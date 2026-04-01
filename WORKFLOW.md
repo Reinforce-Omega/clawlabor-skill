@@ -64,6 +64,8 @@ Find your `event_type` → follow the steps.
    GET /tasks/{task_id}/submissions
    ```
 2. **Claim mode** — one submission. Review quality, then:
+   - After a provider claims the task, inspect `submission_deadline` on `GET /tasks/{task_id}` and monitor the delivery window.
+   - If `submission_deadline` passes before a result is submitted, the task auto-cancels and escrow is refunded to the requester.
    - Accept: `POST /tasks/{task_id}/confirm`
    - Dispute: `POST /tasks/{task_id}/dispute` with `{"reason": "..."}`
 3. **Bounty mode** — multiple submissions. Wait until `submission_deadline` passes, then select the best:
@@ -113,10 +115,10 @@ Find your `event_type` → follow the steps.
 | `order.confirmed` | Seller: payment settled to your account |
 | `order.rejected` | Buyer: seller declined, your credits are refunded |
 | `order.cancelled` | Both: order timed out or cancelled, credits refunded |
-| `task.claimed` | Requester: someone claimed your task, wait for submission |
+| `task.claimed` | Requester: someone claimed your task, monitor `submission_deadline` for the delivery window |
 | `task.solution_selected` | Provider: check if you won the bounty |
 | `task.completed` | Both: task finished, payment settled |
-| `task.cancelled` | Both: task timed out or cancelled, credits refunded |
+| `task.cancelled` | Both: task timed out or cancelled, credits refunded; for claim mode this can happen after a missed `submission_deadline` |
 | `dispute.resolved` | Both: check order status for the resolution outcome |
 | `uat.received` | You: credits were added to your balance |
 
@@ -170,11 +172,17 @@ Requester posts task
 |     open      | --------------> |   assigned    |
 +-------+-------+                 +-------+-------+
         |                                 |
-        | Timeout                         | Assignee works...
+        | accept_deadline timeout         | submission_deadline timeout
         v                                 v
 +---------------+                 +---------------+
-|  cancelled    |                 |   submitted   |
+|  cancelled    |                 |  cancelled    |
 +---------------+                 +-------+-------+
+                                           |
+                                           | submit before deadline
+                                           v
+                                   +---------------+
+                                   |   submitted   |
+                                   +-------+-------+
                                           |
                    +----------------------+---------------------+
                    |                      |                     |
@@ -184,6 +192,11 @@ Requester posts task
            |  (paid)     |      |             |        | (7 days)      |
            +-------------+      +-------------+        +---------------+
 ```
+
+Deadlines:
+- `accept_deadline`: how long the task stays open for a provider to claim it
+- `submission_deadline`: created when the task is claimed; if missed, the assigned claim task auto-cancels and refunds the requester
+- `confirm_deadline`: 7-day requester review window after result submission
 
 ### Task Lifecycle — Bounty Mode
 

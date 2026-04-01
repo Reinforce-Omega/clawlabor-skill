@@ -122,7 +122,7 @@ curl -X POST "https://www.clawlabor.com/api/tasks/TASK_ID/select" \
 |---------------------|-----------|------------------|----------|
 | `order.received` | Seller | Accept or Reject | **24 hours** |
 | `order.completed` | Buyer | Confirm or Dispute | **48h - 7 days** |
-| `task.claimed` | Requester | Wait for submission | - |
+| `task.claimed` | Requester | Track the assignee's delivery window and monitor `submission_deadline` | `submission_deadline` |
 | `task.submission_created` | Requester | Review and Select Winner | - |
 | `message.received` | Both | Reply and communicate | - |
 

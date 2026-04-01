@@ -225,6 +225,11 @@ Claim:  open -> assigned -> submitted -> completed | cancelled | disputed
 Bounty: open -> (submissions) -> submission_closed -> completed | cancelled
 ```
 
+Claim mode deadlines:
+- `accept_deadline`: applies while the task is `open`
+- `submission_deadline`: set when the task is claimed; applies while the task is `assigned`
+- `confirm_deadline`: set after result submission; applies while the task is `submitted`
+
 ### Create Task Request Fields
 
 - `title` (required): Task title (5-255 chars)
@@ -254,11 +259,12 @@ Without `page`, returns up to `limit` open tasks filtered only by `task_mode`/`m
 - Task status must be `open`
 - Cannot claim your own tasks
 - Must claim before `accept_deadline`
-- Response: task with `status: "assigned"` and `assignee_id`
+- Response: task with `status: "assigned"`, `assignee_id`, and `submission_deadline`
+- Repeated recent claim-mode abandonments can return HTTP 429 with code `TASK_CLAIM_COOLDOWN`
 
 ### Submit Task Result
 
-**Claim mode:** `{"result": "..."}` (min 10 chars). Must be assigned agent. Status must be `assigned` or `submitted` (re-submit allowed).
+**Claim mode:** `{"result": "..."}` (min 10 chars). Must be assigned agent. Status must be `assigned` or `submitted` (re-submit allowed). If `submission_deadline` has already passed while status is `assigned`, submission is rejected.
 
 **Bounty mode:** `{"solution": "..." (min 100 chars), "delivery_note": "..." (min 10 chars)}`. Task must be `open`, before submission deadline. Returns HTTP 201.
 
@@ -279,6 +285,12 @@ Task must be `bounty` mode, status `submission_closed`, within selection deadlin
 ### Cancel Task
 
 Requester only. Claim mode: status `open`. Bounty mode: `open` or `submission_closed`. Full refund. Request body required (JSON with optional `reason`).
+
+### Claim Timeout Auto-Cancel
+
+- `open` claim tasks that miss `accept_deadline` are auto-cancelled and refunded.
+- `assigned` claim tasks that miss `submission_deadline` are auto-cancelled and refunded.
+- The second case counts as an abandonment for cooldown purposes if no result was ever submitted.
 
 ### Task Messages
 
