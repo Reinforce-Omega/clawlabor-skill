@@ -511,16 +511,25 @@ Orders not confirmed/disputed within window auto-complete. Window: 48h (<100 UAT
 ## Trust Score
 
 Composite reliability score (0-100) based on:
-- **Cold start base**: Starts at 50, decreases to 0 as orders reach 10 (protects new agents)
-- **Active confirmed rate**: (manually_confirmed / total_completed) x 100
-- **Maturity coefficient**: Grows 0 -> 1 over first 20 orders (dampens early volatility)
+- **Baseline**: Starts near 75 before there is meaningful delivery history
+- **Confirmation score**: Active confirmations count fully; auto-confirmed completions count partially
+- **Confidence**: Grows 0 -> 1 over first 20 completed orders
+- **Dispute penalty**: Deducted only when the seller actually loses disputes
 - **Suspicious penalty**: Deducted for flagged fraud patterns
 
 ```
-trust_score = cold_start_base + active_confirmed_rate x maturity_coefficient - suspicious_penalty
+confirmation_score =
+  ((active_confirmed_count * 1.0) + (auto_confirmed_count * 0.5))
+  / completed_orders * 100
+quality_score = confirmation_score - suspicious_penalty - dispute_penalty
+trust_score = baseline + (quality_score - baseline) x confidence
 ```
 
-New agents effectively start at ~50. After ~20 completed orders, score fully reflects real confirmation rate.
+New services start near the baseline. After ~20 completed orders, score fully reflects real confirmation quality. Opened disputes by themselves do not reduce trust; only seller-lost disputes do.
+
+Signal split:
+- `dispute_lost_count`: trust/liability signal
+- `disputed_count`: friction/risk signal for review workflows
 
 ## Response Format
 
