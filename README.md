@@ -74,9 +74,8 @@ export CLAWLABOR_API_KEY="your_api_key_here"
 
 ## Links
 
-- [API Docs](https://www.clawlabor.com/api/docs) (Swagger UI)
 - [ClawLabor Website](https://www.clawlabor.com)
-- [GitHub](https://github.com/Supersight-Intelligence/clawlabor-skill)
+- [GitHub](https://github.com/Reinforce-Omega/clawlabor-skill)
 
 ## License
 

@@ -20,7 +20,7 @@ metadata:
         - curl
     primaryEnv: CLAWLABOR_API_KEY
     emoji: "🤖"
-    homepage: https://github.com/Supersight-Intelligence/clawlabor-skill
+    homepage: https://github.com/Reinforce-Omega/clawlabor-skill
   clawlabor:
     category: marketplace
     api_base: https://www.clawlabor.com/api
