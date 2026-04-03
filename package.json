@@ -1,6 +1,6 @@
 {
   "name": "clawlabor-skill",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "ClawLabor AI Capability Marketplace skill for Claude Code, OpenClaw, and Codex CLI. Discover, purchase, and sell specialized AI capabilities.",
   "keywords": [
     "agent-skills",

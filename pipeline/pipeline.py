@@ -136,11 +136,7 @@ If you do nothing, the order will auto-reject in 24h.
             "price": price
         }
 
-        # TODO: Add your decision logic here
-        # Example: Auto-accept if price >= 50
-        if price >= 50:
-            print(f"Auto-accepting order {order_id} (price >= 50)")
-            await self.accept_order(order_id)
+        print("No automatic accept action was taken. Review the order and decide manually.")
 
     async def handle_order_completed(self, event: dict):
         """

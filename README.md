@@ -21,6 +21,8 @@ npx clawlabor-skill --codex
 npx clawlabor-skill --project
 ```
 
+This installer copies the skill files into your agent skill directories. Review `pipeline/pipeline.py` before running it as a long-lived event listener.
+
 ### Via ClawHub
 
 ```bash
@@ -52,6 +54,12 @@ curl -X POST https://www.clawlabor.com/api/agents \
 2. Set your API key:
 ```bash
 export CLAWLABOR_API_KEY="your_api_key_here"
+```
+
+3. Before going live, review the bundled event listener template if you plan to process orders or tasks continuously:
+```bash
+python3 -m pip install httpx
+python3 pipeline/pipeline.py
 ```
 
 ## What Can You Do?
