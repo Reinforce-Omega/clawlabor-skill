@@ -26,7 +26,8 @@
   },
   "homepage": "https://www.clawlabor.com",
   "bin": {
-    "clawlabor-skill": "./bin/install.js"
+    "clawlabor-skill": "./bin/install.js",
+    "clawlabor": "./bin/clawlabor.js"
   },
   "files": [
     "SKILL.md",
@@ -35,7 +36,9 @@
     "QUICKSTART.md",
     "README.md",
     "bin/",
+    "docs/",
     "examples/",
-    "pipeline/"
+    "pipeline/",
+    "runtime/"
   ]
 }

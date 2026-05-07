@@ -7,12 +7,14 @@
  * - Claude Code: ~/.claude/skills/clawlabor/
  * - OpenClaw:    ~/.openclaw/skills/clawlabor/
  * - Codex CLI:   ~/.codex/skills/clawlabor/
+ * - Hermes:      ~/.hermes/skills/marketplace/clawlabor/
  *
  * Usage:
  *   npx clawlabor-skill            # Install for all detected platforms
  *   npx clawlabor-skill --claude    # Install for Claude Code only
  *   npx clawlabor-skill --openclaw  # Install for OpenClaw only
  *   npx clawlabor-skill --codex     # Install for Codex CLI only
+ *   npx clawlabor-skill --hermes    # Install for Hermes only
  *   npx clawlabor-skill --project   # Install in current project's .claude/skills/
  *   npx clawlabor-skill --uninstall # Remove from all platforms
  */
@@ -22,12 +24,13 @@ const path = require("path");
 const os = require("os");
 
 const SKILL_NAME = "clawlabor";
-const HOME = os.homedir();
+const HOME = process.env.HOME || os.homedir();
 
 const PLATFORMS = {
   claude: path.join(HOME, ".claude", "skills", SKILL_NAME),
   openclaw: path.join(HOME, ".openclaw", "skills", SKILL_NAME),
   codex: path.join(HOME, ".codex", "skills", SKILL_NAME),
+  hermes: path.join(HOME, ".hermes", "skills", "marketplace", SKILL_NAME),
 };
 
 const FILES_TO_COPY = [
@@ -40,7 +43,7 @@ const FILES_TO_COPY = [
 const args = process.argv.slice(2);
 const flags = new Set(args.map((a) => a.replace(/^--/, "")));
 
-const DIRS_TO_COPY = ["pipeline", "examples"];
+const DIRS_TO_COPY = ["pipeline", "examples", "runtime", "bin", "docs"];
 
 function copySkillFiles(targetDir) {
   const sourceDir = path.resolve(__dirname, "..");
@@ -83,6 +86,7 @@ function detectPlatforms() {
   if (fs.existsSync(path.join(HOME, ".claude"))) detected.push("claude");
   if (fs.existsSync(path.join(HOME, ".openclaw"))) detected.push("openclaw");
   if (fs.existsSync(path.join(HOME, ".codex"))) detected.push("codex");
+  if (fs.existsSync(path.join(HOME, ".hermes"))) detected.push("hermes");
   // If none detected, default to claude
   if (detected.length === 0) detected.push("claude");
   return detected;
@@ -99,6 +103,7 @@ Usage:
   npx clawlabor-skill --claude     Install for Claude Code only
   npx clawlabor-skill --openclaw   Install for OpenClaw only
   npx clawlabor-skill --codex      Install for Codex CLI only
+  npx clawlabor-skill --hermes     Install for Hermes only
   npx clawlabor-skill --project    Install in current project (.claude/skills/)
   npx clawlabor-skill --uninstall  Remove from all platforms
   npx clawlabor-skill --help       Show this help
@@ -144,6 +149,8 @@ if (flags.has("project")) {
   targets.push({ name: "openclaw", dir: PLATFORMS.openclaw });
 } else if (flags.has("codex")) {
   targets.push({ name: "codex", dir: PLATFORMS.codex });
+} else if (flags.has("hermes")) {
+  targets.push({ name: "hermes", dir: PLATFORMS.hermes });
 } else {
   // Auto-detect
   const detected = detectPlatforms();
@@ -178,6 +185,9 @@ console.log(`
   3. Start using it in your agent:
      "Search ClawLabor for code review services"
      "Post a bounty task on ClawLabor for 50 UAT"
+
+     Hermes:
+     hermes --skills clawlabor --oneshot "Use the clawlabor skill to solve ..."
 
   Docs: https://www.clawlabor.com/api/docs
 
