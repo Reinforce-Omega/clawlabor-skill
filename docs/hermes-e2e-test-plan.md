@@ -40,7 +40,8 @@ hermes skills list
 
 ```bash
 cd /Users/kun/Documents/clawlabor/clawlabor-skill
-node --test tests/clawlabor-cli.test.js
+npm test
+cd pipeline && python3 -m unittest test_pipeline.py -v
 ```
 
 **Pass Criteria:**
@@ -48,6 +49,9 @@ node --test tests/clawlabor-cli.test.js
 - All CLI tests pass.
 - Tests cover `match`, `plan`, `buy`, `wait`, `validate`, `result`, `confirm`, `post`, and `solve`.
 - Error classification includes `insufficient_credits`, `requirement_invalid`, and `no_match`.
+- `plan` reports missing required fields when requirement input is omitted.
+- `plan` and `solve` choose a schema-compatible allowed listing when multiple matches are returned.
+- Pipeline tests verify claim-mode requester polling and confirm-deadline warning behavior.
 
 ## Checkpoint 3: ClawLabor API Agent-Native Endpoints
 
@@ -93,7 +97,7 @@ DEBUG=false uv run pytest tests/unit/api/test_task_category_filters.py tests/uni
 **Commands:**
 
 ```bash
-npx clawlabor-skill --hermes
+npx --yes github:Reinforce-Omega/clawlabor-skill --hermes
 hermes skills list
 hermes --skills clawlabor --oneshot "Say only: clawlabor skill loaded"
 ```

@@ -1,5 +1,7 @@
 const fs = require("fs");
 const crypto = require("crypto");
+const os = require("os");
+const path = require("path");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 const TERMINAL_ORDER_STATES = new Set([
@@ -65,10 +67,45 @@ function apiBase(env) {
   return (env.CLAWLABOR_API_BASE || DEFAULT_API_BASE).replace(/\/+$/, "");
 }
 
+function readCredentialsFile(env) {
+  const candidate = credentialsFilePath(env);
+  if (!fs.existsSync(candidate)) {
+    return null;
+  }
+
+  const parsed = JSON.parse(fs.readFileSync(candidate, "utf8"));
+  return parsed && typeof parsed.api_key === "string" ? parsed.api_key : null;
+}
+
+function credentialsFilePath(env) {
+  return env.CLAWLABOR_CREDENTIALS_FILE ||
+    path.join(os.homedir(), ".config", "agentmarket", "credentials.json");
+}
+
+function writeCredentialsFile(env, credentials) {
+  const candidate = credentialsFilePath(env);
+  fs.mkdirSync(path.dirname(candidate), { recursive: true });
+  fs.writeFileSync(candidate, `${JSON.stringify(credentials, null, 2)}\n`, { mode: 0o600 });
+  try {
+    fs.chmodSync(candidate, 0o600);
+  } catch (_err) {
+    // Best effort. Some filesystems ignore chmod.
+  }
+  return candidate;
+}
+
+function resolveApiKey(env) {
+  return env.CLAWLABOR_API_KEY || readCredentialsFile(env);
+}
+
 function authHeaders(env) {
-  const apiKey = env.CLAWLABOR_API_KEY;
+  const apiKey = resolveApiKey(env);
   if (!apiKey) {
-    throw new Error("Set CLAWLABOR_API_KEY before calling clawlabor");
+    const error = new Error(
+      "Set CLAWLABOR_API_KEY or store api_key in ~/.config/agentmarket/credentials.json before calling clawlabor",
+    );
+    error.errorCode = "missing_credentials";
+    throw error;
   }
   return {
     Authorization: `Bearer ${apiKey}`,
@@ -138,8 +175,27 @@ async function request(deps, method, path, { body, headers } = {}) {
   return text;
 }
 
+async function requestNoAuth(deps, method, path, { body, headers } = {}) {
+  const url = `${apiBase(deps.env)}${path}`;
+  const response = await deps.fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json", ...(headers || {}) },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new ApiError(response.status, text);
+  }
+  return text;
+}
+
 async function requestJson(deps, method, path, options) {
   const text = await request(deps, method, path, options);
+  return text ? JSON.parse(text) : {};
+}
+
+async function requestJsonNoAuth(deps, method, path, options) {
+  const text = await requestNoAuth(deps, method, path, options);
   return text ? JSON.parse(text) : {};
 }
 
@@ -215,6 +271,21 @@ function validateRequirementAgainstSchema(requirement, schema) {
   return { valid: missing.length === 0, missing };
 }
 
+function pickCompatibleListing(matches, requirement) {
+  const allowed = matches.filter((item) => item.policy?.allowed !== false);
+  if (allowed.length === 0) return null;
+
+  if (!requirement || Object.keys(requirement).length === 0) {
+    return allowed[0];
+  }
+
+  const compatible = allowed.find((item) => {
+    const check = validateRequirementAgainstSchema(requirement, item.input_schema);
+    return check.valid;
+  });
+  return compatible || allowed[0];
+}
+
 // ---------------------------------------------------------------------------
 // command implementations
 // ---------------------------------------------------------------------------
@@ -225,22 +296,83 @@ async function commandMatch(options, deps, flags) {
   return text;
 }
 
+async function commandMe(_options, deps) {
+  return request(deps, "GET", "/agents/me");
+}
+
+function defaultAgentName(env) {
+  const base = env.HERMES_AGENT_NAME || env.USER || "HermesAgent";
+  return `${base}`.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 48) || "HermesAgent";
+}
+
+async function commandRegister(options, deps) {
+  const ownerEmail = options["owner-email"] || deps.env.CLAWLABOR_OWNER_EMAIL;
+  if (!ownerEmail) {
+    const err = new Error("Missing --owner-email or CLAWLABOR_OWNER_EMAIL for ClawLabor registration");
+    err.errorCode = "missing_owner_email";
+    throw err;
+  }
+
+  const body = {
+    name: options.name || defaultAgentName(deps.env),
+    owner_email: ownerEmail,
+    description: options.description || "Autonomous Hermes agent using ClawLabor capabilities",
+    skills: options.skills ? options.skills.split(",").map((item) => item.trim()).filter(Boolean) : ["hermes", "agent"],
+  };
+  if (options["invite-code"]) body.invite_code = options["invite-code"];
+  if (options["webhook-url"]) body.webhook_url = options["webhook-url"];
+  if (options["webhook-secret"]) body.webhook_secret = options["webhook-secret"];
+
+  const agent = await requestJsonNoAuth(deps, "POST", "/agents", { body });
+  const credentialsPath = writeCredentialsFile(deps.env, {
+    api_key: agent.api_key,
+    id: agent.id,
+    agent_id: agent.agent_id,
+    name: agent.name,
+    owner_email: agent.owner_email,
+  });
+
+  return JSON.stringify({
+    action: "registered",
+    credentials_file: credentialsPath,
+    agent_id: agent.agent_id,
+    name: agent.name,
+    owner_email: agent.owner_email,
+    balance: agent.balance,
+    next: "Use clawlabor solve for buyer-side procurement or run the event pipeline before taking live seller/requester work.",
+  });
+}
+
+async function commandBootstrap(options, deps) {
+  const apiKey = resolveApiKey(deps.env);
+  if (apiKey) {
+    const me = await requestJson(deps, "GET", "/agents/me");
+    const agent = me.agent || me;
+    return JSON.stringify({
+      action: "credentials_valid",
+      credentials_file: credentialsFilePath(deps.env),
+      agent_id: agent.agent_id || agent.id,
+      name: agent.name,
+      balance: agent.balance,
+      next: "Use clawlabor solve when a task needs an external capability.",
+    });
+  }
+  return commandRegister(options, deps);
+}
+
 async function commandPlan(options, deps, flags) {
   const body = matchBody(options, flags, deps.env);
   const matchResult = await requestJson(deps, "POST", "/listings/match", { body });
   const matches = Array.isArray(matchResult.matches) ? matchResult.matches : [];
-  const selected = matches.find((item) => item.policy?.allowed !== false);
+  const requirementProvided = Boolean(options["requirement-json"] || options["requirement-file"]);
+  const requirement = requirementProvided ? parseRequirement(options) : {};
+  const selected = pickCompatibleListing(matches, requirement);
   if (!selected) {
     throw new Error("No policy-compatible ClawLabor listing matched this goal");
   }
 
   const idempotencyKey = options["idempotency-key"] || deps.makeIdempotencyKey();
-  const requirement = (options["requirement-json"] || options["requirement-file"])
-    ? parseRequirement(options)
-    : null;
-  const schemaCheck = requirement
-    ? validateRequirementAgainstSchema(requirement, selected.input_schema)
-    : { valid: true, missing: [] };
+  const schemaCheck = validateRequirementAgainstSchema(requirement, selected.input_schema);
 
   const plan = {
     action: "purchase",
@@ -252,7 +384,7 @@ async function commandPlan(options, deps, flags) {
     idempotency_key: idempotencyKey,
     reasons: selected.reasons || [],
     input_schema: selected.input_schema || null,
-    requirement,
+    requirement: requirementProvided ? requirement : null,
     requirement_valid: schemaCheck.valid,
     missing_required_fields: schemaCheck.missing,
     rejected_listings: matches
@@ -456,7 +588,7 @@ async function commandSolve(options, deps, flags) {
     });
   }
 
-  const selected = allowed[0];
+  const selected = pickCompatibleListing(matches, requirement);
 
   // 2. local schema validation
   const schemaCheck = validateRequirementAgainstSchema(requirement, selected.input_schema);
@@ -536,6 +668,9 @@ async function commandSolve(options, deps, flags) {
 // ---------------------------------------------------------------------------
 
 const COMMANDS = {
+  bootstrap: commandBootstrap,
+  register: commandRegister,
+  me: commandMe,
   match: commandMatch,
   plan: commandPlan,
   buy: commandBuy,
@@ -548,6 +683,20 @@ const COMMANDS = {
   post: commandPost,
   solve: commandSolve,
 };
+
+function usageText() {
+  return [
+    `Usage: clawlabor <${Object.keys(COMMANDS).join("|")}> [options]`,
+    "",
+    "Setup:",
+    "  clawlabor bootstrap [--owner-email you@example.com] [--name AgentName]",
+    "  clawlabor me",
+    "",
+    "Procurement:",
+    "  clawlabor solve --goal \"...\" --requirement-json '{...}'",
+    "  clawlabor plan --goal \"...\" --requirement-json '{...}'",
+  ].join("\n");
+}
 
 async function runCli(argv, injected = {}) {
   const deps = {
@@ -564,11 +713,14 @@ async function runCli(argv, injected = {}) {
   }
 
   const { command, options, flags } = parseArgs(argv);
+  if (!command || command === "--help" || command === "-h" || command === "help") {
+    const output = usageText();
+    deps.stdout(output);
+    return output;
+  }
   const handler = COMMANDS[command];
   if (!handler) {
-    throw new Error(
-      `Usage: clawlabor <${Object.keys(COMMANDS).join("|")}> [options]`,
-    );
+    throw new Error(usageText());
   }
   const output = await handler(options, deps, flags);
   deps.stdout(output);
@@ -580,6 +732,10 @@ module.exports = {
   parseArgs,
   makeIdempotencyKey,
   validateRequirementAgainstSchema,
+  pickCompatibleListing,
+  resolveApiKey,
+  credentialsFilePath,
+  writeCredentialsFile,
   parseDeliveryNote,
   ApiError,
 };

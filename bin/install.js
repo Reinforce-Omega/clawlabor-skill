@@ -10,13 +10,13 @@
  * - Hermes:      ~/.hermes/skills/marketplace/clawlabor/
  *
  * Usage:
- *   npx clawlabor-skill            # Install for all detected platforms
- *   npx clawlabor-skill --claude    # Install for Claude Code only
- *   npx clawlabor-skill --openclaw  # Install for OpenClaw only
- *   npx clawlabor-skill --codex     # Install for Codex CLI only
- *   npx clawlabor-skill --hermes    # Install for Hermes only
- *   npx clawlabor-skill --project   # Install in current project's .claude/skills/
- *   npx clawlabor-skill --uninstall # Remove from all platforms
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill            # Install for all detected platforms
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill --claude    # Install for Claude Code only
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw  # Install for OpenClaw only
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill --codex     # Install for Codex CLI only
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill --hermes    # Install for Hermes only
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill --project   # Install in current project's .claude/skills/
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill --uninstall # Remove from all platforms
  */
 
 const fs = require("fs");
@@ -99,19 +99,21 @@ if (flags.has("help") || flags.has("h")) {
 ClawLabor Skill Installer
 
 Usage:
-  npx clawlabor-skill              Install for all detected platforms
-  npx clawlabor-skill --claude     Install for Claude Code only
-  npx clawlabor-skill --openclaw   Install for OpenClaw only
-  npx clawlabor-skill --codex      Install for Codex CLI only
-  npx clawlabor-skill --hermes     Install for Hermes only
-  npx clawlabor-skill --project    Install in current project (.claude/skills/)
-  npx clawlabor-skill --uninstall  Remove from all platforms
-  npx clawlabor-skill --help       Show this help
+  npx --yes github:Reinforce-Omega/clawlabor-skill              Install for all detected platforms
+  npx --yes github:Reinforce-Omega/clawlabor-skill --claude     Install for Claude Code only
+  npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw   Install for OpenClaw only
+  npx --yes github:Reinforce-Omega/clawlabor-skill --codex      Install for Codex CLI only
+  npx --yes github:Reinforce-Omega/clawlabor-skill --hermes     Install for Hermes only
+  npx --yes github:Reinforce-Omega/clawlabor-skill --project    Install in current project (.claude/skills/)
+  npx --yes github:Reinforce-Omega/clawlabor-skill --uninstall  Remove from all platforms
+  npx --yes github:Reinforce-Omega/clawlabor-skill --help       Show this help
 
-After installation, set your API key:
-  export CLAWLABOR_API_KEY="your_key_here"
+After installation, bootstrap credentials:
+  clawlabor bootstrap
+  clawlabor bootstrap --owner-email "you@example.com" --name "My Agent"
 
-Register at: https://www.clawlabor.com/api/docs
+If clawlabor is not on PATH:
+  <skill-dir>/bin/clawlabor.js bootstrap
 `);
   process.exit(0);
 }
@@ -174,21 +176,26 @@ console.log(`
 
   Next steps:
 
-  1. Set your API key:
-     export CLAWLABOR_API_KEY="your_key"
+  1. Bootstrap credentials:
+     clawlabor bootstrap
 
-  2. Register (if you haven't):
-     curl -X POST https://www.clawlabor.com/api/agents \\
-       -H "Content-Type: application/json" \\
-       -d '{"name":"My Agent","owner_email":"you@example.com"}'
+     If this agent is not registered yet:
+     clawlabor bootstrap --owner-email "you@example.com" --name "My Agent"
 
-  3. Start using it in your agent:
-     "Search ClawLabor for code review services"
-     "Post a bounty task on ClawLabor for 50 UAT"
+     If clawlabor is not on PATH:
+     <skill-dir>/bin/clawlabor.js bootstrap
 
-     Hermes:
-     hermes --skills clawlabor --oneshot "Use the clawlabor skill to solve ..."
+  2. Use the runtime CLI when work needs outside capabilities:
+     clawlabor solve --goal "Analyze competitor" --requirement-json '{"url":"https://example.com"}'
 
-  Docs: https://www.clawlabor.com/api/docs
+  3. Choose a listening strategy before going live as a seller or long-running requester:
+     curl -L https://raw.githubusercontent.com/Reinforce-Omega/clawlabor-skill/main/pipeline/pipeline.py -o pipeline.py
+     python3 -m pip install httpx
+     python3 pipeline.py
+
+  4. Start using it in your agent:
+     "Use ClawLabor when this task needs capabilities beyond local tools."
+
+  Docs: https://www.clawlabor.com/skill.md
 
 `);

@@ -8,6 +8,9 @@ const test = require("node:test");
 const {
   runCli,
   validateRequirementAgainstSchema,
+  pickCompatibleListing,
+  resolveApiKey,
+  credentialsFilePath,
   parseDeliveryNote,
 } = require("../runtime/cli");
 
@@ -88,6 +91,102 @@ test("match rejects non-positive --max-price before calling API", async () => {
     /--max-price must be greater than or equal to 1/,
   );
   assert.equal(calls.length, 0);
+});
+
+test("help prints usage without requiring credentials", async () => {
+  const out = [];
+  await runCli(["--help"], {
+    env: {},
+    fetch: async () => {
+      throw new Error("should not call API");
+    },
+    stdout: (t) => out.push(t),
+  });
+  assert.match(out[0], /Usage: clawlabor/);
+  assert.match(out[0], /bootstrap/);
+  assert.match(out[0], /solve/);
+});
+
+test("bootstrap validates existing credentials without registering again", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-bootstrap-"));
+  const credentialsFile = path.join(tempDir, "credentials.json");
+  fs.writeFileSync(credentialsFile, JSON.stringify({ api_key: "file-key" }));
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ agent_id: "agent_existing", name: "Existing", balance: 100 }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(["bootstrap"], {
+    env: {
+      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+    },
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "credentials_valid");
+  assert.equal(result.agent_id, "agent_existing");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.headers.Authorization, "Bearer file-key");
+});
+
+test("register creates an agent and stores credentials", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-register-"));
+  const credentialsFile = path.join(tempDir, "credentials.json");
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/agents", {
+      status: 201,
+      body: JSON.stringify({
+        id: "agent-uuid",
+        agent_id: "agent_new",
+        name: "HermesBuyer",
+        owner_email: "agent@example.com",
+        api_key: "new-key",
+        balance: 100,
+      }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["register", "--owner-email", "agent@example.com", "--name", "HermesBuyer"],
+    {
+      env: {
+        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+        CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+      },
+      fetch,
+      stdout: (t) => out.push(t),
+    },
+  );
+
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.owner_email, "agent@example.com");
+  assert.equal(body.name, "HermesBuyer");
+  assert.equal(calls[0].options.headers.Authorization, undefined);
+
+  const saved = JSON.parse(fs.readFileSync(credentialsFile, "utf8"));
+  assert.equal(saved.api_key, "new-key");
+  assert.equal(saved.agent_id, "agent_new");
+  assert.equal(JSON.parse(out[0]).action, "registered");
+});
+
+test("register requires owner email", async () => {
+  await assert.rejects(
+    runCli(["register"], {
+      env: { CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE },
+      fetch: async () => {
+        throw new Error("should not call API");
+      },
+      stdout: () => {},
+    }),
+    (err) => err.errorCode === "missing_owner_email",
+  );
 });
 
 test("buy creates a purchase request with idempotency", async () => {
@@ -172,6 +271,65 @@ test("plan exposes input_schema, missing-field check, and rejected listings", as
   assert.deepEqual(plan.rejected_listings, [
     { id: "sku-cheap", blocked_reasons: ["trust_below_minimum"] },
   ]);
+});
+
+test("plan chooses a schema-compatible allowed listing", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/listings/match", {
+      status: 200,
+      body: JSON.stringify({
+        matches: [
+          {
+            id: "sku-repo",
+            price: 30,
+            input_schema: { type: "object", required: ["repo_url"] },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+          {
+            id: "sku-url",
+            price: 25,
+            input_schema: { type: "object", required: ["url"] },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+        ],
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["plan", "--goal", "Analyze site", "--requirement-json", '{"url":"https://example.com"}'],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t), makeIdempotencyKey: () => "fixed-key" },
+  );
+  const plan = JSON.parse(out[0]);
+  assert.equal(plan.selected_listing.id, "sku-url");
+  assert.equal(plan.requirement_valid, true);
+});
+
+test("plan reports missing required fields when requirement is omitted", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/listings/match", {
+      status: 200,
+      body: JSON.stringify({
+        matches: [
+          {
+            id: "sku-url",
+            price: 25,
+            input_schema: { type: "object", required: ["url"] },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+        ],
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["plan", "--goal", "Analyze site"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t), makeIdempotencyKey: () => "fixed-key" },
+  );
+  const plan = JSON.parse(out[0]);
+  assert.equal(plan.requirement, null);
+  assert.equal(plan.requirement_valid, false);
+  assert.deepEqual(plan.missing_required_fields, ["url"]);
 });
 
 test("validate calls delivery validation endpoint", async () => {
@@ -429,6 +587,74 @@ test("solve runs match → buy → wait → validate → confirm", async () => {
   assert.ok(calls.some((c) => c.url.endsWith("/orders/order-9/confirm")));
 });
 
+test("solve buys the first schema-compatible allowed listing", async () => {
+  const routes = [
+    matchRoute("POST", "/listings/match", {
+      status: 200,
+      body: JSON.stringify({
+        matches: [
+          {
+            id: "sku-repo",
+            price: 20,
+            input_schema: { type: "object", required: ["repo_url"] },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+          {
+            id: "sku-url",
+            price: 25,
+            input_schema: { type: "object", required: ["url"] },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+        ],
+      }),
+    }),
+    matchRoute("POST", "/listings/sku-url/purchase", {
+      status: 201,
+      body: '{"id":"order-10"}',
+    }),
+    matchRoute("GET", "/orders/order-10", {
+      status: 200,
+      body: JSON.stringify({
+        order: {
+          id: "order-10",
+          status: "pending_confirmation",
+          delivery_note: "done",
+        },
+      }),
+    }),
+    matchRoute("POST", "/orders/order-10/validate-delivery", {
+      status: 200,
+      body: '{"verdict":"valid","can_auto_confirm":false}',
+    }),
+  ];
+  const { fetch, calls } = recordingFetch(routes);
+  const out = [];
+  await runCli(
+    [
+      "solve",
+      "--goal",
+      "Analyze competitor",
+      "--requirement-json",
+      '{"url":"https://example.com"}',
+      "--timeout",
+      "60",
+      "--interval",
+      "1",
+    ],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      makeIdempotencyKey: () => "fixed",
+      sleep: async () => {},
+      now: () => 0,
+    },
+  );
+  const result = JSON.parse(out[0]);
+  assert.equal(result.listing_id, "sku-url");
+  assert.ok(calls.some((c) => c.url.endsWith("/listings/sku-url/purchase")));
+});
+
 test("solve falls back to bounty when no match and --allow-bounty", async () => {
   const { fetch, calls } = recordingFetch([
     matchRoute("POST", "/listings/match", { status: 200, body: '{"matches":[]}' }),
@@ -527,6 +753,35 @@ test("validateRequirementAgainstSchema flags missing required fields", () => {
   assert.deepEqual(result.missing, ["question"]);
 });
 
+test("pickCompatibleListing prefers schema-compatible allowed listings", () => {
+  const listing = pickCompatibleListing(
+    [
+      { id: "a", policy: { allowed: true }, input_schema: { required: ["repo_url"] } },
+      { id: "b", policy: { allowed: true }, input_schema: { required: ["url"] } },
+    ],
+    { url: "https://example.com" },
+  );
+  assert.equal(listing.id, "b");
+});
+
+test("resolveApiKey reads explicit credentials file fallback", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-creds-"));
+  const credentialsFile = path.join(tempDir, "credentials.json");
+  fs.writeFileSync(credentialsFile, JSON.stringify({ api_key: "file-key" }));
+  assert.equal(resolveApiKey({ CLAWLABOR_CREDENTIALS_FILE: credentialsFile }), "file-key");
+  assert.equal(
+    resolveApiKey({ CLAWLABOR_API_KEY: "env-key", CLAWLABOR_CREDENTIALS_FILE: credentialsFile }),
+    "env-key",
+  );
+});
+
+test("credentialsFilePath uses explicit path before default", () => {
+  assert.equal(
+    credentialsFilePath({ CLAWLABOR_CREDENTIALS_FILE: "/tmp/clawlabor-creds.json" }),
+    "/tmp/clawlabor-creds.json",
+  );
+});
+
 test("parseDeliveryNote handles json and plain text", () => {
   assert.deepEqual(parseDeliveryNote('{"a":1}'), { format: "json", value: { a: 1 } });
   assert.deepEqual(parseDeliveryNote("plain"), { format: "text", value: "plain" });
@@ -534,19 +789,39 @@ test("parseDeliveryNote handles json and plain text", () => {
 });
 
 test("bin emits JSON error and exits nonzero without API key", () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-empty-home-"));
   const result = spawnSync(
     process.execPath,
     [path.join(__dirname, "..", "bin", "clawlabor.js"), "match", "--goal", "x"],
     {
-      env: { ...process.env, CLAWLABOR_API_KEY: "" },
+      env: {
+        ...process.env,
+        HOME: tempHome,
+        CLAWLABOR_API_KEY: "",
+        CLAWLABOR_CREDENTIALS_FILE: path.join(tempHome, "missing-credentials.json"),
+      },
       encoding: "utf8",
     },
   );
 
   assert.equal(result.status, 1);
   const err = JSON.parse(result.stderr);
-  assert.equal(err.error_code, "cli_error");
+  assert.equal(err.error_code, "missing_credentials");
   assert.match(err.error, /CLAWLABOR_API_KEY/);
+});
+
+test("bin --help exits zero", () => {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "..", "bin", "clawlabor.js"), "--help"],
+    {
+      env: { ...process.env, CLAWLABOR_API_KEY: "" },
+      encoding: "utf8",
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Usage: clawlabor/);
 });
 
 test("installer supports Hermes target", () => {

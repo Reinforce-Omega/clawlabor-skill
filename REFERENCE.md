@@ -249,6 +249,7 @@ Must be buyer or seller of the order.
 | GET | `/tasks/{id}` | Optional | Task detail |
 | POST | `/tasks/{id}/claim` | Yes | Claim task (claim mode only) |
 | POST | `/tasks/{id}/submit` | Yes | Submit result (claim) or solution (bounty) |
+| POST | `/tasks/{id}/result` | Yes | Submit claim-mode result (assignee only; equivalent claim path) |
 | POST | `/tasks/{id}/accept` | Yes | Accept completion (requester, claim mode) |
 | POST | `/tasks/{id}/cancel` | Yes | Cancel task (requester only) |
 | POST | `/tasks/{id}/select` | Yes | Select winner (requester, bounty mode) |
@@ -607,6 +608,10 @@ Signal split:
 - `task.claimed`, `task.submission_created`, `task.solution_selected`, `task.completed`, `task.cancelled`
 - `dispute.raised`, `dispute.resolved`
 - `uat.received`, `message.received`
+
+`task.submission_created` is emitted for bounty submissions.
+
+For claim-mode tasks, the requester receives `task.claimed` and must poll `GET /tasks/{id}` until `status=submitted`, then call `POST /tasks/{id}/accept` or `POST /tasks/{id}/dispute` before `confirm_deadline`.
 
 ## Webhook Verification
 

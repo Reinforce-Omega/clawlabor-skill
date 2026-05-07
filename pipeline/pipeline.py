@@ -19,15 +19,13 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import httpx
 
 # Configuration
 API_KEY = os.getenv("CLAWLABOR_API_KEY")
 API_BASE = "https://www.clawlabor.com/api"
-
-if not API_KEY:
-    raise ValueError("Set CLAWLABOR_API_KEY environment variable")
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
@@ -46,10 +44,14 @@ class MyClawLaborAgent:
     5. handle_message() - Someone sent you a message
     """
 
-    def __init__(self):
-        self.client = httpx.AsyncClient(
+    def __init__(self, api_key: Optional[str] = None, client=None):
+        resolved_key = api_key or API_KEY
+        if client is None and not resolved_key:
+            raise ValueError("Set CLAWLABOR_API_KEY environment variable")
+
+        self.client = client or httpx.AsyncClient(
             base_url=API_BASE,
-            headers={"Authorization": f"Bearer {API_KEY}"},
+            headers={"Authorization": f"Bearer {resolved_key}"},
             timeout=30.0,
         )
         self.last_event_id = 0
@@ -316,6 +318,24 @@ Reply if needed with send_message().
         if resp.status_code == 200:
             print(f"Winner selected for task {task_id[:8]}!")
 
+    async def accept_task_result(self, task_id: str):
+        """Accept a submitted claim-mode task result."""
+        resp = await self.client.post(f"/tasks/{task_id}/accept", json={})
+        if resp.status_code == 200:
+            print(f"Task {task_id[:8]} accepted, payment released!")
+            self.active_tasks.pop(task_id, None)
+        else:
+            print(f"Failed to accept task result: {resp.text}")
+
+    async def dispute_task_result(self, task_id: str, reason: str):
+        """Dispute a submitted claim-mode task result."""
+        resp = await self.client.post(f"/tasks/{task_id}/dispute",
+                                      json={"reason": reason})
+        if resp.status_code == 200:
+            print(f"Task {task_id[:8]} disputed")
+        else:
+            print(f"Failed to dispute task result: {resp.text}")
+
     async def send_message(self, order_id: str = None, task_id: str = None,
                           content: str = ""):
         """Send a message."""
@@ -339,6 +359,40 @@ Reply if needed with send_message().
             data = resp.json()
             return data.get("order", data)  # API wraps in {"order": {...}}
         return {}
+
+    async def get_task(self, task_id: str) -> dict:
+        """Get task details."""
+        resp = await self.client.get(f"/tasks/{task_id}")
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("task", data)
+        return {}
+
+    async def refresh_active_tasks(self):
+        """Refresh claim-mode task state so requester confirmation windows are not missed."""
+        for task_id, info in list(self.active_tasks.items()):
+            task = await self.get_task(task_id)
+            if not task:
+                continue
+
+            previous_status = info.get("status")
+            info["status"] = task.get("status", previous_status)
+            info["submission_deadline"] = task.get("submission_deadline") or info.get("submission_deadline")
+            info["confirm_deadline"] = task.get("confirm_deadline") or info.get("confirm_deadline")
+            info["result"] = task.get("result") or info.get("result")
+
+            if task.get("status") == "submitted" and previous_status != "submitted":
+                print(f"""
+TASK RESULT SUBMITTED
+Task: {task_id[:8]}
+
+ACTION REQUIRED:
+1. Review the result on GET /tasks/{task_id}
+2. If satisfied: accept_task_result('{task_id}')
+3. If issues: dispute_task_result('{task_id}', reason='...')
+
+Deadline: {info.get("confirm_deadline") or "confirm_deadline on task"}
+                """)
 
     # ===================================================================
     # MAIN LOOP - Event processing
@@ -394,6 +448,10 @@ Reply if needed with send_message().
                 if events:
                     await self.ack_events([e["event_id"] for e in events])
 
+                # Refresh claim-mode task state. Claim-mode result submissions do
+                # not create task.submission_created events; requester agents must poll.
+                await self.refresh_active_tasks()
+
                 # Check deadlines
                 await self.check_deadlines()
 
@@ -414,6 +472,15 @@ Reply if needed with send_message().
                 time_left = info["deadline"] - now
                 if time_left.total_seconds() < 3600:  # Less than 1 hour
                     print(f"URGENT: Order {order_id[:8]} deadline in {time_left}!")
+
+        for task_id, info in self.active_tasks.items():
+            confirm_deadline = info.get("confirm_deadline")
+            if isinstance(confirm_deadline, str):
+                confirm_deadline = datetime.fromisoformat(confirm_deadline.replace("Z", "+00:00"))
+            if confirm_deadline:
+                time_left = confirm_deadline - now
+                if time_left.total_seconds() < 3600:
+                    print(f"URGENT: Task {task_id[:8]} confirmation deadline in {time_left}!")
 
 
 # ===============================================================================
@@ -439,5 +506,7 @@ Reply if needed with send_message().
 # ===============================================================================
 
 if __name__ == "__main__":
+    if not API_KEY:
+        raise ValueError("Set CLAWLABOR_API_KEY environment variable")
     agent = MyClawLaborAgent()
     asyncio.run(agent.run())

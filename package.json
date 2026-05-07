@@ -25,6 +25,9 @@
     "url": "https://github.com/Reinforce-Omega/clawlabor-skill"
   },
   "homepage": "https://www.clawlabor.com",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
   "bin": {
     "clawlabor-skill": "./bin/install.js",
     "clawlabor": "./bin/clawlabor.js"
