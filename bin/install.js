@@ -45,6 +45,18 @@ const flags = new Set(args.map((a) => a.replace(/^--/, "")));
 
 const DIRS_TO_COPY = ["pipeline", "examples", "runtime", "bin", "docs"];
 
+function resolveDocsUrl(env = process.env) {
+  if (env.CLAWLABOR_DOCS_URL) {
+    return env.CLAWLABOR_DOCS_URL.replace(/\/+$/, "");
+  }
+
+  if (env.CLAWLABOR_API_BASE) {
+    return `${env.CLAWLABOR_API_BASE.replace(/\/+$/, "").replace(/\/api$/, "")}/skill.md`;
+  }
+
+  return "https://www.clawlabor.com/skill.md";
+}
+
 function copySkillFiles(targetDir) {
   const sourceDir = path.resolve(__dirname, "..");
 
@@ -95,6 +107,7 @@ function detectPlatforms() {
 // --- Main ---
 
 if (flags.has("help") || flags.has("h")) {
+  const docsUrl = resolveDocsUrl();
   console.log(`
 ClawLabor Skill Installer
 
@@ -114,6 +127,9 @@ After installation, bootstrap credentials:
 
 If clawlabor is not on PATH:
   <skill-dir>/bin/clawlabor.js bootstrap
+
+Docs:
+  ${docsUrl}
 `);
   process.exit(0);
 }
@@ -170,6 +186,8 @@ for (const { name, dir } of targets) {
   }
 }
 
+const docsUrl = resolveDocsUrl();
+
 console.log(`
 
   ClawLabor skill installed!
@@ -196,6 +214,6 @@ console.log(`
   4. Start using it in your agent:
      "Use ClawLabor when this task needs capabilities beyond local tools."
 
-  Docs: https://www.clawlabor.com/skill.md
+  Docs: ${docsUrl}
 
 `);

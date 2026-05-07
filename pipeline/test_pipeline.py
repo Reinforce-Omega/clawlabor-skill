@@ -1,8 +1,11 @@
 import io
+import importlib
+import os
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 
+import pipeline
 from pipeline import MyClawLaborAgent
 
 
@@ -34,6 +37,22 @@ class FakeClient:
 
 
 class PipelineClaimTaskTests(unittest.IsolatedAsyncioTestCase):
+    def test_api_base_can_target_local_environment(self):
+        original = os.environ.get("CLAWLABOR_API_BASE")
+        os.environ["CLAWLABOR_API_BASE"] = "http://localhost:3000/api/"
+        try:
+            reloaded = importlib.reload(pipeline)
+            self.assertEqual(
+                reloaded.API_BASE,
+                "http://localhost:3000/api",
+            )
+        finally:
+            if original is None:
+                os.environ.pop("CLAWLABOR_API_BASE", None)
+            else:
+                os.environ["CLAWLABOR_API_BASE"] = original
+            importlib.reload(pipeline)
+
     async def test_refreshes_claimed_task_until_submitted(self):
         client = FakeClient({
             ("GET", "/tasks/task-1"): FakeResponse(200, {

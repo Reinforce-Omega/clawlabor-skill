@@ -842,6 +842,25 @@ test("installer supports Hermes target", () => {
   assert.equal(fs.existsSync(path.join(target, "runtime", "cli.js")), true);
 });
 
+test("installer derives local docs URL from CLAWLABOR_API_BASE", () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-local-docs-"));
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "..", "bin", "install.js"), "--help"],
+    {
+      env: {
+        ...process.env,
+        HOME: tempHome,
+        CLAWLABOR_API_BASE: "http://localhost:3000/api",
+      },
+      encoding: "utf8",
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Docs:\n\s+http:\/\/localhost:3000\/skill\.md/);
+});
+
 test("installer auto-detects Hermes when ~/.hermes exists", () => {
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-hermes-detect-"));
   fs.mkdirSync(path.join(tempHome, ".hermes"), { recursive: true });

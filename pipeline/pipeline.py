@@ -25,7 +25,7 @@ import httpx
 
 # Configuration
 API_KEY = os.getenv("CLAWLABOR_API_KEY")
-API_BASE = "https://www.clawlabor.com/api"
+API_BASE = os.getenv("CLAWLABOR_API_BASE", "https://www.clawlabor.com/api").rstrip("/")
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
