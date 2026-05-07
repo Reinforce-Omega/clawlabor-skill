@@ -517,9 +517,14 @@ async function commandStatus(options, deps) {
   const orderId = requiredOption(options, "order");
   const detail = await requestJson(deps, "GET", `/orders/${orderId}`);
   const order = detail.order || detail;
+  const cancellationContext =
+    order?.status === "cancelled" && !order?.cancel_reason
+      ? await fetchOrderCancellationContext(deps, orderId)
+      : null;
   const summary = {
     id: order?.id,
     status: order?.status,
+    cancel_reason: order?.cancel_reason || null,
     has_delivery: Boolean(order?.delivery_note),
     delivery_validation: order?.delivery_validation || null,
     accept_deadline: order?.accept_deadline || null,
@@ -527,6 +532,7 @@ async function commandStatus(options, deps) {
     accepted_at: order?.accepted_at || null,
     completed_at: order?.completed_at || null,
     confirmed_at: order?.confirmed_at || null,
+    cancellation_context: cancellationContext,
   };
   return JSON.stringify(summary);
 }
@@ -543,15 +549,32 @@ async function commandWait(options, deps) {
     last = detail.order || detail;
     const status = last?.status;
     if (status === until) {
-      return JSON.stringify({ id: last.id, status, reached: true, waited_ms: deps.now() - start });
-    }
-    if (TERMINAL_ORDER_STATES.has(status) && status !== until) {
+      const cancellationContext =
+        status === "cancelled" && !last?.cancel_reason
+          ? await fetchOrderCancellationContext(deps, orderId)
+          : null;
       return JSON.stringify({
         id: last.id,
         status,
+        cancel_reason: last?.cancel_reason || null,
+        reached: true,
+        waited_ms: deps.now() - start,
+        cancellation_context: cancellationContext,
+      });
+    }
+    if (TERMINAL_ORDER_STATES.has(status) && status !== until) {
+      const cancellationContext =
+        status === "cancelled" && !last?.cancel_reason
+          ? await fetchOrderCancellationContext(deps, orderId)
+          : null;
+      return JSON.stringify({
+        id: last.id,
+        status,
+        cancel_reason: last?.cancel_reason || null,
         reached: false,
         reason: "terminal_state_before_target",
         waited_ms: deps.now() - start,
+        cancellation_context: cancellationContext,
       });
     }
     await deps.sleep(intervalMs);
@@ -574,17 +597,50 @@ function parseDeliveryNote(deliveryNote) {
   }
 }
 
+function summarizeOrderMessages(messages, limit = 3) {
+  const recent = (Array.isArray(messages) ? messages : [])
+    .slice(-limit)
+    .map((message) => ({
+      id: message?.id || null,
+      sender_id: message?.sender_id || null,
+      sender_name: message?.sender?.name || null,
+      content: message?.content || "",
+      created_at: message?.created_at || null,
+    }));
+  return {
+    message_count: Array.isArray(messages) ? messages.length : 0,
+    recent_messages: recent,
+    latest_message: recent.length > 0 ? recent[recent.length - 1] : null,
+  };
+}
+
+async function fetchOrderCancellationContext(deps, orderId) {
+  try {
+    const detail = await requestJson(deps, "GET", `/orders/${orderId}/messages?limit=20`);
+    const messages = Array.isArray(detail?.messages) ? detail.messages : [];
+    return summarizeOrderMessages(messages);
+  } catch (_err) {
+    return null;
+  }
+}
+
 async function commandResult(options, deps) {
   const orderId = requiredOption(options, "order");
   const detail = await requestJson(deps, "GET", `/orders/${orderId}`);
   const order = detail.order || detail;
   const delivery = parseDeliveryNote(order?.delivery_note);
+  const cancellationContext =
+    order?.status === "cancelled" && !order?.cancel_reason
+      ? await fetchOrderCancellationContext(deps, orderId)
+      : null;
   return JSON.stringify({
     id: order?.id,
     status: order?.status,
+    cancel_reason: order?.cancel_reason || null,
     delivery_format: delivery.format,
     delivery: delivery.value,
     delivery_validation: order?.delivery_validation || null,
+    cancellation_context: cancellationContext,
   });
 }
 

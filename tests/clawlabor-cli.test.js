@@ -201,6 +201,102 @@ test("buy creates a purchase request with idempotency", async () => {
   assert.deepEqual(JSON.parse(calls[0].options.body), { requirement: { url: "https://example.com" } });
 });
 
+test("status surfaces structured cancel_reason without message fallback", async () => {
+  const fetch = async (url, options) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/api/orders/order-123") {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          order: {
+            id: "order-123",
+            status: "cancelled",
+            delivery_note: null,
+            delivery_validation: null,
+            accept_deadline: "2026-05-07T10:00:00Z",
+            confirm_deadline: null,
+            accepted_at: null,
+            completed_at: null,
+            confirmed_at: null,
+            cancel_reason: "Seller found the upstream source unavailable.",
+          },
+        }),
+      };
+    }
+    if (pathname === "/api/orders/order-123/messages") {
+      throw new Error("message fallback should not run when cancel_reason is present");
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  const out = [];
+  await runCli(["status", "--order", "order-123"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.cancel_reason, "Seller found the upstream source unavailable.");
+  assert.equal(result.cancellation_context, null);
+});
+
+test("wait falls back to cancellation context when cancel_reason is absent", async () => {
+  const fetch = async (url, options) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/api/orders/order-123") {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ order: { id: "order-123", status: "cancelled" } }),
+      };
+    }
+    if (pathname === "/api/orders/order-123/messages") {
+      assert.equal(options.method, "GET");
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            messages: [
+              {
+                id: "msg-1",
+                sender_id: "seller-1",
+                sender: { name: "Seller One" },
+                content: "Order cancelled: I could not access the required attachment.",
+                created_at: "2026-05-07T09:10:00Z",
+              },
+            ],
+          }),
+      };
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  const out = [];
+  await runCli(["wait", "--order", "order-123", "--until", "pending_confirmation", "--timeout", "1", "--interval", "1"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+    sleep: async () => {},
+    now: (() => {
+      let current = 0;
+      return () => {
+        current += 100;
+        return current;
+      };
+    })(),
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.reached, false);
+  assert.equal(result.reason, "terminal_state_before_target");
+  assert.equal(result.cancel_reason, null);
+  assert.equal(result.cancellation_context.latest_message.content, "Order cancelled: I could not access the required attachment.");
+});
+
 test("match applies local policy defaults", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-policy-"));
   const policyFile = path.join(tempDir, "policy.json");
@@ -473,6 +569,28 @@ test("result parses JSON delivery_note", async () => {
   const data = JSON.parse(out[0]);
   assert.equal(data.delivery_format, "json");
   assert.deepEqual(data.delivery.opportunities, ["a", "b"]);
+});
+
+test("result surfaces structured cancel_reason on cancelled orders", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/orders/order-2", {
+      status: 200,
+      body: JSON.stringify({
+        order: {
+          id: "order-2",
+          status: "cancelled",
+          delivery_note: null,
+          cancel_reason: "Seller could not access the source file.",
+        },
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(["result", "--order", "order-2"], { env: BASE_ENV, fetch, stdout: (t) => out.push(t) });
+  const data = JSON.parse(out[0]);
+  assert.equal(data.cancel_reason, "Seller could not access the source file.");
+  assert.equal(data.cancellation_context, null);
+  assert.equal(calls.length, 1);
 });
 
 test("confirm posts to confirm endpoint", async () => {

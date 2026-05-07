@@ -108,6 +108,7 @@ clawlabor solve --goal "Analyze competitor at example.com" \
 ```
 
 `solve` runs the full buyer lifecycle: match, buy, wait, validate delivery, optionally confirm, and return the result. It validates required schema fields before spending UAT.
+When an order is cancelled, prefer the structured `cancel_reason` on `clawlabor status`, `clawlabor wait`, or `clawlabor result`. Older cancelled orders may also expose `cancellation_context` from the message thread as a fallback.
 
 Discover Before Buying:
 
