@@ -113,6 +113,18 @@ function authHeaders(env) {
   };
 }
 
+function authOnlyHeaders(env) {
+  const apiKey = resolveApiKey(env);
+  if (!apiKey) {
+    const error = new Error(
+      "Set CLAWLABOR_API_KEY or store api_key in ~/.config/agentmarket/credentials.json before calling clawlabor",
+    );
+    error.errorCode = "missing_credentials";
+    throw error;
+  }
+  return { Authorization: `Bearer ${apiKey}` };
+}
+
 function makeIdempotencyKey() {
   return `clawlabor-buy-${Date.now()}-${crypto.randomUUID()}`;
 }
@@ -199,6 +211,51 @@ async function requestJsonNoAuth(deps, method, path, options) {
   return text ? JSON.parse(text) : {};
 }
 
+async function requestMultipart(deps, method, path, formData) {
+  const url = `${apiBase(deps.env)}${path}`;
+  const response = await deps.fetch(url, {
+    method,
+    headers: authOnlyHeaders(deps.env),
+    body: formData,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new ApiError(response.status, text);
+  }
+  return text;
+}
+
+function readAttachmentOptions(options, fileOptionName = "file") {
+  const filePath = requiredOption(options, fileOptionName);
+  return {
+    filePath,
+    filename: options.filename || path.basename(filePath),
+    contentType: options["content-type"] || "application/octet-stream",
+    description: options.description,
+    overwriteFilename: options["overwrite-filename"],
+  };
+}
+
+async function uploadAttachment(deps, entity, id, attachment) {
+  const bytes = fs.readFileSync(attachment.filePath);
+  const formData = new FormData();
+  formData.append(
+    "file",
+    new Blob([bytes], { type: attachment.contentType }),
+    attachment.filename,
+  );
+  if (attachment.description) formData.append("description", attachment.description);
+  if (attachment.overwriteFilename) {
+    formData.append("overwrite_filename", attachment.overwriteFilename);
+  }
+  return requestMultipart(
+    deps,
+    "POST",
+    attachmentPath({ entity, id }),
+    formData,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // policy / requirement helpers
 // ---------------------------------------------------------------------------
@@ -211,6 +268,26 @@ function parseRequirement(options) {
     return JSON.parse(fs.readFileSync(options["requirement-file"], "utf8"));
   }
   return {};
+}
+
+function attachmentPath(options, includeFileId = false) {
+  const entity = requiredOption(options, "entity");
+  const id = requiredOption(options, "id");
+  const fileId = includeFileId ? requiredOption(options, "file-id") : null;
+  const prefixes = {
+    order: "orders",
+    orders: "orders",
+    task: "tasks",
+    tasks: "tasks",
+    submission: "task-submissions",
+    "task-submission": "task-submissions",
+    "task-submissions": "task-submissions",
+  };
+  const prefix = prefixes[entity];
+  if (!prefix) {
+    throw new Error("--entity must be one of: order, task, submission");
+  }
+  return `/${prefix}/${id}/attachments${fileId ? `/${fileId}` : ""}`;
 }
 
 function loadPolicy(options, env) {
@@ -531,7 +608,43 @@ async function commandPost(options, deps) {
   if (options["requirement-json"] || options["requirement-file"]) {
     body.requirement = parseRequirement(options);
   }
-  return request(deps, "POST", "/tasks", { body });
+  if (!options["attachment-file"]) {
+    return request(deps, "POST", "/tasks", { body });
+  }
+
+  const task = await requestJson(deps, "POST", "/tasks", { body });
+  const taskId = task?.id || task?.task?.id;
+  if (!taskId) {
+    throw new Error("Task response did not include task id for attachment upload");
+  }
+  const attachment = await uploadAttachment(deps, "task", taskId, {
+    ...readAttachmentOptions(
+      {
+        ...options,
+        file: options["attachment-file"],
+        description: options["attachment-description"] || options.description,
+      },
+      "file",
+    ),
+  });
+  return JSON.stringify({ task, attachment: attachment ? JSON.parse(attachment) : null });
+}
+
+async function commandUploadAttachment(options, deps) {
+  return uploadAttachment(
+    deps,
+    requiredOption(options, "entity"),
+    requiredOption(options, "id"),
+    readAttachmentOptions(options),
+  );
+}
+
+async function commandListAttachments(options, deps) {
+  return request(deps, "GET", attachmentPath(options));
+}
+
+async function commandDeleteAttachment(options, deps) {
+  return request(deps, "DELETE", attachmentPath(options, true));
 }
 
 function deriveBountyFromGoal(goal, options) {
@@ -613,6 +726,26 @@ async function commandSolve(options, deps, flags) {
   }
   trace.push({ step: "buy", order_id: orderId, listing_id: selected.id });
 
+  if (options["attachment-file"]) {
+    const attachmentText = await uploadAttachment(deps, "order", orderId, {
+      ...readAttachmentOptions(
+        {
+          ...options,
+          file: options["attachment-file"],
+          description: options["attachment-description"] || options.description,
+        },
+        "file",
+      ),
+    });
+    const attachment = attachmentText ? JSON.parse(attachmentText) : null;
+    trace.push({
+      step: "upload_attachment",
+      order_id: orderId,
+      file_id: attachment?.file_id,
+      filename: attachment?.filename,
+    });
+  }
+
   // 4. wait until pending_confirmation
   const waitOutput = await commandWait(
     { ...options, order: orderId, until: "pending_confirmation" },
@@ -681,6 +814,9 @@ const COMMANDS = {
   result: commandResult,
   confirm: commandConfirm,
   post: commandPost,
+  "upload-attachment": commandUploadAttachment,
+  "list-attachments": commandListAttachments,
+  "delete-attachment": commandDeleteAttachment,
   solve: commandSolve,
 };
 
@@ -694,7 +830,14 @@ function usageText() {
     "",
     "Procurement:",
     "  clawlabor solve --goal \"...\" --requirement-json '{...}'",
+    "  clawlabor solve --goal \"...\" --requirement-json '{...}' --attachment-file ./brief.html",
     "  clawlabor plan --goal \"...\" --requirement-json '{...}'",
+    "  clawlabor post --title \"...\" --description \"...\" --reward 50 --attachment-file ./brief.html",
+    "",
+    "Attachments:",
+    "  clawlabor upload-attachment --entity order --id <id> --file ./report.pdf [--description \"...\"]",
+    "  clawlabor list-attachments --entity task --id <id>",
+    "  clawlabor delete-attachment --entity submission --id <id> --file-id <file_id>",
   ].join("\n");
 }
 

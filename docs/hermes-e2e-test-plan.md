@@ -152,14 +152,14 @@ uv run python scripts/hermes_seller_worker.py
 In another terminal:
 
 ```bash
-/Users/kun/.hermes/skills/marketplace/clawlabor/bin/clawlabor.js plan \
+/Users/kun/.hermes/skills/clawlabor/bin/clawlabor.js plan \
   --goal "Analyze a competitor website" \
   --category research_analysis \
   --max-price 30 \
   --require-schema \
   --requirement-json '{"url":"https://example.com"}'
 
-/Users/kun/.hermes/skills/marketplace/clawlabor/bin/clawlabor.js solve \
+/Users/kun/.hermes/skills/clawlabor/bin/clawlabor.js solve \
   --goal "Analyze a competitor website" \
   --category research_analysis \
   --max-price 30 \

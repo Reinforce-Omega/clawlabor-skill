@@ -508,6 +508,116 @@ test("post creates a bounty task", async () => {
   assert.equal(body.task_mode, "bounty");
 });
 
+test("upload-attachment posts multipart file without JSON content-type", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-upload-"));
+  const filePath = path.join(tempDir, "report.html");
+  fs.writeFileSync(filePath, "<html>ok</html>");
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/orders/order-123/attachments", {
+      status: 201,
+      body: JSON.stringify({ file_id: "file-1", filename: "brief.html" }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(
+    [
+      "upload-attachment",
+      "--entity",
+      "order",
+      "--id",
+      "order-123",
+      "--file",
+      filePath,
+      "--filename",
+      "brief.html",
+      "--content-type",
+      "text/html",
+      "--description",
+      "Buyer material",
+    ],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer test-key");
+  assert.equal(calls[0].options.headers["Content-Type"], undefined);
+  assert.equal(calls[0].options.body.get("description"), "Buyer material");
+  const uploaded = calls[0].options.body.get("file");
+  assert.equal(uploaded.name, "brief.html");
+  assert.equal(uploaded.type, "text/html");
+  assert.equal(JSON.parse(out[0]).file_id, "file-1");
+});
+
+test("post uploads attachment after task creation when attachment-file is provided", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-post-attach-"));
+  const filePath = path.join(tempDir, "brief.html");
+  fs.writeFileSync(filePath, "<html>brief</html>");
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/tasks", { status: 201, body: '{"id":"task-1"}' }),
+    matchRoute("POST", "/tasks/task-1/attachments", {
+      status: 201,
+      body: '{"file_id":"file-task-1","filename":"brief.html"}',
+    }),
+  ]);
+  const out = [];
+
+  await runCli(
+    [
+      "post",
+      "--title",
+      "Render HTML",
+      "--description",
+      "Render the attached HTML file into a PNG.",
+      "--reward",
+      "50",
+      "--attachment-file",
+      filePath,
+      "--filename",
+      "brief.html",
+      "--content-type",
+      "text/html",
+      "--attachment-description",
+      "Source HTML",
+    ],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+
+  assert.equal(calls[0].url, "https://api.example.test/api/tasks");
+  assert.equal(calls[1].url, "https://api.example.test/api/tasks/task-1/attachments");
+  assert.equal(calls[1].options.body.get("description"), "Source HTML");
+  assert.equal(JSON.parse(out[0]).attachment.file_id, "file-task-1");
+});
+
+test("list and delete attachment map entity aliases to API paths", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/tasks/task-1/attachments", {
+      status: 200,
+      body: '{"files":[],"file_count":0,"total_size":0}',
+    }),
+    matchRoute("DELETE", "/task-submissions/sub-1/attachments/file-1", {
+      status: 204,
+      body: "",
+    }),
+  ]);
+
+  await runCli(
+    ["list-attachments", "--entity", "task", "--id", "task-1"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
+  );
+  await runCli(
+    ["delete-attachment", "--entity", "submission", "--id", "sub-1", "--file-id", "file-1"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
+  );
+
+  assert.equal(calls[0].url, "https://api.example.test/api/tasks/task-1/attachments");
+  assert.equal(
+    calls[1].url,
+    "https://api.example.test/api/task-submissions/sub-1/attachments/file-1",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // solve orchestrator
 // ---------------------------------------------------------------------------
@@ -585,6 +695,91 @@ test("solve runs match → buy → wait → validate → confirm", async () => {
   assert.equal(result.delivery_format, "json");
   // Confirm endpoint hit
   assert.ok(calls.some((c) => c.url.endsWith("/orders/order-9/confirm")));
+});
+
+test("solve uploads attachment after purchase before waiting for delivery", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-solve-attach-"));
+  const filePath = path.join(tempDir, "brief.html");
+  fs.writeFileSync(filePath, "<html>brief</html>");
+  const routes = [
+    matchRoute("POST", "/listings/match", {
+      status: 200,
+      body: JSON.stringify({
+        matches: [
+          {
+            id: "sku-1",
+            price: 20,
+            trust_score: 90,
+            input_schema: { type: "object", required: ["instructions"] },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+        ],
+      }),
+    }),
+    matchRoute("POST", "/listings/sku-1/purchase", {
+      status: 201,
+      body: '{"id":"order-attach"}',
+    }),
+    matchRoute("POST", "/orders/order-attach/attachments", {
+      status: 201,
+      body: '{"file_id":"file-order-1","filename":"brief.html"}',
+    }),
+    matchRoute("GET", "/orders/order-attach", {
+      status: 200,
+      body: JSON.stringify({
+        order: {
+          id: "order-attach",
+          status: "pending_confirmation",
+          delivery_note: "done",
+        },
+      }),
+    }),
+    matchRoute("POST", "/orders/order-attach/validate-delivery", {
+      status: 200,
+      body: '{"verdict":"valid","can_auto_confirm":false}',
+    }),
+  ];
+  const { fetch, calls } = recordingFetch(routes);
+  const out = [];
+
+  await runCli(
+    [
+      "solve",
+      "--goal",
+      "Render attached HTML",
+      "--requirement-json",
+      '{"instructions":"Render the attached source HTML file."}',
+      "--attachment-file",
+      filePath,
+      "--filename",
+      "brief.html",
+      "--content-type",
+      "text/html",
+      "--attachment-description",
+      "Source HTML",
+      "--timeout",
+      "60",
+      "--interval",
+      "1",
+    ],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      makeIdempotencyKey: () => "fixed",
+      sleep: async () => {},
+      now: () => 0,
+    },
+  );
+
+  const urls = calls.map((call) => call.url);
+  assert.ok(urls.indexOf("https://api.example.test/api/listings/sku-1/purchase") < urls.indexOf("https://api.example.test/api/orders/order-attach/attachments"));
+  assert.ok(urls.indexOf("https://api.example.test/api/orders/order-attach/attachments") < urls.indexOf("https://api.example.test/api/orders/order-attach"));
+  assert.equal(calls[2].options.body.get("description"), "Source HTML");
+  assert.equal(
+    JSON.parse(out[0]).trace.some((step) => step.step === "upload_attachment"),
+    true,
+  );
 });
 
 test("solve buys the first schema-compatible allowed listing", async () => {
@@ -836,7 +1031,7 @@ test("installer supports Hermes target", () => {
   );
 
   assert.equal(result.status, 0, result.stderr);
-  const target = path.join(tempHome, ".hermes", "skills", "marketplace", "clawlabor");
+  const target = path.join(tempHome, ".hermes", "skills", "clawlabor");
   assert.equal(fs.existsSync(path.join(target, "SKILL.md")), true);
   assert.equal(fs.existsSync(path.join(target, "bin", "clawlabor.js")), true);
   assert.equal(fs.existsSync(path.join(target, "runtime", "cli.js")), true);
@@ -875,7 +1070,17 @@ test("installer auto-detects Hermes when ~/.hermes exists", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
-    fs.existsSync(path.join(tempHome, ".hermes", "skills", "marketplace", "clawlabor", "SKILL.md")),
+    fs.existsSync(path.join(tempHome, ".hermes", "skills", "clawlabor", "SKILL.md")),
     true,
   );
+});
+
+test("skill contract tells agents to discover marketplace capabilities before local workarounds", () => {
+  const skill = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+
+  assert.match(skill, /Discovery-first trigger/);
+  assert.match(skill, /marketplace is the source of truth/);
+  assert.match(skill, /do not rely on this skill file to enumerate/);
+  assert.match(skill, /clawlabor plan --goal "<describe the user's requested deliverable>"/);
+  assert.match(skill, /omit `--category`/);
 });

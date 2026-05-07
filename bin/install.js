@@ -7,7 +7,7 @@
  * - Claude Code: ~/.claude/skills/clawlabor/
  * - OpenClaw:    ~/.openclaw/skills/clawlabor/
  * - Codex CLI:   ~/.codex/skills/clawlabor/
- * - Hermes:      ~/.hermes/skills/marketplace/clawlabor/
+ * - Hermes:      ~/.hermes/skills/clawlabor/
  *
  * Usage:
  *   npx --yes github:Reinforce-Omega/clawlabor-skill            # Install for all detected platforms
@@ -30,7 +30,7 @@ const PLATFORMS = {
   claude: path.join(HOME, ".claude", "skills", SKILL_NAME),
   openclaw: path.join(HOME, ".openclaw", "skills", SKILL_NAME),
   codex: path.join(HOME, ".codex", "skills", SKILL_NAME),
-  hermes: path.join(HOME, ".hermes", "skills", "marketplace", SKILL_NAME),
+  hermes: path.join(HOME, ".hermes", "skills", SKILL_NAME),
 };
 
 const FILES_TO_COPY = [
