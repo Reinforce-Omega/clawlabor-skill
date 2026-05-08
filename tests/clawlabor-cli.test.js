@@ -1528,3 +1528,125 @@ test("buy with --input @-file stages and injects URL into purchase", async () =>
 
   nodeFs.unlinkSync(tmpFile);
 });
+
+test("solve with --auto-confirm fires confirm and reports auto_confirm.fired=true", async () => {
+  const { runCli } = require("../runtime/cli");
+
+  const calls = [];
+  const fakeFetch = async (url, opts) => {
+    calls.push({ url, method: opts?.method || "GET" });
+    if (url.endsWith("/listings/match"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        matches: [{ id: "sku_1", price: 10, policy: { allowed: true },
+          input_schema: { properties: { input: { type: "string" } }, required: ["input"] } }]
+      })};
+    if (url.endsWith("/purchase"))
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_1" }) };
+    if (url.includes("/orders/ord_1/validate-delivery"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        verdict: "valid", overall_score: 0.95, can_auto_confirm: true,
+        auto_confirm_policy: { min_score: 0.8, required_verdict: "valid" },
+        auto_confirm_skip_reason: null,
+      })};
+    if (url.includes("/orders/ord_1/confirm"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_1", status: "completed" }) };
+    if (url.includes("/orders/ord_1/attachments"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ files: [], file_count: 0, total_size: 0 }) };
+    if (url.includes("/orders/ord_1"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_1", status: "pending_confirmation", delivery_note: null }) };
+    return { ok: false, status: 404, text: async () => "not found" };
+  };
+
+  const out = [];
+  await runCli(
+    ["solve", "--goal", "do thing", "--requirement-json", '{"input":"x"}', "--auto-confirm"],
+    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
+  );
+
+  const result = JSON.parse(out.join(""));
+  assert.equal(result.auto_confirmed, true);
+  assert.ok(result.auto_confirm, "auto_confirm block present");
+  assert.equal(result.auto_confirm.requested, true);
+  assert.equal(result.auto_confirm.fired, true);
+  assert.equal(result.auto_confirm.skip_reason, null);
+  assert.deepEqual(result.auto_confirm.policy, { min_score: 0.8, required_verdict: "valid" });
+});
+
+test("solve with --auto-confirm but low score reports skip_reason and next_action", async () => {
+  const { runCli } = require("../runtime/cli");
+
+  const fakeFetch = async (url, opts) => {
+    if (url.endsWith("/listings/match"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        matches: [{ id: "sku_1", price: 10, policy: { allowed: true },
+          input_schema: { properties: { input: { type: "string" } }, required: ["input"] } }]
+      })};
+    if (url.endsWith("/purchase"))
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_2" }) };
+    if (url.includes("/orders/ord_2/validate-delivery"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        verdict: "partial", overall_score: 0.5, can_auto_confirm: false,
+        auto_confirm_policy: { min_score: 0.8, required_verdict: "valid" },
+        auto_confirm_skip_reason: "overall_score 0.50 below required 0.80",
+      })};
+    if (url.includes("/orders/ord_2/attachments"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ files: [], file_count: 0, total_size: 0 }) };
+    if (url.includes("/orders/ord_2"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_2", status: "pending_confirmation", delivery_note: null }) };
+    return { ok: false, status: 404, text: async () => "not found" };
+  };
+
+  const out = [];
+  await runCli(
+    ["solve", "--goal", "do thing", "--requirement-json", '{"input":"x"}', "--auto-confirm"],
+    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
+  );
+
+  const result = JSON.parse(out.join(""));
+  assert.equal(result.auto_confirmed, false);
+  assert.equal(result.action, "delivered");
+  assert.equal(result.auto_confirm.requested, true);
+  assert.equal(result.auto_confirm.fired, false);
+  assert.equal(result.auto_confirm.skip_reason, "overall_score 0.50 below required 0.80");
+  assert.ok(
+    result.auto_confirm.next_action.includes("clawlabor confirm --order ord_2"),
+    `next_action should reference manual confirm: ${result.auto_confirm.next_action}`,
+  );
+});
+
+test("solve without --auto-confirm reports auto_confirm.requested=false", async () => {
+  const { runCli } = require("../runtime/cli");
+
+  const fakeFetch = async (url, opts) => {
+    if (url.endsWith("/listings/match"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        matches: [{ id: "sku_1", price: 10, policy: { allowed: true },
+          input_schema: { properties: { input: { type: "string" } }, required: ["input"] } }]
+      })};
+    if (url.endsWith("/purchase"))
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_3" }) };
+    if (url.includes("/orders/ord_3/validate-delivery"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        verdict: "valid", overall_score: 0.95, can_auto_confirm: true,
+        auto_confirm_policy: { min_score: 0.8, required_verdict: "valid" },
+        auto_confirm_skip_reason: null,
+      })};
+    if (url.includes("/orders/ord_3/attachments"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ files: [], file_count: 0, total_size: 0 }) };
+    if (url.includes("/orders/ord_3"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_3", status: "pending_confirmation", delivery_note: null }) };
+    return { ok: false, status: 404, text: async () => "not found" };
+  };
+
+  const out = [];
+  await runCli(
+    ["solve", "--goal", "do thing", "--requirement-json", '{"input":"x"}'],
+    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
+  );
+
+  const result = JSON.parse(out.join(""));
+  assert.equal(result.auto_confirmed, false);
+  assert.equal(result.auto_confirm.requested, false);
+  assert.equal(result.auto_confirm.fired, false);
+  assert.equal(result.auto_confirm.skip_reason, null);
+});

@@ -1102,8 +1102,9 @@ async function commandSolve(options, deps, flags) {
   });
 
   // 6. optionally confirm
+  const autoConfirmRequested = flags.has("auto-confirm");
   let confirmed = null;
-  if (flags.has("auto-confirm") && validation?.can_auto_confirm) {
+  if (autoConfirmRequested && validation?.can_auto_confirm) {
     confirmed = await requestJson(deps, "POST", `/orders/${orderId}/confirm`, { body: {} });
     trace.push({ step: "confirm", order_id: orderId });
   }
@@ -1113,6 +1114,20 @@ async function commandSolve(options, deps, flags) {
   const order = orderDetail.order || orderDetail;
   const delivery = parseDeliveryNote(order?.delivery_note);
   const attachments = await fetchOrderAttachments(deps, orderId);
+
+  const autoConfirm = {
+    requested: autoConfirmRequested,
+    fired: Boolean(confirmed),
+    policy: validation?.auto_confirm_policy || null,
+    skip_reason:
+      autoConfirmRequested && !confirmed
+        ? validation?.auto_confirm_skip_reason || "validation response did not permit auto-confirm"
+        : null,
+    next_action:
+      autoConfirmRequested && !confirmed
+        ? `Review delivery, then run: clawlabor confirm --order ${orderId}`
+        : null,
+  };
 
   return JSON.stringify({
     action: confirmed ? "completed" : "delivered",
@@ -1124,6 +1139,7 @@ async function commandSolve(options, deps, flags) {
     delivery_attestation: order?.delivery_attestation || null,
     attachments,
     auto_confirmed: Boolean(confirmed),
+    auto_confirm: autoConfirm,
     trace,
   });
 }
