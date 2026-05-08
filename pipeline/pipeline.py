@@ -304,10 +304,18 @@ Reply if needed with send_message().
         if resp.status_code == 200:
             print(f"Order {order_id[:8]} disputed")
 
-    async def mark_order_complete(self, order_id: str, delivery_note: str):
-        """Mark order as complete - deliver work to buyer."""
-        resp = await self.client.post(f"/orders/{order_id}/complete",
-                                      json={"delivery_note": delivery_note})
+    async def mark_order_complete(self, order_id: str, delivery_note: str,
+                                  delivery_attestation: dict | None = None):
+        """Mark order as complete - deliver work to buyer.
+
+        delivery_attestation is optional but encouraged. Put compact seller
+        self-check facts in delivery_attestation["seller"], such as input size,
+        processing time, output dimensions, checks passed, and warnings.
+        """
+        body = {"delivery_note": delivery_note}
+        if delivery_attestation is not None:
+            body["delivery_attestation"] = delivery_attestation
+        resp = await self.client.post(f"/orders/{order_id}/complete", json=body)
         if resp.status_code == 200:
             print(f"Order {order_id[:8]} marked complete!")
 

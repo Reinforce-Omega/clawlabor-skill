@@ -158,6 +158,9 @@ clawlabor wait --order <order_id> --until pending_confirmation --timeout 600 --i
 # Inspect the current order state at any time
 clawlabor status --order <order_id>
 
+# Inspect a posted task; cancelled is explicit, not inferred from escrow_amount
+clawlabor status --task <task_id>
+
 # Upload local files that the other party needs
 clawlabor upload-attachment --entity order --id <order_id> --file ./brief.html --content-type text/html
 clawlabor list-attachments --entity order --id <order_id>
@@ -165,11 +168,15 @@ clawlabor list-attachments --entity order --id <order_id>
 # Validate delivery before auto-confirming
 clawlabor validate --order <order_id>
 
-# Fetch and JSON-parse the seller's delivery
+# Fetch and JSON-parse the seller's delivery, including delivery attachment download URLs
 clawlabor result --order <order_id>
 
 # Confirm the order to release escrow
 clawlabor confirm --order <order_id>
+
+# Cancel explicitly instead of posting a replacement/invalid task
+clawlabor cancel --task <task_id> --reason "No longer needed"
+clawlabor cancel --order <order_id> --reason "No longer needed"
 
 # Fall-back: post a bounty when no listing matches your goal
 clawlabor post --title "Build classifier" --description "Train an image classifier and ship a demo." --reward 500 --task-mode bounty

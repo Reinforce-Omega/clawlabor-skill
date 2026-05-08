@@ -514,7 +514,31 @@ async function commandInspect(options, deps) {
 }
 
 async function commandStatus(options, deps) {
-  const orderId = requiredOption(options, "order");
+  const orderId = options.order;
+  const taskId = options.task;
+  if (orderId && taskId) {
+    throw new Error("Use either --order or --task, not both");
+  }
+  if (taskId) {
+    const detail = await requestJson(deps, "GET", `/tasks/${taskId}`);
+    const task = detail.task || detail;
+    return JSON.stringify({
+      id: task?.id,
+      status: task?.status,
+      task_mode: task?.task_mode || null,
+      reward: task?.reward ?? null,
+      escrow_amount: task?.escrow_amount ?? null,
+      is_cancelled: task?.status === "cancelled",
+      is_open: task?.status === "open",
+      closed_at: task?.closed_at || null,
+      submission_deadline: task?.submission_deadline || null,
+      selection_deadline: task?.selection_deadline || null,
+      current_submissions: task?.current_submissions ?? null,
+    });
+  }
+  if (!orderId) {
+    throw new Error("Missing required --order or --task");
+  }
   const detail = await requestJson(deps, "GET", `/orders/${orderId}`);
   const order = detail.order || detail;
   const cancellationContext =
@@ -624,11 +648,38 @@ async function fetchOrderCancellationContext(deps, orderId) {
   }
 }
 
+async function fetchOrderAttachments(deps, orderId) {
+  try {
+    const response = await requestJson(deps, "GET", `/orders/${orderId}/attachments`);
+    const files = Array.isArray(response?.files) ? response.files : [];
+    const deliveryFiles = files.filter((file) => file?.file_type === "seller_delivery");
+    return {
+      files,
+      delivery_files: deliveryFiles,
+      file_count: Number.isFinite(response?.file_count) ? response.file_count : files.length,
+      delivery_file_count: deliveryFiles.length,
+      total_size: Number.isFinite(response?.total_size)
+        ? response.total_size
+        : files.reduce((sum, file) => sum + (Number(file?.size) || 0), 0),
+    };
+  } catch (_err) {
+    return {
+      files: [],
+      delivery_files: [],
+      file_count: 0,
+      delivery_file_count: 0,
+      total_size: 0,
+      unavailable: true,
+    };
+  }
+}
+
 async function commandResult(options, deps) {
   const orderId = requiredOption(options, "order");
   const detail = await requestJson(deps, "GET", `/orders/${orderId}`);
   const order = detail.order || detail;
   const delivery = parseDeliveryNote(order?.delivery_note);
+  const attachments = await fetchOrderAttachments(deps, orderId);
   const cancellationContext =
     order?.status === "cancelled" && !order?.cancel_reason
       ? await fetchOrderCancellationContext(deps, orderId)
@@ -639,6 +690,8 @@ async function commandResult(options, deps) {
     cancel_reason: order?.cancel_reason || null,
     delivery_format: delivery.format,
     delivery: delivery.value,
+    delivery_attestation: order?.delivery_attestation || null,
+    attachments,
     delivery_validation: order?.delivery_validation || null,
     cancellation_context: cancellationContext,
   });
@@ -647,6 +700,26 @@ async function commandResult(options, deps) {
 async function commandConfirm(options, deps) {
   const orderId = requiredOption(options, "order");
   return request(deps, "POST", `/orders/${orderId}/confirm`, { body: {} });
+}
+
+async function commandCancel(options, deps) {
+  const orderId = options.order;
+  const taskId = options.task;
+  if (orderId && taskId) {
+    throw new Error("Use either --order or --task, not both");
+  }
+  if (!orderId && !taskId) {
+    throw new Error("Missing required --order or --task");
+  }
+  if (orderId && !options.reason) {
+    throw new Error("Missing required --reason");
+  }
+  const body = {};
+  if (options.reason) body.reason = options.reason;
+  if (taskId) {
+    return request(deps, "POST", `/tasks/${taskId}/cancel`, { body });
+  }
+  return request(deps, "POST", `/orders/${orderId}/cancel`, { body });
 }
 
 async function commandPost(options, deps) {
@@ -839,6 +912,7 @@ async function commandSolve(options, deps, flags) {
   const orderDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
   const order = orderDetail.order || orderDetail;
   const delivery = parseDeliveryNote(order?.delivery_note);
+  const attachments = await fetchOrderAttachments(deps, orderId);
 
   return JSON.stringify({
     action: confirmed ? "completed" : "delivered",
@@ -847,6 +921,8 @@ async function commandSolve(options, deps, flags) {
     validation,
     delivery_format: delivery.format,
     delivery: delivery.value,
+    delivery_attestation: order?.delivery_attestation || null,
+    attachments,
     auto_confirmed: Boolean(confirmed),
     trace,
   });
@@ -869,6 +945,7 @@ const COMMANDS = {
   wait: commandWait,
   result: commandResult,
   confirm: commandConfirm,
+  cancel: commandCancel,
   post: commandPost,
   "upload-attachment": commandUploadAttachment,
   "list-attachments": commandListAttachments,
@@ -889,6 +966,9 @@ function usageText() {
     "  clawlabor solve --goal \"...\" --requirement-json '{...}' --attachment-file ./brief.html",
     "  clawlabor plan --goal \"...\" --requirement-json '{...}'",
     "  clawlabor post --title \"...\" --description \"...\" --reward 50 --attachment-file ./brief.html",
+    "  clawlabor status --task <task_id>",
+    "  clawlabor cancel --task <task_id> [--reason \"...\"]",
+    "  clawlabor cancel --order <order_id> --reason \"...\"",
     "",
     "Attachments:",
     "  clawlabor upload-attachment --entity order --id <id> --file ./report.pdf [--description \"...\"]",

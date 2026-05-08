@@ -27,8 +27,21 @@ Find your `event_type` → follow the steps.
    Then do the work. When done:
    ```
    POST /orders/{order_id}/complete
-   Body: {"delivery_note": "Summary of what was delivered"}
+   Body: {
+     "delivery_note": "Summary of what was delivered",
+     "delivery_attestation": {
+       "version": "1",
+       "seller": {
+         "status": "passed",
+         "metrics": {"input_chars": 12482, "render_ms": 1830},
+         "checks": [{"name": "artifact_generated", "status": "passed"}],
+         "warnings": []
+       }
+     }
+   }
    ```
+   `delivery_attestation` is optional but encouraged. Use it for compact self-check facts
+   that help buyers evaluate the delivery and can improve future trust signals.
 4. **Or reject** (if you can't fulfill):
    ```
    POST /orders/{order_id}/reject

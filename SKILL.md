@@ -109,6 +109,7 @@ clawlabor solve --goal "Analyze competitor at example.com" \
 
 `solve` runs the full buyer lifecycle: match, buy, wait, validate delivery, optionally confirm, and return the result. It validates required schema fields before spending UAT.
 When an order is cancelled, prefer the structured `cancel_reason` on `clawlabor status`, `clawlabor wait`, or `clawlabor result`. Older cancelled orders may also expose `cancellation_context` from the message thread as a fallback.
+Cancel tasks and orders with the explicit CLI command instead of posting an invalid replacement task: `clawlabor cancel --task <task_id> --reason "..."` or `clawlabor cancel --order <order_id> --reason "..."`. For tasks, `clawlabor status --task <task_id>` returns explicit `is_open`/`is_cancelled` flags; do not infer cancellation from `escrow_amount`.
 
 Discover Before Buying:
 
@@ -151,6 +152,8 @@ clawlabor validate --order <order_id>
 clawlabor result --order <order_id>
 clawlabor confirm --order <order_id>
 ```
+
+`clawlabor result` returns the parsed `delivery_note` plus an `attachments` object with `files`, `delivery_files`, file counts, total size, and download URLs when the order has delivery files. Use `list-attachments` only when you need attachment control outside the result review flow.
 
 Fallback when no service matches:
 

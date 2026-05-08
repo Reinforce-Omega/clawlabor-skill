@@ -560,6 +560,10 @@ test("result parses JSON delivery_note", async () => {
           id: "order-1",
           status: "pending_confirmation",
           delivery_note: JSON.stringify({ report: "ok", opportunities: ["a", "b"] }),
+          delivery_attestation: {
+            version: "1",
+            seller: { status: "passed", metrics: { render_ms: 42 } },
+          },
         },
       }),
     }),
@@ -569,6 +573,7 @@ test("result parses JSON delivery_note", async () => {
   const data = JSON.parse(out[0]);
   assert.equal(data.delivery_format, "json");
   assert.deepEqual(data.delivery.opportunities, ["a", "b"]);
+  assert.equal(data.delivery_attestation.seller.metrics.render_ms, 42);
 });
 
 test("result surfaces structured cancel_reason on cancelled orders", async () => {
@@ -590,7 +595,55 @@ test("result surfaces structured cancel_reason on cancelled orders", async () =>
   const data = JSON.parse(out[0]);
   assert.equal(data.cancel_reason, "Seller could not access the source file.");
   assert.equal(data.cancellation_context, null);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
+});
+
+test("result includes delivery attachments with download URLs", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/orders/order-1", {
+      status: 200,
+      body: JSON.stringify({
+        order: {
+          id: "order-1",
+          status: "pending_confirmation",
+          delivery_note: "See attached report.",
+        },
+      }),
+    }),
+    matchRoute("GET", "/orders/order-1/attachments", {
+      status: 200,
+      body: JSON.stringify({
+        files: [
+          {
+            file_id: "file-delivery",
+            filename: "report.pdf",
+            content_type: "application/pdf",
+            size: 1234,
+            download_url: "https://storage.example.test/report.pdf?sig=abc",
+            file_type: "seller_delivery",
+          },
+          {
+            file_id: "file-input",
+            filename: "brief.txt",
+            content_type: "text/plain",
+            size: 12,
+            download_url: "https://storage.example.test/brief.txt?sig=abc",
+            file_type: "buyer_material",
+          },
+        ],
+        file_count: 2,
+        total_size: 1246,
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(["result", "--order", "order-1"], { env: BASE_ENV, fetch, stdout: (t) => out.push(t) });
+  const data = JSON.parse(out[0]);
+
+  assert.equal(calls[1].url, "https://api.example.test/api/orders/order-1/attachments");
+  assert.equal(data.attachments.file_count, 2);
+  assert.equal(data.attachments.delivery_file_count, 1);
+  assert.equal(data.attachments.delivery_files[0].download_url, "https://storage.example.test/report.pdf?sig=abc");
 });
 
 test("confirm posts to confirm endpoint", async () => {
@@ -600,6 +653,72 @@ test("confirm posts to confirm endpoint", async () => {
   await runCli(["confirm", "--order", "order-1"], { env: BASE_ENV, fetch, stdout: () => {} });
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.body, "{}");
+});
+
+test("status can fetch a task without treating open zero escrow as cancelled", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/tasks/task-1", {
+      status: 200,
+      body: JSON.stringify({
+        id: "task-1",
+        status: "open",
+        task_mode: "bounty",
+        reward: 50,
+        escrow_amount: 0,
+        current_submissions: 0,
+      }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(["status", "--task", "task-1"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  assert.equal(calls[0].url, "https://api.example.test/api/tasks/task-1");
+  const result = JSON.parse(out[0]);
+  assert.equal(result.status, "open");
+  assert.equal(result.escrow_amount, 0);
+  assert.equal(result.is_open, true);
+  assert.equal(result.is_cancelled, false);
+});
+
+test("cancel posts to task cancel endpoint with reason", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/tasks/task-1/cancel", {
+      status: 200,
+      body: '{"id":"task-1","status":"cancelled"}',
+    }),
+  ]);
+
+  await runCli(["cancel", "--task", "task-1", "--reason", "no longer needed"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: () => {},
+  });
+
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), { reason: "no longer needed" });
+});
+
+test("cancel posts to order cancel endpoint with reason", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/orders/order-1/cancel", {
+      status: 200,
+      body: '{"id":"order-1","status":"cancelled"}',
+    }),
+  ]);
+
+  await runCli(["cancel", "--order", "order-1", "--reason", "buyer cancelled"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: () => {},
+  });
+
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), { reason: "buyer cancelled" });
 });
 
 test("post creates a bounty task", async () => {
