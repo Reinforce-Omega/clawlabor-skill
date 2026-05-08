@@ -198,7 +198,7 @@ test("buy creates a purchase request with idempotency", async () => {
     { env: BASE_ENV, fetch, stdout: () => {}, makeIdempotencyKey: () => "fixed-key" },
   );
   assert.equal(calls[0].options.headers["X-Idempotency-Key"], "fixed-key");
-  assert.deepEqual(JSON.parse(calls[0].options.body), { requirement: { url: "https://example.com" } });
+  assert.deepEqual(JSON.parse(calls[0].options.body), { requirement: { url: "https://example.com" }, staged_attachment_ids: [] });
 });
 
 test("status surfaces structured cancel_reason without message fallback", async () => {
@@ -1320,4 +1320,211 @@ test("skill contract tells agents to discover marketplace capabilities before lo
   assert.match(skill, /do not rely on this skill file to enumerate/);
   assert.match(skill, /clawlabor plan --goal "<describe the user's requested deliverable>"/);
   assert.match(skill, /omit `--category`/);
+});
+
+// ---------------------------------------------------------------------------
+// @-input parsing
+// ---------------------------------------------------------------------------
+
+test("parseInputFlags: @-prefix entry detected as file", () => {
+  const { parseInputFlags } = require("../runtime/cli");
+  const entries = parseInputFlags(["file_url=@/tmp/report.html", "format=png"]);
+  assert.equal(entries.length, 2);
+  const fileEntry = entries.find((e) => e.field === "file_url");
+  assert.ok(fileEntry.isFile);
+  assert.equal(fileEntry.localPath, "/tmp/report.html");
+  const strEntry = entries.find((e) => e.field === "format");
+  assert.ok(!strEntry.isFile);
+  assert.equal(strEntry.value, "png");
+});
+
+test("isUrlField: suffix and prefix patterns", () => {
+  const { isUrlField } = require("../runtime/cli");
+  assert.ok(isUrlField("image_url"));
+  assert.ok(isUrlField("file_url"));
+  assert.ok(isUrlField("source_pdf_url"));
+  assert.ok(isUrlField("document_uri"));
+  assert.ok(isUrlField("file_path"));
+  assert.ok(isUrlField("image_data"));
+  assert.ok(!isUrlField("caption"));
+  assert.ok(!isUrlField("format"));
+});
+
+test("isUrlField: schema uri format override", () => {
+  const { isUrlField } = require("../runtime/cli");
+  const schema = { properties: { caption: { type: "string", format: "uri" } } };
+  assert.ok(isUrlField("caption", schema));
+});
+
+test("stageAndUploadFile: calls stage, PUT, confirm, returns signed URL", async () => {
+  const { stageAndUploadFile } = require("../runtime/cli");
+  const nodePath = require("node:path");
+  const nodeFs = require("node:fs");
+
+  const tmpFile = nodePath.join(os.tmpdir(), "test-staged.txt");
+  nodeFs.writeFileSync(tmpFile, "hello world");
+
+  const fetchCalls = [];
+  const fakeFetch = async (url, opts) => {
+    fetchCalls.push({ url, method: opts?.method || "GET" });
+    if (url.endsWith("/attachments/stage")) {
+      return {
+        ok: true,
+        status: 201,
+        text: async () => JSON.stringify({
+          staged_attachment_id: "sta_test",
+          upload_url: "https://s3.example.com/put",
+          upload_url_expires_at: new Date().toISOString(),
+          expires_at: new Date().toISOString(),
+        }),
+      };
+    }
+    if (url.endsWith("/confirm")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          staged_attachment_id: "sta_test",
+          status: "uploaded",
+          signed_download_url: "https://s3.example.com/get?sig=abc",
+        }),
+      };
+    }
+    // S3 PUT
+    return { ok: true, status: 200, text: async () => "" };
+  };
+
+  const deps = {
+    env: { CLAWLABOR_API_KEY: "test-key", CLAWLABOR_API_BASE: "https://api.test/api" },
+    fetch: fakeFetch,
+  };
+
+  const result = await stageAndUploadFile(deps, { field: "file_url", localPath: tmpFile, isFile: true });
+
+  assert.equal(result.stagedId, "sta_test");
+  assert.equal(result.signedUrl, "https://s3.example.com/get?sig=abc");
+  assert.equal(result.field, "file_url");
+
+  const stageCalls = fetchCalls.filter((c) => c.url.endsWith("/attachments/stage"));
+  assert.equal(stageCalls.length, 1);
+  const s3PutCalls = fetchCalls.filter((c) => c.url.includes("s3.example.com") && c.method === "PUT");
+  assert.equal(s3PutCalls.length, 1);
+  const confirmCalls = fetchCalls.filter((c) => c.url.endsWith("/confirm"));
+  assert.equal(confirmCalls.length, 1);
+
+  const stageIdx = fetchCalls.findIndex((c) => c.url.endsWith("/attachments/stage"));
+  const putIdx = fetchCalls.findIndex((c) => c.url.includes("s3.example.com") && c.method === "PUT");
+  const confirmIdx = fetchCalls.findIndex((c) => c.url.endsWith("/confirm"));
+  assert.ok(stageIdx < putIdx, "stage must precede PUT");
+  assert.ok(putIdx < confirmIdx, "PUT must precede confirm");
+
+  nodeFs.unlinkSync(tmpFile);
+});
+
+test("solve with --input @-file stages and injects URL into requirement", async () => {
+  const { runCli } = require("../runtime/cli");
+  const nodeOs = require("node:os");
+  const nodePath = require("node:path");
+  const nodeFs = require("node:fs");
+
+  const tmpFile = nodePath.join(nodeOs.tmpdir(), "test-input.png");
+  nodeFs.writeFileSync(tmpFile, Buffer.alloc(16, 0xff));
+
+  const calls = [];
+  const fakeFetch = async (url, opts) => {
+    calls.push({ url, method: opts?.method || "GET", body: opts?.body });
+    if (url.endsWith("/listings/match"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        matches: [{ id: "sku_1", price: 10, policy: { allowed: true },
+          input_schema: { properties: { image_url: { type: "string", format: "uri" } }, required: ["image_url"] } }]
+      })};
+    if (url.endsWith("/attachments/stage"))
+      return { ok: true, status: 201, text: async () => JSON.stringify({
+        staged_attachment_id: "sta_1", upload_url: "https://s3.test/put",
+        upload_url_expires_at: new Date().toISOString(), expires_at: new Date().toISOString()
+      })};
+    if (url.includes("s3.test/put"))
+      return { ok: true, status: 200, text: async () => "" };
+    if (url.endsWith("/confirm"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        staged_attachment_id: "sta_1", status: "uploaded",
+        signed_download_url: "https://s3.test/get?sig=abc"
+      })};
+    if (url.endsWith("/purchase")) {
+      const body = JSON.parse(opts.body);
+      assert.equal(body.requirement.image_url, "https://s3.test/get?sig=abc");
+      assert.deepEqual(body.staged_attachment_ids, ["sta_1"]);
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_1" }) };
+    }
+    if (url.includes("/orders/ord_1/validate-delivery"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ verdict: "pass", can_auto_confirm: true }) };
+    if (url.includes("/orders/ord_1/confirm"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_1", status: "completed" }) };
+    if (url.includes("/orders/ord_1/attachments"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ files: [], file_count: 0, total_size: 0 }) };
+    if (url.includes("/orders/ord_1"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_1", status: "completed", delivery_note: null }) };
+    return { ok: false, status: 404, text: async () => "not found" };
+  };
+
+  const out = [];
+  await runCli(
+    ["solve", "--goal", "convert to png", "--input", `image_url=@${tmpFile}`, "--auto-confirm"],
+    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
+  );
+
+  const purchaseCall = calls.find((c) => c.url.endsWith("/purchase"));
+  assert.ok(purchaseCall, "purchase was called");
+
+  const matchIdx = calls.findIndex((c) => c.url.endsWith("/listings/match"));
+  const stageIdx = calls.findIndex((c) => c.url.endsWith("/attachments/stage"));
+  assert.ok(matchIdx >= 0, "match was called");
+  assert.ok(stageIdx >= 0, "stage was called");
+  assert.ok(matchIdx < stageIdx, "match must precede staging");
+
+  nodeFs.unlinkSync(tmpFile);
+});
+
+test("buy with --input @-file stages and injects URL into purchase", async () => {
+  const { runCli } = require("../runtime/cli");
+  const nodeOs = require("node:os");
+  const nodePath = require("node:path");
+  const nodeFs = require("node:fs");
+
+  const tmpFile = nodePath.join(nodeOs.tmpdir(), "test-buy-input.png");
+  nodeFs.writeFileSync(tmpFile, Buffer.alloc(8, 0xaa));
+
+  const calls = [];
+  const fakeFetch = async (url, opts) => {
+    calls.push({ url, method: opts?.method || "GET", body: opts?.body });
+    if (url.endsWith("/attachments/stage"))
+      return { ok: true, status: 201, text: async () => JSON.stringify({
+        staged_attachment_id: "sta_buy_1", upload_url: "https://s3.test/put-buy",
+        upload_url_expires_at: new Date().toISOString(), expires_at: new Date().toISOString()
+      })};
+    if (url.includes("s3.test/put-buy"))
+      return { ok: true, status: 200, text: async () => "" };
+    if (url.endsWith("/confirm"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        staged_attachment_id: "sta_buy_1", status: "uploaded",
+        signed_download_url: "https://s3.test/get-buy?sig=xyz"
+      })};
+    if (url.endsWith("/purchase")) {
+      const body = JSON.parse(opts.body);
+      assert.equal(body.requirement.image_url, "https://s3.test/get-buy?sig=xyz");
+      assert.deepEqual(body.staged_attachment_ids, ["sta_buy_1"]);
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_buy_1" }) };
+    }
+    return { ok: false, status: 404, text: async () => "not found" };
+  };
+
+  await runCli(
+    ["buy", "--listing", "sku_buy_1", "--input", `image_url=@${tmpFile}`],
+    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: () => {} },
+  );
+
+  const purchaseCall = calls.find((c) => c.url.endsWith("/purchase"));
+  assert.ok(purchaseCall, "purchase was called");
+
+  nodeFs.unlinkSync(tmpFile);
 });

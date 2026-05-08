@@ -28,7 +28,17 @@ function parseArgs(argv) {
       parsed.flags.add(key);
       continue;
     }
-    parsed.options[key] = value;
+    if (key === "input") {
+      if (Array.isArray(parsed.options[key])) {
+        parsed.options[key].push(value);
+      } else if (parsed.options[key] !== undefined) {
+        parsed.options[key] = [parsed.options[key], value];
+      } else {
+        parsed.options[key] = value;
+      }
+    } else {
+      parsed.options[key] = value;
+    }
     i += 1;
   }
   return parsed;
@@ -270,6 +280,134 @@ function parseRequirement(options) {
   return {};
 }
 
+// ---------------------------------------------------------------------------
+// attachment staging helpers
+// ---------------------------------------------------------------------------
+
+const URL_FIELD_SUFFIXES = ["_url", "_uri"];
+const URL_FIELD_PREFIXES = ["file_", "image_", "source_", "input_"];
+const BLOCKED_EXTENSIONS = new Set([".exe", ".bat", ".sh", ".dll", ".ps1", ".cmd", ".vbs"]);
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100 MB
+
+function isUrlField(fieldName, inputSchema) {
+  const name = fieldName.toLowerCase();
+  if (URL_FIELD_SUFFIXES.some((s) => name.endsWith(s))) return true;
+  if (URL_FIELD_PREFIXES.some((p) => name.startsWith(p))) return true;
+  if (inputSchema?.properties?.[fieldName]?.format === "uri") return true;
+  return false;
+}
+
+function parseInputFlags(inputValues) {
+  return (inputValues || []).map((raw) => {
+    const eqIdx = raw.indexOf("=");
+    if (eqIdx === -1) throw new Error(`--input must be in field=value or field=@path format, got: ${raw}`);
+    const field = raw.slice(0, eqIdx);
+    const val = raw.slice(eqIdx + 1);
+    if (val.startsWith("@")) {
+      return { field, isFile: true, localPath: val.slice(1) };
+    }
+    return { field, isFile: false, value: val };
+  });
+}
+
+function guessMimeType(ext) {
+  const map = {
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".pdf": "application/pdf",
+    ".zip": "application/zip",
+    ".css": "text/css",
+    ".txt": "text/plain",
+  };
+  return map[ext] || "application/octet-stream";
+}
+
+async function stageAndUploadFile(deps, entry) {
+  const { field, localPath } = entry;
+  const base = apiBase(deps.env);
+  const apiKey = resolveApiKey(deps.env);
+
+  // Fast-fail checks
+  const stat = fs.statSync(localPath);
+  if (stat.size > MAX_UPLOAD_BYTES) {
+    throw new Error(`File too large: ${stat.size} bytes (max ${MAX_UPLOAD_BYTES})`);
+  }
+  const ext = path.extname(localPath).toLowerCase();
+  if (BLOCKED_EXTENSIONS.has(ext)) {
+    throw new Error(`Blocked file extension: ${ext}`);
+  }
+
+  const filename = path.basename(localPath);
+  const bytes = fs.readFileSync(localPath);
+  const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+  const mimeType = guessMimeType(ext);
+
+  if (mimeType === "text/html" || mimeType === "image/svg+xml") {
+    process.stderr.write(
+      `Warning: ${filename} is a high-risk input (HTML/SVG). Seller must render in a sandboxed browser with no network access.\n`,
+    );
+  }
+
+  // 1. Stage
+  const stageResp = await deps.fetch(`${base}/attachments/stage`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      original_filename: filename,
+      requirement_field: field,
+      mime_type: mimeType,
+      size_bytes: stat.size,
+      sha256,
+    }),
+  });
+  if (!stageResp.ok) {
+    const body = await stageResp.text();
+    throw new Error(`Stage failed (${stageResp.status}): ${body}`);
+  }
+  const staged = JSON.parse(await stageResp.text());
+
+  // 2. PUT to presigned upload URL
+  const putResp = await deps.fetch(staged.upload_url, {
+    method: "PUT",
+    headers: { "Content-Type": mimeType },
+    body: bytes,
+  });
+  if (!putResp.ok) {
+    throw new Error(`S3 PUT failed (${putResp.status})`);
+  }
+
+  // 3. Confirm
+  const confirmResp = await deps.fetch(
+    `${base}/attachments/stage/${staged.staged_attachment_id}/confirm`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sha256 }),
+    },
+  );
+  if (!confirmResp.ok) {
+    const body = await confirmResp.text();
+    throw new Error(`Confirm failed (${confirmResp.status}): ${body}`);
+  }
+  const confirmed = JSON.parse(await confirmResp.text());
+
+  return {
+    field,
+    stagedId: staged.staged_attachment_id,
+    signedUrl: confirmed.signed_download_url,
+  };
+}
+
 function attachmentPath(options, includeFileId = false) {
   const entity = requiredOption(options, "entity");
   const id = requiredOption(options, "id");
@@ -480,10 +618,37 @@ async function commandBuy(options, deps) {
   const idempotencyKey = options["idempotency-key"] || deps.makeIdempotencyKey();
   const requirement = parseRequirement(options);
 
+  const inputEntries = parseInputFlags(options["input"] ? [].concat(options["input"]) : []);
+  const stagedResults = [];
+  for (const e of inputEntries.filter((x) => x.isFile)) {
+    if (!isUrlField(e.field)) {
+      throw new Error(`Field "${e.field}" does not look like a URL field.`);
+    }
+    const staged = await stageAndUploadFile(deps, e);
+    stagedResults.push(staged);
+    requirement[staged.field] = staged.signedUrl;
+  }
+  for (const e of inputEntries.filter((x) => !x.isFile)) {
+    requirement[e.field] = e.value;
+  }
+
   return request(deps, "POST", `/listings/${listingId}/purchase`, {
-    body: { requirement },
+    body: {
+      requirement,
+      staged_attachment_ids: stagedResults.map((s) => s.stagedId),
+    },
     headers: { "X-Idempotency-Key": idempotencyKey },
   });
+}
+
+async function commandStage(options, deps) {
+  const filePath = requiredOption(options, "file");
+  const field = options["field"] || "_standalone";
+  if (options["field"] && !isUrlField(options["field"])) {
+    throw new Error(`Field "${options["field"]}" does not look like a URL field.`);
+  }
+  const result = await stageAndUploadFile(deps, { field, localPath: filePath, isFile: true });
+  return JSON.stringify({ staged_attachment_id: result.stagedId, signed_download_url: result.signedUrl });
 }
 
 async function commandValidate(options, deps) {
@@ -794,6 +959,23 @@ async function commandSolve(options, deps, flags) {
     ? parseRequirement(options)
     : {};
 
+  // Parse --input flags: plain entries merged into requirement immediately
+  const inputEntries = parseInputFlags(options["input"] ? [].concat(options["input"]) : []);
+  const fileEntries = inputEntries.filter((e) => e.isFile);
+  const plainEntries = inputEntries.filter((e) => !e.isFile);
+  for (const e of plainEntries) {
+    requirement[e.field] = e.value;
+  }
+  // Pattern-only fast-fail before any API call
+  for (const e of fileEntries) {
+    if (!isUrlField(e.field)) {
+      throw new Error(
+        `Field "${e.field}" does not look like a URL field (*_url, *_uri, file_*, image_*). ` +
+        `Use --input ${e.field}="value" (without @) for plain strings.`,
+      );
+    }
+  }
+
   // 1. match
   const body = matchBody(options, flags, deps.env);
   const matchResult = await requestJson(deps, "POST", "/listings/match", { body });
@@ -832,7 +1014,22 @@ async function commandSolve(options, deps, flags) {
 
   const selected = pickCompatibleListing(matches, requirement);
 
-  // 2. local schema validation
+  // Stage files after match so we can validate against the listing's input_schema
+  const stagedResults = [];
+  for (const e of fileEntries) {
+    if (!isUrlField(e.field, selected.input_schema)) {
+      throw new Error(
+        `Field "${e.field}" is not declared as a URI type in the selected listing's schema. ` +
+        `Use --input ${e.field}="value" (without @) for plain strings.`,
+      );
+    }
+    const staged = await stageAndUploadFile(deps, e);
+    stagedResults.push(staged);
+    requirement[staged.field] = staged.signedUrl;
+    trace.push({ step: "stage_file", field: staged.field, staged_id: staged.stagedId });
+  }
+
+  // 2. local schema validation (skip required-field check for file-input fields already injected above)
   const schemaCheck = validateRequirementAgainstSchema(requirement, selected.input_schema);
   if (!schemaCheck.valid) {
     const err = new Error(
@@ -846,7 +1043,10 @@ async function commandSolve(options, deps, flags) {
   // 3. buy
   const idempotencyKey = options["idempotency-key"] || deps.makeIdempotencyKey();
   const purchase = await requestJson(deps, "POST", `/listings/${selected.id}/purchase`, {
-    body: { requirement },
+    body: {
+      requirement,
+      staged_attachment_ids: stagedResults.map((s) => s.stagedId),
+    },
     headers: { "X-Idempotency-Key": idempotencyKey },
   });
   const orderId = purchase?.id || purchase?.order?.id;
@@ -950,6 +1150,7 @@ const COMMANDS = {
   "upload-attachment": commandUploadAttachment,
   "list-attachments": commandListAttachments,
   "delete-attachment": commandDeleteAttachment,
+  stage: commandStage,
   solve: commandSolve,
 };
 
@@ -964,6 +1165,8 @@ function usageText() {
     "Procurement:",
     "  clawlabor solve --goal \"...\" --requirement-json '{...}'",
     "  clawlabor solve --goal \"...\" --requirement-json '{...}' --attachment-file ./brief.html",
+    "  clawlabor solve --goal \"...\" --input file_url=@./doc.html --input format=png",
+    "  clawlabor stage --file ./photo.png [--field image_url]",
     "  clawlabor plan --goal \"...\" --requirement-json '{...}'",
     "  clawlabor post --title \"...\" --description \"...\" --reward 50 --attachment-file ./brief.html",
     "  clawlabor status --task <task_id>",
@@ -1017,4 +1220,7 @@ module.exports = {
   writeCredentialsFile,
   parseDeliveryNote,
   ApiError,
+  parseInputFlags,
+  isUrlField,
+  stageAndUploadFile,
 };
