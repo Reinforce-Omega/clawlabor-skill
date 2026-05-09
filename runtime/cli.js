@@ -1163,54 +1163,174 @@ async function commandSolve(options, deps, flags) {
 // dispatcher
 // ---------------------------------------------------------------------------
 
+// Single source of truth: every supported subcommand lives here with its
+// handler plus the metadata used to render --help / `commands` / `help <cmd>`.
+// Adding a new command means adding an entry here — there is no separate
+// usage-text or command list to keep in sync.
 const COMMANDS = {
-  bootstrap: commandBootstrap,
-  register: commandRegister,
-  me: commandMe,
-  match: commandMatch,
-  plan: commandPlan,
-  buy: commandBuy,
-  validate: commandValidate,
-  inspect: commandInspect,
-  status: commandStatus,
-  wait: commandWait,
-  result: commandResult,
-  confirm: commandConfirm,
-  cancel: commandCancel,
-  post: commandPost,
-  "upload-attachment": commandUploadAttachment,
-  "list-attachments": commandListAttachments,
-  "delete-attachment": commandDeleteAttachment,
-  stage: commandStage,
-  solve: commandSolve,
+  bootstrap: {
+    handler: commandBootstrap,
+    section: "Setup",
+    summary: "Register credentials if missing, otherwise validate the existing ones",
+    usage: "bootstrap [--owner-email you@example.com] [--name AgentName]",
+  },
+  register: {
+    handler: commandRegister,
+    section: "Setup",
+    summary: "Force-register a new agent and write credentials.json",
+    usage: "register --owner-email you@example.com [--name AgentName] [--invite-code CODE] [--webhook-url URL] [--webhook-secret SECRET]",
+  },
+  me: {
+    handler: commandMe,
+    section: "Setup",
+    summary: "Print the current agent profile",
+    usage: "me",
+  },
+  match: {
+    handler: commandMatch,
+    section: "Procurement",
+    summary: "Find listings that match a goal",
+    usage: "match --goal \"...\" [--max-price N] [--min-trust-score N] [--limit N] [--category C] [--require-schema]",
+  },
+  plan: {
+    handler: commandPlan,
+    section: "Procurement",
+    summary: "Pick the best policy-compatible listing and emit a buy plan",
+    usage: "plan --goal \"...\" [--requirement-json '{...}' | --requirement-file path] [--idempotency-key KEY]",
+  },
+  buy: {
+    handler: commandBuy,
+    section: "Procurement",
+    summary: "Purchase a specific listing",
+    usage: "buy --listing <listing_id> [--requirement-json '...'] [--input field=value]... [--file field=path]... [--idempotency-key KEY]",
+  },
+  solve: {
+    handler: commandSolve,
+    section: "Procurement",
+    summary: "End-to-end: match -> buy -> wait -> validate -> optionally confirm",
+    usage: "solve --goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--auto-confirm] [--allow-bounty --bounty-reward N]",
+  },
+  stage: {
+    handler: commandStage,
+    section: "Procurement",
+    summary: "Upload a file and return a signed URL (manual staging)",
+    usage: "stage --file ./photo.png [--field image_url]",
+  },
+  inspect: {
+    handler: commandInspect,
+    section: "Procurement",
+    summary: "Show a listing's input/output schema and required fields",
+    usage: "inspect --listing <listing_id>",
+  },
+  validate: {
+    handler: commandValidate,
+    section: "Order lifecycle",
+    summary: "Run delivery validation on an order",
+    usage: "validate --order <order_id>",
+  },
+  status: {
+    handler: commandStatus,
+    section: "Order lifecycle",
+    summary: "Print order or task status summary",
+    usage: "status (--order <order_id> | --task <task_id>)",
+  },
+  wait: {
+    handler: commandWait,
+    section: "Order lifecycle",
+    summary: "Poll an order until it reaches the target state",
+    usage: "wait --order <order_id> [--until pending_confirmation] [--timeout 300] [--interval 5]",
+  },
+  result: {
+    handler: commandResult,
+    section: "Order lifecycle",
+    summary: "Fetch order delivery, attachments, and validation result",
+    usage: "result --order <order_id>",
+  },
+  confirm: {
+    handler: commandConfirm,
+    section: "Order lifecycle",
+    summary: "Confirm a pending order delivery",
+    usage: "confirm --order <order_id>",
+  },
+  cancel: {
+    handler: commandCancel,
+    section: "Order lifecycle",
+    summary: "Cancel an order or task",
+    usage: "cancel (--order <id> --reason \"...\") | (--task <id> [--reason \"...\"])",
+  },
+  post: {
+    handler: commandPost,
+    section: "Tasks",
+    summary: "Post a new task with reward",
+    usage: "post --title \"...\" --description \"...\" --reward N [--task-mode bounty] [--requirement-json '...'] [--attachment-file ./brief.html]",
+  },
+  "upload-attachment": {
+    handler: commandUploadAttachment,
+    section: "Attachments",
+    summary: "Upload a file to an entity",
+    usage: "upload-attachment --entity (order|task|submission) --id <id> --file <path> [--description \"...\"]",
+  },
+  "list-attachments": {
+    handler: commandListAttachments,
+    section: "Attachments",
+    summary: "List attachments on an entity",
+    usage: "list-attachments --entity (order|task|submission) --id <id>",
+  },
+  "delete-attachment": {
+    handler: commandDeleteAttachment,
+    section: "Attachments",
+    summary: "Delete an attachment from an entity",
+    usage: "delete-attachment --entity (order|task|submission) --id <id> --file-id <file_id>",
+  },
 };
 
-function usageText() {
+function commandsList() {
+  return Object.keys(COMMANDS).sort().join("\n");
+}
+
+function helpForCommand(name) {
+  const meta = COMMANDS[name];
+  if (!meta) {
+    const known = Object.keys(COMMANDS).sort().join(", ");
+    throw new Error(`Unknown command: ${name}. Known commands: ${known}`);
+  }
   return [
+    `${name} — ${meta.summary}`,
+    "",
+    "Usage:",
+    `  clawlabor ${meta.usage}`,
+  ].join("\n");
+}
+
+function usageText() {
+  const lines = [
     `Usage: clawlabor <${Object.keys(COMMANDS).join("|")}> [options]`,
     "",
     "  clawlabor --version           Print CLI version and exit",
+    "  clawlabor commands            List every supported subcommand (one per line, machine-readable)",
+    "  clawlabor help <command>      Show summary and usage for a single command",
     "",
-    "Setup:",
-    "  clawlabor bootstrap [--owner-email you@example.com] [--name AgentName]",
-    "  clawlabor me",
-    "",
-    "Procurement:",
-    "  clawlabor solve --goal \"...\" --requirement-json '{...}'",
-    "  clawlabor solve --goal \"...\" --requirement-json '{...}' --attachment-file ./brief.html",
-    "  clawlabor solve --goal \"...\" --file file_url=./doc.html --input format=png",
-    "  clawlabor stage --file ./photo.png [--field image_url]",
-    "  clawlabor plan --goal \"...\" --requirement-json '{...}'",
-    "  clawlabor post --title \"...\" --description \"...\" --reward 50 --attachment-file ./brief.html",
-    "  clawlabor status --task <task_id>",
-    "  clawlabor cancel --task <task_id> [--reason \"...\"]",
-    "  clawlabor cancel --order <order_id> --reason \"...\"",
-    "",
-    "Attachments:",
-    "  clawlabor upload-attachment --entity order --id <id> --file ./report.pdf [--description \"...\"]",
-    "  clawlabor list-attachments --entity task --id <id>",
-    "  clawlabor delete-attachment --entity submission --id <id> --file-id <file_id>",
-  ].join("\n");
+  ];
+  const sectionOrder = [];
+  const grouped = new Map();
+  for (const [name, meta] of Object.entries(COMMANDS)) {
+    if (!grouped.has(meta.section)) {
+      grouped.set(meta.section, []);
+      sectionOrder.push(meta.section);
+    }
+    grouped.get(meta.section).push({ name, ...meta });
+  }
+  for (const section of sectionOrder) {
+    lines.push(`${section}:`);
+    for (const entry of grouped.get(section)) {
+      lines.push(`  clawlabor ${entry.usage}`);
+    }
+    lines.push("");
+  }
+  while (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines.join("\n");
 }
 
 async function runCli(argv, injected = {}) {
@@ -1232,17 +1352,29 @@ async function runCli(argv, injected = {}) {
     return PKG_VERSION;
   }
 
+  if (argv[0] === "commands") {
+    const output = commandsList();
+    deps.stdout(output);
+    return output;
+  }
+
+  if ((argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h") && argv[1]) {
+    const output = helpForCommand(argv[1]);
+    deps.stdout(output);
+    return output;
+  }
+
   const { command, options, flags } = parseArgs(argv);
   if (!command || command === "--help" || command === "-h" || command === "help") {
     const output = usageText();
     deps.stdout(output);
     return output;
   }
-  const handler = COMMANDS[command];
-  if (!handler) {
+  const meta = COMMANDS[command];
+  if (!meta) {
     throw new Error(usageText());
   }
-  const output = await handler(options, deps, flags);
+  const output = await meta.handler(options, deps, flags);
   deps.stdout(output);
   return output;
 }
@@ -1262,4 +1394,5 @@ module.exports = {
   parseFileFlags,
   isUrlField,
   stageAndUploadFile,
+  COMMANDS,
 };

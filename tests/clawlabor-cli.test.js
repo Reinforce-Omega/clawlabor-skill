@@ -12,6 +12,7 @@ const {
   resolveApiKey,
   credentialsFilePath,
   parseDeliveryNote,
+  COMMANDS,
 } = require("../runtime/cli");
 
 const BASE_ENV = {
@@ -1244,6 +1245,72 @@ test("bin emits JSON error and exits nonzero without API key", () => {
   const err = JSON.parse(result.stderr);
   assert.equal(err.error_code, "missing_credentials");
   assert.match(err.error, /CLAWLABOR_API_KEY/);
+});
+
+test("every COMMANDS entry has handler, summary, usage, and section metadata", () => {
+  for (const [name, meta] of Object.entries(COMMANDS)) {
+    assert.equal(typeof meta.handler, "function", `${name} missing handler`);
+    assert.equal(typeof meta.summary, "string", `${name} missing summary`);
+    assert.ok(meta.summary.length > 0, `${name} has empty summary`);
+    assert.equal(typeof meta.usage, "string", `${name} missing usage`);
+    assert.ok(meta.usage.startsWith(name), `${name} usage should start with the command name, got: ${meta.usage}`);
+    assert.equal(typeof meta.section, "string", `${name} missing section`);
+  }
+});
+
+test("commands subcommand prints every registered command, one per line", async () => {
+  const out = [];
+  await runCli(["commands"], {
+    env: {},
+    fetch: async () => {
+      throw new Error("commands must not call API");
+    },
+    stdout: (text) => out.push(text),
+  });
+  const listed = out[0].split("\n");
+  const expected = Object.keys(COMMANDS).sort();
+  assert.deepEqual(listed, expected);
+});
+
+test("usageText mentions every command, preventing help-text drift", async () => {
+  const out = [];
+  await runCli(["--help"], {
+    env: {},
+    fetch: async () => {
+      throw new Error("help must not call API");
+    },
+    stdout: (text) => out.push(text),
+  });
+  for (const name of Object.keys(COMMANDS)) {
+    assert.match(out[0], new RegExp(`\\b${name}\\b`), `usage text missing command: ${name}`);
+  }
+});
+
+test("help <command> prints summary and usage for a known command", async () => {
+  const out = [];
+  await runCli(["help", "plan"], {
+    env: {},
+    fetch: async () => {
+      throw new Error("help must not call API");
+    },
+    stdout: (text) => out.push(text),
+  });
+  assert.match(out[0], /^plan —/);
+  assert.match(out[0], /Usage:/);
+  assert.match(out[0], /clawlabor plan/);
+});
+
+test("help <command> rejects unknown command names", async () => {
+  await assert.rejects(
+    runCli(["help", "no-such-command"], {
+      env: {},
+      fetch: async () => {
+        throw new Error("must not call API");
+      },
+      stdout: () => {},
+    }),
+    /Unknown command: no-such-command/,
+  );
 });
 
 test("bin --help exits zero", () => {
