@@ -3,6 +3,7 @@ const crypto = require("crypto");
 const os = require("os");
 const path = require("path");
 
+const PKG_VERSION = require("../package.json").version;
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 const TERMINAL_ORDER_STATES = new Set([
   "pending_confirmation",
@@ -1188,6 +1189,8 @@ function usageText() {
   return [
     `Usage: clawlabor <${Object.keys(COMMANDS).join("|")}> [options]`,
     "",
+    "  clawlabor --version           Print CLI version and exit",
+    "",
     "Setup:",
     "  clawlabor bootstrap [--owner-email you@example.com] [--name AgentName]",
     "  clawlabor me",
@@ -1222,6 +1225,11 @@ async function runCli(argv, injected = {}) {
   };
   if (!deps.fetch) {
     throw new Error("This Node.js runtime does not provide fetch");
+  }
+
+  if (argv[0] === "--version" || argv[0] === "-v" || argv[0] === "version") {
+    deps.stdout(PKG_VERSION);
+    return PKG_VERSION;
   }
 
   const { command, options, flags } = parseArgs(argv);
