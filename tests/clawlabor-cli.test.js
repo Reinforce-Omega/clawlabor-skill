@@ -19,6 +19,10 @@ const BASE_ENV = {
   CLAWLABOR_API_BASE: "https://api.example.test/api",
 };
 
+function tempTestFile(name) {
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-cli-test-")), name);
+}
+
 function recordingFetch(routes) {
   const calls = [];
   const fetchImpl = async (url, options) => {
@@ -1323,29 +1327,46 @@ test("skill contract tells agents to discover marketplace capabilities before lo
 });
 
 // ---------------------------------------------------------------------------
-// @-input parsing
+// --input / --file parsing
 // ---------------------------------------------------------------------------
 
-test("parseInputFlags: @-prefix entry detected as file", () => {
+test("parseInputFlags: @-prefix is a plain string value", () => {
   const { parseInputFlags } = require("../runtime/cli");
   const entries = parseInputFlags(["file_url=@/tmp/report.html", "format=png"]);
   assert.equal(entries.length, 2);
   const fileEntry = entries.find((e) => e.field === "file_url");
-  assert.ok(fileEntry.isFile);
-  assert.equal(fileEntry.localPath, "/tmp/report.html");
+  assert.ok(!fileEntry.isFile);
+  assert.equal(fileEntry.value, "@/tmp/report.html");
   const strEntry = entries.find((e) => e.field === "format");
   assert.ok(!strEntry.isFile);
   assert.equal(strEntry.value, "png");
 });
 
-test("isUrlField: suffix and prefix patterns", () => {
+test("parseFileFlags: field=path entry detected as file", () => {
+  const { parseFileFlags } = require("../runtime/cli");
+  const entries = parseFileFlags(["file_url=/tmp/report.html", "image_url=./photo.png"]);
+  assert.deepEqual(entries, [
+    { field: "file_url", isFile: true, localPath: "/tmp/report.html", source: "file" },
+    { field: "image_url", isFile: true, localPath: "./photo.png", source: "file" },
+  ]);
+});
+
+test("isUrlField: suffixes and schema uri only", () => {
   const { isUrlField } = require("../runtime/cli");
   assert.ok(isUrlField("image_url"));
   assert.ok(isUrlField("file_url"));
   assert.ok(isUrlField("source_pdf_url"));
   assert.ok(isUrlField("document_uri"));
-  assert.ok(isUrlField("file_path"));
-  assert.ok(isUrlField("image_data"));
+  assert.ok(!isUrlField("file_path"));
+  assert.ok(!isUrlField("image_data"));
+  const schema = {
+    properties: {
+      file_path: { type: "string" },
+      image_data: { type: "string" },
+    },
+  };
+  assert.ok(!isUrlField("file_path", schema));
+  assert.ok(!isUrlField("image_data", schema));
   assert.ok(!isUrlField("caption"));
   assert.ok(!isUrlField("format"));
 });
@@ -1361,7 +1382,7 @@ test("stageAndUploadFile: calls stage, PUT, confirm, returns signed URL", async 
   const nodePath = require("node:path");
   const nodeFs = require("node:fs");
 
-  const tmpFile = nodePath.join(os.tmpdir(), "test-staged.txt");
+  const tmpFile = tempTestFile("test-staged.txt");
   nodeFs.writeFileSync(tmpFile, "hello world");
 
   const fetchCalls = [];
@@ -1421,13 +1442,35 @@ test("stageAndUploadFile: calls stage, PUT, confirm, returns signed URL", async 
   nodeFs.unlinkSync(tmpFile);
 });
 
-test("solve with --input @-file stages and injects URL into requirement", async () => {
-  const { runCli } = require("../runtime/cli");
-  const nodeOs = require("node:os");
+test("stageAndUploadFile: blocks JavaScript files before upload", async () => {
+  const { stageAndUploadFile } = require("../runtime/cli");
   const nodePath = require("node:path");
   const nodeFs = require("node:fs");
 
-  const tmpFile = nodePath.join(nodeOs.tmpdir(), "test-input.png");
+  const tmpFile = tempTestFile("test-staged.js");
+  nodeFs.writeFileSync(tmpFile, "console.log('nope');");
+
+  await assert.rejects(
+    () => stageAndUploadFile(
+      {
+        env: { CLAWLABOR_API_KEY: "test-key", CLAWLABOR_API_BASE: "https://api.test/api" },
+        fetch: async () => {
+          throw new Error("fetch should not be called");
+        },
+      },
+      { field: "file_url", localPath: tmpFile, isFile: true },
+    ),
+    /Blocked file extension: \.js/,
+  );
+
+  nodeFs.unlinkSync(tmpFile);
+});
+
+test("solve with --file stages and injects URL into requirement", async () => {
+  const { runCli } = require("../runtime/cli");
+  const nodeFs = require("node:fs");
+
+  const tmpFile = tempTestFile("test-file-input.png");
   nodeFs.writeFileSync(tmpFile, Buffer.alloc(16, 0xff));
 
   const calls = [];
@@ -1436,62 +1479,85 @@ test("solve with --input @-file stages and injects URL into requirement", async 
     if (url.endsWith("/listings/match"))
       return { ok: true, status: 200, text: async () => JSON.stringify({
         matches: [{ id: "sku_1", price: 10, policy: { allowed: true },
-          input_schema: { properties: { image_url: { type: "string", format: "uri" } }, required: ["image_url"] } }]
+          input_schema: { properties: { image_url: { type: "string", format: "uri" }, format: { type: "string" } }, required: ["image_url"] } }]
       })};
     if (url.endsWith("/attachments/stage"))
       return { ok: true, status: 201, text: async () => JSON.stringify({
-        staged_attachment_id: "sta_1", upload_url: "https://s3.test/put",
+        staged_attachment_id: "sta_file_1", upload_url: "https://s3.test/put-file",
         upload_url_expires_at: new Date().toISOString(), expires_at: new Date().toISOString()
       })};
-    if (url.includes("s3.test/put"))
+    if (url.includes("s3.test/put-file"))
       return { ok: true, status: 200, text: async () => "" };
     if (url.endsWith("/confirm"))
       return { ok: true, status: 200, text: async () => JSON.stringify({
-        staged_attachment_id: "sta_1", status: "uploaded",
-        signed_download_url: "https://s3.test/get?sig=abc"
+        staged_attachment_id: "sta_file_1", status: "uploaded",
+        signed_download_url: "https://s3.test/get-file?sig=abc"
       })};
     if (url.endsWith("/purchase")) {
       const body = JSON.parse(opts.body);
-      assert.equal(body.requirement.image_url, "https://s3.test/get?sig=abc");
-      assert.deepEqual(body.staged_attachment_ids, ["sta_1"]);
-      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_1" }) };
+      assert.equal(body.requirement.image_url, "https://s3.test/get-file?sig=abc");
+      assert.equal(body.requirement.format, "png");
+      assert.deepEqual(body.staged_attachment_ids, ["sta_file_1"]);
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_file_1" }) };
     }
-    if (url.includes("/orders/ord_1/validate-delivery"))
+    if (url.includes("/orders/ord_file_1/validate-delivery"))
       return { ok: true, status: 200, text: async () => JSON.stringify({ verdict: "pass", can_auto_confirm: true }) };
-    if (url.includes("/orders/ord_1/confirm"))
-      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_1", status: "completed" }) };
-    if (url.includes("/orders/ord_1/attachments"))
+    if (url.includes("/orders/ord_file_1/confirm"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_file_1", status: "completed" }) };
+    if (url.includes("/orders/ord_file_1/attachments"))
       return { ok: true, status: 200, text: async () => JSON.stringify({ files: [], file_count: 0, total_size: 0 }) };
-    if (url.includes("/orders/ord_1"))
-      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_1", status: "completed", delivery_note: null }) };
+    if (url.includes("/orders/ord_file_1"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ id: "ord_file_1", status: "completed", delivery_note: null }) };
     return { ok: false, status: 404, text: async () => "not found" };
   };
 
-  const out = [];
   await runCli(
-    ["solve", "--goal", "convert to png", "--input", `image_url=@${tmpFile}`, "--auto-confirm"],
-    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
+    ["solve", "--goal", "convert to png", "--file", `image_url=${tmpFile}`, "--input", "format=png", "--auto-confirm"],
+    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: () => {} },
   );
-
-  const purchaseCall = calls.find((c) => c.url.endsWith("/purchase"));
-  assert.ok(purchaseCall, "purchase was called");
 
   const matchIdx = calls.findIndex((c) => c.url.endsWith("/listings/match"));
   const stageIdx = calls.findIndex((c) => c.url.endsWith("/attachments/stage"));
-  assert.ok(matchIdx >= 0, "match was called");
-  assert.ok(stageIdx >= 0, "stage was called");
   assert.ok(matchIdx < stageIdx, "match must precede staging");
 
   nodeFs.unlinkSync(tmpFile);
 });
 
-test("buy with --input @-file stages and injects URL into purchase", async () => {
+test("solve rejects legacy file field when selected listing has non-uri schema field", async () => {
   const { runCli } = require("../runtime/cli");
-  const nodeOs = require("node:os");
-  const nodePath = require("node:path");
   const nodeFs = require("node:fs");
 
-  const tmpFile = nodePath.join(nodeOs.tmpdir(), "test-buy-input.png");
+  const tmpFile = tempTestFile("test-file-path-input.png");
+  nodeFs.writeFileSync(tmpFile, Buffer.alloc(16, 0xff));
+
+  const calls = [];
+  const fakeFetch = async (url, opts) => {
+    calls.push({ url, method: opts?.method || "GET", body: opts?.body });
+    if (url.endsWith("/listings/match"))
+      return { ok: true, status: 200, text: async () => JSON.stringify({
+        matches: [{ id: "sku_1", price: 10, policy: { allowed: true },
+          input_schema: { properties: { file_path: { type: "string" } }, required: ["file_path"] } }]
+      })};
+    return { ok: false, status: 404, text: async () => "not found" };
+  };
+
+  await assert.rejects(
+    () => runCli(
+      ["solve", "--goal", "convert to png", "--file", `file_path=${tmpFile}`],
+      { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: () => {} },
+    ),
+    /Field "file_path" does not look like a URL field/,
+  );
+
+  assert.equal(calls.filter((c) => c.url.endsWith("/attachments/stage")).length, 0);
+  nodeFs.unlinkSync(tmpFile);
+});
+
+test("buy with --file stages and injects URL into purchase", async () => {
+  const { runCli } = require("../runtime/cli");
+  const nodeFs = require("node:fs");
+
+  const tmpFile = tempTestFile("test-buy-file-input.png");
   nodeFs.writeFileSync(tmpFile, Buffer.alloc(8, 0xaa));
 
   const calls = [];
@@ -1499,32 +1565,32 @@ test("buy with --input @-file stages and injects URL into purchase", async () =>
     calls.push({ url, method: opts?.method || "GET", body: opts?.body });
     if (url.endsWith("/attachments/stage"))
       return { ok: true, status: 201, text: async () => JSON.stringify({
-        staged_attachment_id: "sta_buy_1", upload_url: "https://s3.test/put-buy",
+        staged_attachment_id: "sta_buy_file_1", upload_url: "https://s3.test/put-buy-file",
         upload_url_expires_at: new Date().toISOString(), expires_at: new Date().toISOString()
       })};
-    if (url.includes("s3.test/put-buy"))
+    if (url.includes("s3.test/put-buy-file"))
       return { ok: true, status: 200, text: async () => "" };
     if (url.endsWith("/confirm"))
       return { ok: true, status: 200, text: async () => JSON.stringify({
-        staged_attachment_id: "sta_buy_1", status: "uploaded",
-        signed_download_url: "https://s3.test/get-buy?sig=xyz"
+        staged_attachment_id: "sta_buy_file_1", status: "uploaded",
+        signed_download_url: "https://s3.test/get-buy-file?sig=xyz"
       })};
     if (url.endsWith("/purchase")) {
       const body = JSON.parse(opts.body);
-      assert.equal(body.requirement.image_url, "https://s3.test/get-buy?sig=xyz");
-      assert.deepEqual(body.staged_attachment_ids, ["sta_buy_1"]);
-      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_buy_1" }) };
+      assert.equal(body.requirement.image_url, "https://s3.test/get-buy-file?sig=xyz");
+      assert.equal(body.requirement.format, "png");
+      assert.deepEqual(body.staged_attachment_ids, ["sta_buy_file_1"]);
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: "ord_buy_file_1" }) };
     }
     return { ok: false, status: 404, text: async () => "not found" };
   };
 
   await runCli(
-    ["buy", "--listing", "sku_buy_1", "--input", `image_url=@${tmpFile}`],
+    ["buy", "--listing", "sku_buy_1", "--file", `image_url=${tmpFile}`, "--input", "format=png"],
     { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: () => {} },
   );
 
-  const purchaseCall = calls.find((c) => c.url.endsWith("/purchase"));
-  assert.ok(purchaseCall, "purchase was called");
+  assert.ok(calls.find((c) => c.url.endsWith("/purchase")), "purchase was called");
 
   nodeFs.unlinkSync(tmpFile);
 });

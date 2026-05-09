@@ -28,7 +28,7 @@ function parseArgs(argv) {
       parsed.flags.add(key);
       continue;
     }
-    if (key === "input") {
+    if (key === "input" || key === "file") {
       if (Array.isArray(parsed.options[key])) {
         parsed.options[key].push(value);
       } else if (parsed.options[key] !== undefined) {
@@ -285,28 +285,42 @@ function parseRequirement(options) {
 // ---------------------------------------------------------------------------
 
 const URL_FIELD_SUFFIXES = ["_url", "_uri"];
-const URL_FIELD_PREFIXES = ["file_", "image_", "source_", "input_"];
-const BLOCKED_EXTENSIONS = new Set([".exe", ".bat", ".sh", ".dll", ".ps1", ".cmd", ".vbs"]);
+const BLOCKED_EXTENSIONS = new Set([".exe", ".bat", ".sh", ".dll", ".ps1", ".cmd", ".vbs", ".js"]);
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100 MB
 
-function isUrlField(fieldName, inputSchema) {
+function hasUriSchemaField(fieldName, inputSchema) {
+  return inputSchema?.properties?.[fieldName]?.format === "uri";
+}
+
+function isStrictUrlField(fieldName, inputSchema) {
   const name = fieldName.toLowerCase();
   if (URL_FIELD_SUFFIXES.some((s) => name.endsWith(s))) return true;
-  if (URL_FIELD_PREFIXES.some((p) => name.startsWith(p))) return true;
-  if (inputSchema?.properties?.[fieldName]?.format === "uri") return true;
+  if (hasUriSchemaField(fieldName, inputSchema)) return true;
   return false;
+}
+
+function isUrlField(fieldName, inputSchema) {
+  return isStrictUrlField(fieldName, inputSchema);
 }
 
 function parseInputFlags(inputValues) {
   return (inputValues || []).map((raw) => {
     const eqIdx = raw.indexOf("=");
-    if (eqIdx === -1) throw new Error(`--input must be in field=value or field=@path format, got: ${raw}`);
+    if (eqIdx === -1) throw new Error(`--input must be in field=value format, got: ${raw}`);
     const field = raw.slice(0, eqIdx);
     const val = raw.slice(eqIdx + 1);
-    if (val.startsWith("@")) {
-      return { field, isFile: true, localPath: val.slice(1) };
-    }
     return { field, isFile: false, value: val };
+  });
+}
+
+function parseFileFlags(fileValues) {
+  return (fileValues || []).map((raw) => {
+    const eqIdx = raw.indexOf("=");
+    if (eqIdx === -1) throw new Error(`--file must be in field=path format, got: ${raw}`);
+    const field = raw.slice(0, eqIdx);
+    const localPath = raw.slice(eqIdx + 1);
+    if (!field || !localPath) throw new Error(`--file must be in field=path format, got: ${raw}`);
+    return { field, isFile: true, localPath, source: "file" };
   });
 }
 
@@ -619,8 +633,9 @@ async function commandBuy(options, deps) {
   const requirement = parseRequirement(options);
 
   const inputEntries = parseInputFlags(options["input"] ? [].concat(options["input"]) : []);
+  const fileEntries = parseFileFlags(options["file"] ? [].concat(options["file"]) : []);
   const stagedResults = [];
-  for (const e of inputEntries.filter((x) => x.isFile)) {
+  for (const e of fileEntries) {
     if (!isUrlField(e.field)) {
       throw new Error(`Field "${e.field}" does not look like a URL field.`);
     }
@@ -961,17 +976,16 @@ async function commandSolve(options, deps, flags) {
 
   // Parse --input flags: plain entries merged into requirement immediately
   const inputEntries = parseInputFlags(options["input"] ? [].concat(options["input"]) : []);
-  const fileEntries = inputEntries.filter((e) => e.isFile);
-  const plainEntries = inputEntries.filter((e) => !e.isFile);
-  for (const e of plainEntries) {
+  const fileEntries = parseFileFlags(options["file"] ? [].concat(options["file"]) : []);
+  for (const e of inputEntries) {
     requirement[e.field] = e.value;
   }
   // Pattern-only fast-fail before any API call
   for (const e of fileEntries) {
     if (!isUrlField(e.field)) {
       throw new Error(
-        `Field "${e.field}" does not look like a URL field (*_url, *_uri, file_*, image_*). ` +
-        `Use --input ${e.field}="value" (without @) for plain strings.`,
+        `Field "${e.field}" does not look like a URL field (*_url, *_uri, or schema format:"uri"). ` +
+        `Use --file ${e.field}=path for local files, or --input ${e.field}="value" for plain strings.`,
       );
     }
   }
@@ -1020,7 +1034,7 @@ async function commandSolve(options, deps, flags) {
     if (!isUrlField(e.field, selected.input_schema)) {
       throw new Error(
         `Field "${e.field}" is not declared as a URI type in the selected listing's schema. ` +
-        `Use --input ${e.field}="value" (without @) for plain strings.`,
+        `Use --file ${e.field}=path only for URL fields, or --input ${e.field}="value" for plain strings.`,
       );
     }
     const staged = await stageAndUploadFile(deps, e);
@@ -1181,7 +1195,7 @@ function usageText() {
     "Procurement:",
     "  clawlabor solve --goal \"...\" --requirement-json '{...}'",
     "  clawlabor solve --goal \"...\" --requirement-json '{...}' --attachment-file ./brief.html",
-    "  clawlabor solve --goal \"...\" --input file_url=@./doc.html --input format=png",
+    "  clawlabor solve --goal \"...\" --file file_url=./doc.html --input format=png",
     "  clawlabor stage --file ./photo.png [--field image_url]",
     "  clawlabor plan --goal \"...\" --requirement-json '{...}'",
     "  clawlabor post --title \"...\" --description \"...\" --reward 50 --attachment-file ./brief.html",
@@ -1237,6 +1251,7 @@ module.exports = {
   parseDeliveryNote,
   ApiError,
   parseInputFlags,
+  parseFileFlags,
   isUrlField,
   stageAndUploadFile,
 };
