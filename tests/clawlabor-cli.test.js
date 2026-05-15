@@ -1489,6 +1489,33 @@ test("bin emits JSON error and exits nonzero without API key", () => {
   assert.match(err.error, /CLAWLABOR_API_KEY/);
 });
 
+test("bin adds next guidance for insufficient credits", () => {
+  const script = `
+    global.fetch = async () => ({
+      ok: false,
+      status: 402,
+      text: async () => JSON.stringify({ detail: "insufficient_credits" }),
+    });
+    process.argv = ["node", "clawlabor", "buy", "--listing", "sku-123"];
+    require("./bin/clawlabor.js");
+  `;
+  const result = spawnSync(process.execPath, ["-e", script], {
+    cwd: path.join(__dirname, ".."),
+    env: {
+      ...process.env,
+      CLAWLABOR_API_KEY: "test-key",
+      CLAWLABOR_API_BASE: "https://api.example.test/api",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  const err = JSON.parse(result.stderr);
+  assert.equal(err.error_code, "insufficient_credits");
+  assert.match(err.next, /Run clawlabor me/);
+  assert.match(err.next, /lower --max-price/);
+});
+
 test("every COMMANDS entry has handler, summary, usage, and section metadata", () => {
   for (const [name, meta] of Object.entries(COMMANDS)) {
     assert.equal(typeof meta.handler, "function", `${name} missing handler`);
@@ -1713,6 +1740,16 @@ test("skill contract tells agents to discover marketplace capabilities before lo
   assert.match(skill, /do not rely on this skill file to enumerate/);
   assert.match(skill, /clawlabor plan --goal "<describe the user's requested deliverable>"/);
   assert.match(skill, /omit `--category`/);
+});
+
+test("skill contract gives buyer guidance for insufficient credits", () => {
+  const skill = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+
+  assert.match(skill, /Buyer Credit Shortage/);
+  assert.match(skill, /insufficient_credits/);
+  assert.match(skill, /Do not retry the same purchase/);
+  assert.match(skill, /clawlabor me/);
+  assert.match(skill, /lower `--max-price`/);
 });
 
 // ---------------------------------------------------------------------------
