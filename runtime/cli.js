@@ -590,6 +590,18 @@ async function commandBootstrap(options, deps) {
   return commandRegister(options, deps);
 }
 
+function compactListingForPlan(listing) {
+  return {
+    id: listing?.id || null,
+    title: listing?.title || listing?.name || null,
+    price: listing?.price ?? null,
+    category: listing?.category || null,
+    trust_score: listing?.trust_score ?? null,
+    status: listing?.status || null,
+    inventory: listing?.inventory ?? null,
+  };
+}
+
 async function commandPlan(options, deps, flags) {
   const body = matchBody(options, flags, deps.env);
   const matchResult = await requestJson(deps, "POST", "/listings/match", { body });
@@ -603,28 +615,42 @@ async function commandPlan(options, deps, flags) {
 
   const idempotencyKey = options["idempotency-key"] || deps.makeIdempotencyKey();
   const schemaCheck = validateRequirementAgainstSchema(requirement, selected.input_schema);
+  const policy = selected.policy || { allowed: true, blocked_reasons: [] };
+  const rejectedListings = matches
+    .filter((item) => item.policy?.allowed === false)
+    .map((item) => ({
+      id: item.id,
+      blocked_reasons: item.policy?.blocked_reasons || [],
+    }));
 
   const plan = {
     action: "purchase",
     goal: requiredOption(options, "goal"),
-    selected_listing: selected,
-    price: selected.price,
-    trust_score: selected.trust_score,
-    policy: selected.policy || { allowed: true, blocked_reasons: [] },
+    listing: compactListingForPlan(selected),
+    decision: {
+      allowed: policy.allowed !== false,
+      blocked_reasons: policy.blocked_reasons || [],
+      why_matched: selected.match_explanation || "",
+      how_to_use: selected.invocation_guidance || [],
+    },
     idempotency_key: idempotencyKey,
-    reasons: selected.reasons || [],
-    input_schema: selected.input_schema || null,
-    requirement: requirementProvided ? requirement : null,
-    requirement_valid: schemaCheck.valid,
-    missing_required_fields: schemaCheck.missing,
-    rejected_listings: matches
-      .filter((item) => item.policy?.allowed === false)
-      .map((item) => ({
-        id: item.id,
-        blocked_reasons: item.policy?.blocked_reasons || [],
-      })),
+    input: {
+      schema: selected.input_schema || null,
+      requirement: requirementProvided ? requirement : null,
+      valid: schemaCheck.valid,
+      missing_required_fields: schemaCheck.missing,
+    },
     execute_command: `clawlabor buy --listing ${selected.id} --idempotency-key ${idempotencyKey}`,
   };
+  if (flags.has("verbose")) {
+    plan.debug = {
+      selected_listing: selected,
+      policy,
+      reasons: selected.reasons || [],
+      rejected_listings: rejectedListings,
+      raw_match: matchResult,
+    };
+  }
   return JSON.stringify(plan);
 }
 
@@ -1196,7 +1222,7 @@ const COMMANDS = {
     handler: commandPlan,
     section: "Procurement",
     summary: "Pick the best policy-compatible listing and emit a buy plan",
-    usage: "plan --goal \"...\" [--requirement-json '{...}' | --requirement-file path] [--idempotency-key KEY]",
+    usage: "plan --goal \"...\" [--requirement-json '{...}' | --requirement-file path] [--idempotency-key KEY] [--verbose]",
   },
   buy: {
     handler: commandBuy,
