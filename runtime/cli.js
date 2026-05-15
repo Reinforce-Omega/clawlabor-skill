@@ -118,14 +118,22 @@ function credentialState(env) {
       source: "CLAWLABOR_API_KEY",
       credentialsPath,
       credentialsFileExists: fileExists,
+      credentialsFileError: null,
     };
   }
-  const fileKey = readCredentialsFile(env);
+  let fileKey = null;
+  let fileError = null;
+  try {
+    fileKey = readCredentialsFile(env);
+  } catch (err) {
+    fileError = err;
+  }
   return {
     apiKey: fileKey,
     source: fileKey ? "credentials_file" : null,
     credentialsPath,
     credentialsFileExists: fileExists,
+    credentialsFileError: fileError ? fileError.message : null,
   };
 }
 
@@ -581,6 +589,116 @@ async function commandAuth(options, deps) {
   result.name = agent.name || null;
   result.balance = agent.balance ?? null;
   return JSON.stringify(result);
+}
+
+function diagnosticStatus(checks) {
+  return checks.some((check) => check.status === "fail") ? "fail" : "pass";
+}
+
+function credentialsFileMode(credentialsPath) {
+  try {
+    return fs.statSync(credentialsPath).mode & 0o777;
+  } catch (_err) {
+    return null;
+  }
+}
+
+async function commandDoctor(_options, deps) {
+  const checks = [];
+  const base = apiBase(deps.env);
+  const state = credentialState(deps.env);
+
+  checks.push({
+    name: "node_runtime",
+    status: deps.fetch && globalThis.FormData && globalThis.Blob ? "pass" : "fail",
+    node_version: process.version,
+    has_fetch: Boolean(deps.fetch),
+    has_form_data: Boolean(globalThis.FormData),
+    has_blob: Boolean(globalThis.Blob),
+  });
+
+  checks.push({
+    name: "api_base",
+    status: "pass",
+    value: base,
+    source: deps.env.CLAWLABOR_API_BASE ? "CLAWLABOR_API_BASE" : "default",
+  });
+
+  const fileMode = state.credentialsFileExists
+    ? credentialsFileMode(state.credentialsPath)
+    : null;
+  let credentialsStatus = state.apiKey ? "pass" : "fail";
+  if (state.apiKey && state.source === "CLAWLABOR_API_KEY" && !state.credentialsFileExists) {
+    credentialsStatus = "warn";
+  }
+  if (state.credentialsFileError) credentialsStatus = "fail";
+  checks.push({
+    name: "credentials",
+    status: credentialsStatus,
+    api_key_source: state.source,
+    credentials_file: state.credentialsPath,
+    credentials_file_exists: state.credentialsFileExists,
+    credentials_file_mode: fileMode === null ? null : `0${fileMode.toString(8)}`,
+    error: state.credentialsFileError,
+  });
+
+  try {
+    const response = await deps.fetch(`${base}/health`, { method: "GET" });
+    checks.push({
+      name: "api_reachable",
+      status: response.ok ? "pass" : "fail",
+      endpoint: "/health",
+      http_status: response.status,
+    });
+  } catch (err) {
+    checks.push({
+      name: "api_reachable",
+      status: "fail",
+      endpoint: "/health",
+      error: err.message,
+    });
+  }
+
+  if (!state.apiKey) {
+    checks.push({
+      name: "auth",
+      status: "fail",
+      error_code: "missing_credentials",
+      next: "Run clawlabor bootstrap --owner-email you@example.com --name AgentName, set CLAWLABOR_API_KEY, or write credentials.json at the reported path.",
+    });
+  } else {
+    try {
+      const me = await requestJson(deps, "GET", "/agents/me");
+      const agent = me.agent || me;
+      checks.push({
+        name: "auth",
+        status: "pass",
+        agent_id: agent.agent_id || agent.id || null,
+        agent_name: agent.name || null,
+        balance: agent.balance ?? null,
+        frozen: agent.frozen ?? null,
+      });
+    } catch (err) {
+      checks.push({
+        name: "auth",
+        status: "fail",
+        error_code: err.errorCode || "auth_check_failed",
+        http_status: err.status || null,
+        error: err.message,
+      });
+    }
+  }
+
+  const status = diagnosticStatus(checks);
+  const failing = checks.find((check) => check.status === "fail");
+  return JSON.stringify({
+    ok: status === "pass",
+    status,
+    api_base: base,
+    credentials_file: state.credentialsPath,
+    checks,
+    next: failing ? failing.next || "Inspect the failing doctor check and retry." : null,
+  });
 }
 
 function defaultAgentName(env) {
@@ -1258,6 +1376,12 @@ const COMMANDS = {
     section: "Setup",
     summary: "Print the credentials.json path the CLI will use",
     usage: "credentials-path",
+  },
+  doctor: {
+    handler: commandDoctor,
+    section: "Setup",
+    summary: "Run local environment, API reachability, credentials, and auth diagnostics",
+    usage: "doctor",
   },
   bootstrap: {
     handler: commandBootstrap,
