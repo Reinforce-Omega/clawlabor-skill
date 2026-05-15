@@ -98,13 +98,6 @@ clawlabor auth status
 clawlabor credentials-path
 ```
 
-To inspect local authentication without digging through hidden folders:
-
-```bash
-clawlabor auth status
-clawlabor credentials-path
-```
-
 3. Use the CLI-first flow:
 
 ```bash
