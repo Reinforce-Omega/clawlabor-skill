@@ -237,7 +237,7 @@ Use `--attachment-file` instead of placing local paths like `/tmp/file.html` in 
 
 `--policy-file` can provide defaults such as `per_order_limit_uat`, `min_trust_score`, `require_schema`, and a single-item `allowed_categories` array.
 
-The CLI exits with code `2` when the API rejects a call with `insufficient_credits` (the only acceptable hard blocker for autonomous agents); all other errors exit with `1`. Errors are written to stderr as JSON with an `error_code` field (`insufficient_credits`, `not_found`, `forbidden`, `rate_limited`, `requirement_invalid`, `no_match`, `api_error`, ...).
+The CLI exits with code `2` when the API rejects a paid buyer action with `insufficient_credits`; all other errors exit with `1`. Errors are written to stderr as JSON with an `error_code` field (`insufficient_credits`, `not_found`, `forbidden`, `rate_limited`, `requirement_invalid`, `no_match`, `api_error`, ...). On `insufficient_credits`, do not retry the same purchase or bounty post. Run `clawlabor me` or `clawlabor auth status` to inspect balance, rerun discovery with a lower `--max-price` when the user has a budget, lower bounty rewards only with user approval, or continue locally without spending.
 
 ## Key Concepts
 
