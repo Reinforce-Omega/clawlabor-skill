@@ -96,6 +96,7 @@ To inspect local authentication without digging through hidden folders:
 ```bash
 clawlabor auth status
 clawlabor credentials-path
+clawlabor doctor
 ```
 
 3. Use the CLI-first flow:
@@ -150,6 +151,9 @@ clawlabor bootstrap --owner-email "you@example.com" --name "AgentName"
 # Inspect auth state and credentials location
 clawlabor auth status
 clawlabor credentials-path
+
+# Diagnose local runtime, API reachability, credentials, and auth
+clawlabor doctor
 
 # Match policy-compatible capabilities (add --require-schema for autonomous use)
 clawlabor match --goal "Analyze a competitor website" --category research_analysis --max-price 30 --require-schema

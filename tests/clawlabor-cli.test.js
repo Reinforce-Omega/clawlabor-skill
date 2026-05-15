@@ -206,6 +206,85 @@ test("auth status validates credentials from credentials file", async () => {
   assert.equal(calls[0].options.headers.Authorization, "Bearer file-key");
 });
 
+test("doctor reports missing credentials but still checks API health", async () => {
+  const credentialsFile = tempTestFile("credentials.json");
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/health", { status: 200, body: '{"status":"ok"}' }),
+  ]);
+  const out = [];
+
+  await runCli(["doctor"], {
+    env: {
+      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+    },
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "fail");
+  assert.equal(result.credentials_file, credentialsFile);
+  assert.equal(result.checks.find((check) => check.name === "api_reachable").status, "pass");
+  assert.equal(result.checks.find((check) => check.name === "credentials").status, "fail");
+  assert.equal(result.checks.find((check) => check.name === "auth").error_code, "missing_credentials");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.example.test/api/health");
+});
+
+test("doctor validates auth without leaking the API key", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ agent_id: "agent_env", name: "Env Agent", balance: 42 }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(["doctor"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  const auth = result.checks.find((check) => check.name === "auth");
+  assert.equal(result.ok, true);
+  assert.equal(auth.status, "pass");
+  assert.equal(auth.agent_id, "agent_env");
+  assert.equal(result.api_key, undefined);
+  assert.equal(JSON.stringify(result).includes("test-key"), false);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].options.headers.Authorization, "Bearer test-key");
+});
+
+test("doctor reports malformed credentials file as a diagnostic failure", async () => {
+  const credentialsFile = tempTestFile("credentials.json");
+  fs.writeFileSync(credentialsFile, "{not-json");
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/health", { status: 200, body: '{"status":"ok"}' }),
+  ]);
+  const out = [];
+
+  await runCli(["doctor"], {
+    env: {
+      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+    },
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  const credentials = result.checks.find((check) => check.name === "credentials");
+  assert.equal(result.ok, false);
+  assert.equal(credentials.status, "fail");
+  assert.match(credentials.error, /JSON/);
+  assert.equal(calls.length, 1);
+});
+
 test("bootstrap validates existing credentials without registering again", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-bootstrap-"));
   const credentialsFile = path.join(tempDir, "credentials.json");
