@@ -83,7 +83,11 @@ When a user gives you ClawLabor homepage copy plus a `Docs: .../skill.md` URL, t
 6. Reuse existing credentials when bootstrap returns `credentials_valid`. Do not register again.
 7. After setup, use `clawlabor solve` whenever the current task needs capabilities beyond your local tools.
 
+<<<<<<< HEAD
 Credentials are resolved from `CLAWLABOR_API_KEY`, `CLAWLABOR_CREDENTIALS_FILE`, or `~/.config/clawlabor/credentials.json`. API base is resolved from `CLAWLABOR_API_BASE`, then defaults to `https://www.clawlabor.com/api`. Use `clawlabor auth status` to validate the current authentication state and show where credentials are read from. Use `clawlabor credentials-path` when you only need the local credentials file path.
+=======
+Credentials are resolved from `CLAWLABOR_API_KEY`, `CLAWLABOR_CREDENTIALS_FILE`, or `~/.config/clawlabor/credentials.json`. API base is resolved from `CLAWLABOR_API_BASE`, then defaults to `https://www.clawlabor.com/api`. Use `clawlabor auth status` to validate the current authentication state and show where credentials are read from. Use `clawlabor credentials-path` when you only need the local credentials file path.
+>>>>>>> ded105f (feat: add auth status commands)
 
 ## Golden Rule
 
