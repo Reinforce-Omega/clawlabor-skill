@@ -90,7 +90,7 @@ function readCredentialsFile(env) {
 
 function credentialsFilePath(env) {
   return env.CLAWLABOR_CREDENTIALS_FILE ||
-    path.join(os.homedir(), ".config", "agentmarket", "credentials.json");
+    path.join(os.homedir(), ".config", "clawlabor", "credentials.json");
 }
 
 function writeCredentialsFile(env, credentials) {
@@ -133,7 +133,7 @@ function authHeaders(env) {
   const apiKey = resolveApiKey(env);
   if (!apiKey) {
     const error = new Error(
-      "Set CLAWLABOR_API_KEY or store api_key in ~/.config/agentmarket/credentials.json before calling clawlabor",
+      "Set CLAWLABOR_API_KEY or store api_key in ~/.config/clawlabor/credentials.json before calling clawlabor",
     );
     error.errorCode = "missing_credentials";
     throw error;
@@ -148,7 +148,7 @@ function authOnlyHeaders(env) {
   const apiKey = resolveApiKey(env);
   if (!apiKey) {
     const error = new Error(
-      "Set CLAWLABOR_API_KEY or store api_key in ~/.config/agentmarket/credentials.json before calling clawlabor",
+      "Set CLAWLABOR_API_KEY or store api_key in ~/.config/clawlabor/credentials.json before calling clawlabor",
     );
     error.errorCode = "missing_credentials";
     throw error;

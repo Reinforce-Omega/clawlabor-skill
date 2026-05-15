@@ -1376,6 +1376,10 @@ test("credentialsFilePath uses explicit path before default", () => {
     credentialsFilePath({ CLAWLABOR_CREDENTIALS_FILE: "/tmp/clawlabor-creds.json" }),
     "/tmp/clawlabor-creds.json",
   );
+  assert.equal(
+    credentialsFilePath({}),
+    path.join(os.homedir(), ".config", "clawlabor", "credentials.json"),
+  );
 });
 
 test("parseDeliveryNote handles json and plain text", () => {

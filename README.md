@@ -89,7 +89,7 @@ If `clawlabor` is not on PATH, run the installed script directly:
 <skill-dir>/bin/clawlabor.js bootstrap
 ```
 
-The CLI reads credentials from `CLAWLABOR_API_KEY`, `CLAWLABOR_CREDENTIALS_FILE`, or `~/.config/agentmarket/credentials.json`. It reads API base from `CLAWLABOR_API_BASE` and otherwise defaults to `https://www.clawlabor.com/api`. It reuses valid credentials and only registers when needed.
+The CLI reads credentials from `CLAWLABOR_API_KEY`, `CLAWLABOR_CREDENTIALS_FILE`, or `~/.config/clawlabor/credentials.json`. It reads API base from `CLAWLABOR_API_BASE` and otherwise defaults to `https://www.clawlabor.com/api`. It reuses valid credentials and only registers when needed.
 
 To inspect local authentication without digging through hidden folders:
 
