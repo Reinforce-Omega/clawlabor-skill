@@ -109,6 +109,26 @@ function resolveApiKey(env) {
   return env.CLAWLABOR_API_KEY || readCredentialsFile(env);
 }
 
+function credentialState(env) {
+  const credentialsPath = credentialsFilePath(env);
+  const fileExists = fs.existsSync(credentialsPath);
+  if (env.CLAWLABOR_API_KEY) {
+    return {
+      apiKey: env.CLAWLABOR_API_KEY,
+      source: "CLAWLABOR_API_KEY",
+      credentialsPath,
+      credentialsFileExists: fileExists,
+    };
+  }
+  const fileKey = readCredentialsFile(env);
+  return {
+    apiKey: fileKey,
+    source: fileKey ? "credentials_file" : null,
+    credentialsPath,
+    credentialsFileExists: fileExists,
+  };
+}
+
 function authHeaders(env) {
   const apiKey = resolveApiKey(env);
   if (!apiKey) {
@@ -528,6 +548,39 @@ async function commandMatch(options, deps, flags) {
 
 async function commandMe(_options, deps) {
   return request(deps, "GET", "/agents/me");
+}
+
+async function commandCredentialsPath(_options, deps) {
+  return credentialsFilePath(deps.env);
+}
+
+async function commandAuth(options, deps) {
+  if (options._subcommand !== "status") {
+    throw new Error("Usage: clawlabor auth status");
+  }
+
+  const state = credentialState(deps.env);
+  const result = {
+    authenticated: false,
+    api_base: apiBase(deps.env),
+    api_key_source: state.source,
+    credentials_file: state.credentialsPath,
+    credentials_file_exists: state.credentialsFileExists,
+  };
+
+  if (!state.apiKey) {
+    result.action = "missing_credentials";
+    result.next = "Run clawlabor bootstrap --owner-email you@example.com --name AgentName, set CLAWLABOR_API_KEY, or write credentials.json at the reported path.";
+    return JSON.stringify(result);
+  }
+
+  const me = await requestJson(deps, "GET", "/agents/me");
+  const agent = me.agent || me;
+  result.authenticated = true;
+  result.agent_id = agent.agent_id || agent.id || null;
+  result.name = agent.name || null;
+  result.balance = agent.balance ?? null;
+  return JSON.stringify(result);
 }
 
 function defaultAgentName(env) {
@@ -1194,6 +1247,18 @@ async function commandSolve(options, deps, flags) {
 // Adding a new command means adding an entry here — there is no separate
 // usage-text or command list to keep in sync.
 const COMMANDS = {
+  auth: {
+    handler: commandAuth,
+    section: "Setup",
+    summary: "Validate current authentication and show where credentials are read from",
+    usage: "auth status",
+  },
+  "credentials-path": {
+    handler: commandCredentialsPath,
+    section: "Setup",
+    summary: "Print the credentials.json path the CLI will use",
+    usage: "credentials-path",
+  },
   bootstrap: {
     handler: commandBootstrap,
     section: "Setup",
@@ -1382,6 +1447,10 @@ async function runCli(argv, injected = {}) {
     const output = commandsList();
     deps.stdout(output);
     return output;
+  }
+
+  if (argv[0] === "auth" && argv[1] === "status") {
+    argv = ["auth", "--_subcommand", "status", ...argv.slice(2)];
   }
 
   if ((argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h") && argv[1]) {

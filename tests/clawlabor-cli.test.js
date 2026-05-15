@@ -112,6 +112,100 @@ test("help prints usage without requiring credentials", async () => {
   assert.match(out[0], /solve/);
 });
 
+test("credentials-path prints the configured credentials file", async () => {
+  const credentialsFile = tempTestFile("credentials.json");
+  const out = [];
+
+  await runCli(["credentials-path"], {
+    env: { CLAWLABOR_CREDENTIALS_FILE: credentialsFile },
+    fetch: async () => {
+      throw new Error("should not call API");
+    },
+    stdout: (t) => out.push(t),
+  });
+
+  assert.equal(out[0], credentialsFile);
+});
+
+test("auth status reports missing credentials without calling the API", async () => {
+  const credentialsFile = tempTestFile("credentials.json");
+  const out = [];
+
+  await runCli(["auth", "status"], {
+    env: {
+      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+    },
+    fetch: async () => {
+      throw new Error("should not call API");
+    },
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.authenticated, false);
+  assert.equal(result.api_base, BASE_ENV.CLAWLABOR_API_BASE);
+  assert.equal(result.api_key_source, null);
+  assert.equal(result.credentials_file, credentialsFile);
+  assert.equal(result.credentials_file_exists, false);
+  assert.equal(result.action, "missing_credentials");
+});
+
+test("auth status validates CLAWLABOR_API_KEY credentials", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ agent_id: "agent_env", name: "Env Agent", balance: 42 }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(["auth", "status"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.authenticated, true);
+  assert.equal(result.api_key_source, "CLAWLABOR_API_KEY");
+  assert.equal(result.agent_id, "agent_env");
+  assert.equal(result.name, "Env Agent");
+  assert.equal(result.balance, 42);
+  assert.equal(result.api_key, undefined);
+  assert.equal(calls[0].options.headers.Authorization, "Bearer test-key");
+});
+
+test("auth status validates credentials from credentials file", async () => {
+  const credentialsFile = tempTestFile("credentials.json");
+  fs.writeFileSync(credentialsFile, JSON.stringify({ api_key: "file-key" }));
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ agent: { agent_id: "agent_file", name: "File Agent" } }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(["auth", "status"], {
+    env: {
+      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+    },
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.authenticated, true);
+  assert.equal(result.api_key_source, "credentials_file");
+  assert.equal(result.credentials_file, credentialsFile);
+  assert.equal(result.credentials_file_exists, true);
+  assert.equal(result.agent_id, "agent_file");
+  assert.equal(result.api_key, undefined);
+  assert.equal(calls[0].options.headers.Authorization, "Bearer file-key");
+});
+
 test("bootstrap validates existing credentials without registering again", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-bootstrap-"));
   const credentialsFile = path.join(tempDir, "credentials.json");
