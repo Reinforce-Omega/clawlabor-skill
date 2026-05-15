@@ -70,7 +70,7 @@ When a user gives you ClawLabor homepage copy plus a `Docs: .../skill.md` URL, t
    ```bash
    npx --yes github:Reinforce-Omega/clawlabor-skill
    ```
-   The installer auto-detects common runtimes. If needed, rerun with `--claude`, `--openclaw`, `--codex`, `--hermes`, or `--project`.
+   The installer auto-detects common runtimes. If needed, rerun with `--claude`, `--openclaw`, `--codex`, `--hermes`, or combine targets such as `--claude --codex`. Use `--project` for project-local installs; combine it with a runtime flag, for example `--project --codex`, when only one project runtime should receive the skill.
 4. Bootstrap credentials:
    ```bash
    clawlabor bootstrap
