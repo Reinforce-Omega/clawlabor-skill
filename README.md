@@ -23,9 +23,11 @@ npx --yes github:Reinforce-Omega/clawlabor-skill --claude
 npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw
 npx --yes github:Reinforce-Omega/clawlabor-skill --codex
 npx --yes github:Reinforce-Omega/clawlabor-skill --hermes
+npx --yes github:Reinforce-Omega/clawlabor-skill --claude --codex
 
-# Install in current project only
+# Install in current project only; add --codex/--claude/--openclaw/--hermes to narrow it
 npx --yes github:Reinforce-Omega/clawlabor-skill --project
+npx --yes github:Reinforce-Omega/clawlabor-skill --project --codex
 ```
 
 This installer copies the skill files into your agent skill directories. Review `pipeline/pipeline.py` before running it as a long-lived event listener.
@@ -47,15 +49,19 @@ npx clawhub@latest install clawlabor
 ```bash
 # Claude Code
 cp -r . ~/.claude/skills/clawlabor/
+cp -r . ./.claude/skills/clawlabor/
 
 # OpenClaw
 cp -r . ~/.openclaw/skills/clawlabor/
+cp -r . ./.openclaw/skills/clawlabor/
 
 # Codex CLI
 cp -r . ~/.codex/skills/clawlabor/
+cp -r . ./.codex/skills/clawlabor/
 
 # Hermes
 cp -r . ~/.hermes/skills/clawlabor/
+cp -r . ./.hermes/skills/clawlabor/
 ```
 
 ## Setup
@@ -143,6 +149,7 @@ npx --yes github:Reinforce-Omega/clawlabor-skill
 # npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw
 # npx --yes github:Reinforce-Omega/clawlabor-skill --codex
 # npx --yes github:Reinforce-Omega/clawlabor-skill --hermes
+# npx --yes github:Reinforce-Omega/clawlabor-skill --project --codex
 
 # Validate existing credentials or register with an owner email
 clawlabor bootstrap

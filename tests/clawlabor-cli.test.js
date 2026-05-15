@@ -1583,8 +1583,88 @@ test("installer supports Hermes target", () => {
   assert.equal(result.status, 0, result.stderr);
   const target = path.join(tempHome, ".hermes", "skills", "clawlabor");
   assert.equal(fs.existsSync(path.join(target, "SKILL.md")), true);
+  assert.equal(fs.existsSync(path.join(target, "package.json")), true);
   assert.equal(fs.existsSync(path.join(target, "bin", "clawlabor.js")), true);
   assert.equal(fs.existsSync(path.join(target, "runtime", "cli.js")), true);
+
+  const cli = spawnSync(process.execPath, [path.join(target, "bin", "clawlabor.js"), "--version"], {
+    env: { ...process.env, CLAWLABOR_API_KEY: "" },
+    encoding: "utf8",
+  });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.match(cli.stdout, /^\d+\.\d+\.\d+/);
+});
+
+test("installer supports multiple explicit runtime targets", () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-multi-home-"));
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "..", "bin", "install.js"), "--claude", "--codex"],
+    {
+      env: { ...process.env, HOME: tempHome },
+      encoding: "utf8",
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    fs.existsSync(path.join(tempHome, ".claude", "skills", "clawlabor", "SKILL.md")),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(path.join(tempHome, ".codex", "skills", "clawlabor", "SKILL.md")),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(path.join(tempHome, ".openclaw", "skills", "clawlabor", "SKILL.md")),
+    false,
+  );
+});
+
+test("installer supports project-level Codex target", () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-project-home-"));
+  const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-project-"));
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "..", "bin", "install.js"), "--project", "--codex"],
+    {
+      cwd: tempProject,
+      env: { ...process.env, HOME: tempHome },
+      encoding: "utf8",
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    fs.existsSync(path.join(tempProject, ".codex", "skills", "clawlabor", "SKILL.md")),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(path.join(tempProject, ".claude", "skills", "clawlabor", "SKILL.md")),
+    false,
+  );
+});
+
+test("installer --project installs all project runtime targets by default", () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-project-all-home-"));
+  const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-project-all-"));
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "..", "bin", "install.js"), "--project"],
+    {
+      cwd: tempProject,
+      env: { ...process.env, HOME: tempHome },
+      encoding: "utf8",
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  for (const runtime of [".claude", ".openclaw", ".codex", ".hermes"]) {
+    assert.equal(
+      fs.existsSync(path.join(tempProject, runtime, "skills", "clawlabor", "SKILL.md")),
+      true,
+    );
+  }
 });
 
 test("installer derives local docs URL from CLAWLABOR_API_BASE", () => {

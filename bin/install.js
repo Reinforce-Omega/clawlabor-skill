@@ -15,7 +15,7 @@
  *   npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw  # Install for OpenClaw only
  *   npx --yes github:Reinforce-Omega/clawlabor-skill --codex     # Install for Codex CLI only
  *   npx --yes github:Reinforce-Omega/clawlabor-skill --hermes    # Install for Hermes only
- *   npx --yes github:Reinforce-Omega/clawlabor-skill --project   # Install in current project's .claude/skills/
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill --project   # Install in current project's agent skill dirs
  *   npx --yes github:Reinforce-Omega/clawlabor-skill --uninstall # Remove from all platforms
  */
 
@@ -33,7 +33,17 @@ const PLATFORMS = {
   hermes: path.join(HOME, ".hermes", "skills", SKILL_NAME),
 };
 
+const PROJECT_PLATFORMS = {
+  claude: path.join(process.cwd(), ".claude", "skills", SKILL_NAME),
+  openclaw: path.join(process.cwd(), ".openclaw", "skills", SKILL_NAME),
+  codex: path.join(process.cwd(), ".codex", "skills", SKILL_NAME),
+  hermes: path.join(process.cwd(), ".hermes", "skills", SKILL_NAME),
+};
+
+const PLATFORM_FLAGS = ["claude", "openclaw", "codex", "hermes"];
+
 const FILES_TO_COPY = [
+  "package.json",
   "SKILL.md",
   "REFERENCE.md",
   "WORKFLOW.md",
@@ -104,6 +114,29 @@ function detectPlatforms() {
   return detected;
 }
 
+function selectedPlatformFlags() {
+  return PLATFORM_FLAGS.filter((name) => flags.has(name));
+}
+
+function targetFor(platform, projectMode = false) {
+  return {
+    name: projectMode ? `project:${platform}` : platform,
+    dir: projectMode ? PROJECT_PLATFORMS[platform] : PLATFORMS[platform],
+  };
+}
+
+function selectedTargets() {
+  const selected = selectedPlatformFlags();
+  if (flags.has("project")) {
+    const platforms = selected.length > 0 ? selected : PLATFORM_FLAGS;
+    return platforms.map((platform) => targetFor(platform, true));
+  }
+  if (selected.length > 0) {
+    return selected.map((platform) => targetFor(platform, false));
+  }
+  return detectPlatforms().map((platform) => targetFor(platform, false));
+}
+
 // --- Main ---
 
 if (flags.has("help") || flags.has("h")) {
@@ -117,7 +150,9 @@ Usage:
   npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw   Install for OpenClaw only
   npx --yes github:Reinforce-Omega/clawlabor-skill --codex      Install for Codex CLI only
   npx --yes github:Reinforce-Omega/clawlabor-skill --hermes     Install for Hermes only
-  npx --yes github:Reinforce-Omega/clawlabor-skill --project    Install in current project (.claude/skills/)
+  npx --yes github:Reinforce-Omega/clawlabor-skill --project    Install in current project's .claude/.openclaw/.codex/.hermes skill dirs
+  npx --yes github:Reinforce-Omega/clawlabor-skill --project --codex
+                                                              Install in current project's .codex/skills/ only
   npx --yes github:Reinforce-Omega/clawlabor-skill --uninstall  Remove from all platforms
   npx --yes github:Reinforce-Omega/clawlabor-skill --help       Show this help
 
@@ -143,11 +178,11 @@ if (flags.has("uninstall")) {
       removed++;
     }
   }
-  // Also check project-level
-  const projectDir = path.join(process.cwd(), ".claude", "skills", SKILL_NAME);
-  if (removeSkillDir(projectDir)) {
-    console.log(`  Removed from project: ${projectDir}`);
-    removed++;
+  for (const [platform, dir] of Object.entries(PROJECT_PLATFORMS)) {
+    if (removeSkillDir(dir)) {
+      console.log(`  Removed from project:${platform}: ${dir}`);
+      removed++;
+    }
   }
   if (removed === 0) {
     console.log("  No installations found.");
@@ -155,25 +190,7 @@ if (flags.has("uninstall")) {
   process.exit(0);
 }
 
-// Determine target platforms
-let targets = [];
-
-if (flags.has("project")) {
-  const projectDir = path.join(process.cwd(), ".claude", "skills", SKILL_NAME);
-  targets.push({ name: "project", dir: projectDir });
-} else if (flags.has("claude")) {
-  targets.push({ name: "claude", dir: PLATFORMS.claude });
-} else if (flags.has("openclaw")) {
-  targets.push({ name: "openclaw", dir: PLATFORMS.openclaw });
-} else if (flags.has("codex")) {
-  targets.push({ name: "codex", dir: PLATFORMS.codex });
-} else if (flags.has("hermes")) {
-  targets.push({ name: "hermes", dir: PLATFORMS.hermes });
-} else {
-  // Auto-detect
-  const detected = detectPlatforms();
-  targets = detected.map((p) => ({ name: p, dir: PLATFORMS[p] }));
-}
+const targets = selectedTargets();
 
 console.log("Installing ClawLabor skill...\n");
 
