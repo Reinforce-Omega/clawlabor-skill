@@ -330,7 +330,7 @@ test("match applies local policy defaults", async () => {
   });
 });
 
-test("plan exposes input_schema, missing-field check, and rejected listings", async () => {
+test("plan emits a compact agent-facing purchase plan", async () => {
   const { fetch } = recordingFetch([
     matchRoute("POST", "/listings/match", {
       status: 200,
@@ -338,12 +338,19 @@ test("plan exposes input_schema, missing-field check, and rejected listings", as
         matches: [
           {
             id: "sku-123",
-            name: "Research",
+            title: "Research",
+            description: "Long listing text that should not be duplicated in the default plan.",
             price: 20,
+            category: "research_analysis",
             trust_score: 92,
+            status: "active",
+            inventory: 1,
+            tags: ["research"],
             input_schema: { type: "object", required: ["url", "question"] },
             policy: { allowed: true, blocked_reasons: [] },
             reasons: ["category_match"],
+            match_explanation: "Matched because the task needs public evidence.",
+            invocation_guidance: ["Expected outcome: sourced research brief"],
           },
           {
             id: "sku-cheap",
@@ -365,13 +372,71 @@ test("plan exposes input_schema, missing-field check, and rejected listings", as
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t), makeIdempotencyKey: () => "fixed-key" },
   );
   const plan = JSON.parse(out[0]);
-  assert.equal(plan.selected_listing.id, "sku-123");
-  assert.deepEqual(plan.input_schema.required, ["url", "question"]);
-  assert.equal(plan.requirement_valid, false);
-  assert.deepEqual(plan.missing_required_fields, ["question"]);
-  assert.deepEqual(plan.rejected_listings, [
+  assert.deepEqual(plan.listing, {
+    id: "sku-123",
+    title: "Research",
+    price: 20,
+    category: "research_analysis",
+    trust_score: 92,
+    status: "active",
+    inventory: 1,
+  });
+  assert.deepEqual(plan.input.schema.required, ["url", "question"]);
+  assert.deepEqual(plan.input.requirement, { url: "https://x.com" });
+  assert.equal(plan.input.valid, false);
+  assert.deepEqual(plan.input.missing_required_fields, ["question"]);
+  assert.equal(plan.decision.why_matched, "Matched because the task needs public evidence.");
+  assert.deepEqual(plan.decision.how_to_use, ["Expected outcome: sourced research brief"]);
+  assert.equal(plan.selected_listing, undefined);
+  assert.equal(plan.match_explanation, undefined);
+  assert.equal(plan.invocation_guidance, undefined);
+  assert.equal(plan.rejected_listings, undefined);
+  assert.equal(plan.input_schema, undefined);
+  assert.equal(plan.debug, undefined);
+});
+
+test("plan --verbose includes raw match debug data", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/listings/match", {
+      status: 200,
+      body: JSON.stringify({
+        matches: [
+          {
+            id: "sku-123",
+            title: "Research",
+            price: 20,
+            input_schema: { type: "object", required: ["url"] },
+            policy: { allowed: true, blocked_reasons: [] },
+            reasons: ["category_match"],
+          },
+          {
+            id: "sku-cheap",
+            policy: { allowed: false, blocked_reasons: ["trust_below_minimum"] },
+          },
+        ],
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    [
+      "plan",
+      "--goal",
+      "Analyze",
+      "--requirement-json",
+      '{"url":"https://x.com"}',
+      "--verbose",
+    ],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t), makeIdempotencyKey: () => "fixed-key" },
+  );
+  const plan = JSON.parse(out[0]);
+  assert.equal(plan.listing.id, "sku-123");
+  assert.equal(plan.debug.selected_listing.id, "sku-123");
+  assert.deepEqual(plan.debug.reasons, ["category_match"]);
+  assert.deepEqual(plan.debug.rejected_listings, [
     { id: "sku-cheap", blocked_reasons: ["trust_below_minimum"] },
   ]);
+  assert.equal(plan.debug.raw_match.matches.length, 2);
 });
 
 test("plan chooses a schema-compatible allowed listing", async () => {
@@ -402,8 +467,8 @@ test("plan chooses a schema-compatible allowed listing", async () => {
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t), makeIdempotencyKey: () => "fixed-key" },
   );
   const plan = JSON.parse(out[0]);
-  assert.equal(plan.selected_listing.id, "sku-url");
-  assert.equal(plan.requirement_valid, true);
+  assert.equal(plan.listing.id, "sku-url");
+  assert.equal(plan.input.valid, true);
 });
 
 test("plan reports missing required fields when requirement is omitted", async () => {
@@ -428,9 +493,9 @@ test("plan reports missing required fields when requirement is omitted", async (
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t), makeIdempotencyKey: () => "fixed-key" },
   );
   const plan = JSON.parse(out[0]);
-  assert.equal(plan.requirement, null);
-  assert.equal(plan.requirement_valid, false);
-  assert.deepEqual(plan.missing_required_fields, ["url"]);
+  assert.equal(plan.input.requirement, null);
+  assert.equal(plan.input.valid, false);
+  assert.deepEqual(plan.input.missing_required_fields, ["url"]);
 });
 
 test("validate calls delivery validation endpoint", async () => {
