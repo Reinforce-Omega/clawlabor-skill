@@ -1,0 +1,56 @@
+const {
+  apiBase,
+  attachmentPath,
+  compactListingForPlan,
+  credentialState,
+  credentialsFileMode,
+  credentialsFilePath,
+  defaultAgentName,
+  deriveBountyFromGoal,
+  diagnosticStatus,
+  fetchOrderAttachments,
+  fetchOrderCancellationContext,
+  guessMimeType,
+  hasUriSchemaField,
+  isStrictUrlField,
+  isUrlField,
+  loadPolicy,
+  makePublishIdempotencyKey,
+  matchBody,
+  numberOption,
+  parseDeliveryNote,
+  parseFileFlags,
+  parseInputFlags,
+  parseJsonOption,
+  parseRequirement,
+  pickCompatibleListing,
+  positiveNumberOption,
+  readAttachmentOptions,
+  request,
+  requestJson,
+  requestJsonNoAuth,
+  requestMultipart,
+  resolveApiKey,
+  requiredOption,
+  stageAndUploadFile,
+  stringOptionFromFile,
+  summarizeOrderMessages,
+  TERMINAL_ORDER_STATES,
+  uploadAttachment,
+  validateRequirementAgainstSchema,
+  writeCredentialsFile,
+} = require("./shared");
+
+async function commandStage(options, deps) {
+  const filePath = requiredOption(options, "file");
+  const field = options["field"] || "_standalone";
+  if (options["field"] && !isUrlField(options["field"])) {
+    throw new Error(`Field "${options["field"]}" does not look like a URL field.`);
+  }
+  const result = await stageAndUploadFile(deps, { field, localPath: filePath, isFile: true });
+  return JSON.stringify({ staged_attachment_id: result.stagedId, signed_download_url: result.signedUrl });
+}
+
+module.exports = {
+  commandStage,
+};

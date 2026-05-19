@@ -1,8 +1,11 @@
 const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
+const { Readable } = require("node:stream");
 const test = require("node:test");
 
 const {
@@ -47,6 +50,31 @@ function matchRoute(method, pathSuffix, respond) {
     match: ({ url, options }) =>
       (options.method || "GET") === method && url.endsWith(pathSuffix),
     respond,
+  };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function createMockResponse() {
+  return {
+    statusCode: null,
+    headers: null,
+    body: "",
+    writeHead(statusCode, headers) {
+      this.statusCode = statusCode;
+      this.headers = headers;
+    },
+    end(body = "") {
+      this.body = body;
+    },
   };
 }
 
@@ -206,6 +234,85 @@ test("auth status validates credentials from credentials file", async () => {
   assert.equal(calls[0].options.headers.Authorization, "Bearer file-key");
 });
 
+test("doctor reports missing credentials but still checks API health", async () => {
+  const credentialsFile = tempTestFile("credentials.json");
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/health", { status: 200, body: '{"status":"ok"}' }),
+  ]);
+  const out = [];
+
+  await runCli(["doctor"], {
+    env: {
+      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+    },
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "fail");
+  assert.equal(result.credentials_file, credentialsFile);
+  assert.equal(result.checks.find((check) => check.name === "api_reachable").status, "pass");
+  assert.equal(result.checks.find((check) => check.name === "credentials").status, "fail");
+  assert.equal(result.checks.find((check) => check.name === "auth").error_code, "missing_credentials");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.example.test/api/health");
+});
+
+test("doctor validates auth without leaking the API key", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ agent_id: "agent_env", name: "Env Agent", balance: 42 }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(["doctor"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  const auth = result.checks.find((check) => check.name === "auth");
+  assert.equal(result.ok, true);
+  assert.equal(auth.status, "pass");
+  assert.equal(auth.agent_id, "agent_env");
+  assert.equal(result.api_key, undefined);
+  assert.equal(JSON.stringify(result).includes("test-key"), false);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].options.headers.Authorization, "Bearer test-key");
+});
+
+test("doctor reports malformed credentials file as a diagnostic failure", async () => {
+  const credentialsFile = tempTestFile("credentials.json");
+  fs.writeFileSync(credentialsFile, "{not-json");
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/health", { status: 200, body: '{"status":"ok"}' }),
+  ]);
+  const out = [];
+
+  await runCli(["doctor"], {
+    env: {
+      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+    },
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  const result = JSON.parse(out[0]);
+  const credentials = result.checks.find((check) => check.name === "credentials");
+  assert.equal(result.ok, false);
+  assert.equal(credentials.status, "fail");
+  assert.match(credentials.error, /JSON/);
+  assert.equal(calls.length, 1);
+});
+
 test("bootstrap validates existing credentials without registering again", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-bootstrap-"));
   const credentialsFile = path.join(tempDir, "credentials.json");
@@ -273,6 +380,715 @@ test("register creates an agent and stores credentials", async () => {
   assert.equal(saved.api_key, "new-key");
   assert.equal(saved.agent_id, "agent_new");
   assert.equal(JSON.parse(out[0]).action, "registered");
+});
+
+test("profile updates the current agent webhook configuration", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("PATCH", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        agent_id: "agent_existing",
+        name: "Agent Existing",
+        webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
+      }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(
+    [
+      "profile",
+      "--webhook-url",
+      "https://example.trycloudflare.com/webhooks/clawlabor",
+      "--webhook-secret",
+      "0123456789abcdef0123456789abcdef",
+    ],
+    {
+      env: {
+        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+        CLAWLABOR_API_KEY: "file-key",
+      },
+      fetch,
+      stdout: (t) => out.push(t),
+    },
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer file-key");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
+    webhook_secret: "0123456789abcdef0123456789abcdef",
+  });
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "updated");
+  assert.equal(result.webhook_url, "https://example.trycloudflare.com/webhooks/clawlabor");
+});
+
+test("publish creates a SKU listing for the current agent", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/listings", {
+      status: 201,
+      body: JSON.stringify({
+        listing: {
+          id: "listing-code-1",
+          name: "Hermes Code Writer",
+          price: 25,
+          category: "code_engineering",
+          status: "active",
+          input_schema: {
+            type: "object",
+            required: ["task"],
+            properties: { task: { type: "string" } },
+          },
+        },
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    [
+      "publish",
+      "--name",
+      "Hermes Code Writer",
+      "--description",
+      "Writes small code changes and returns a concise patch.",
+      "--price",
+      "25",
+      "--category",
+      "code_engineering",
+      "--input-schema-json",
+      '{"type":"object","required":["task"],"properties":{"task":{"type":"string"}}}',
+      "--tags",
+      "code,hermes",
+      "--idempotency-key",
+      "publish-code-1",
+    ],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+
+  assert.equal(calls[0].options.method, "POST");
+  assert.ok(calls[0].url.endsWith("/listings"));
+  assert.equal(calls[0].options.headers["Idempotency-Key"], "publish-code-1");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    name: "Hermes Code Writer",
+    description: "Writes small code changes and returns a concise patch.",
+    price: 25,
+    input_schema: {
+      type: "object",
+      required: ["task"],
+      properties: { task: { type: "string" } },
+    },
+    output_schema: null,
+    example_input: null,
+    example_output: null,
+    tags: ["code", "hermes"],
+    category: "code_engineering",
+  });
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "published");
+  assert.equal(result.listing_id, "listing-code-1");
+});
+
+test("accept and complete seller order lifecycle commands", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/orders/order-1/accept", {
+      status: 200,
+      body: JSON.stringify({ id: "order-1", status: "in_progress" }),
+    }),
+    matchRoute("POST", "/orders/order-1/complete", {
+      status: 200,
+      body: JSON.stringify({
+        id: "order-1",
+        status: "pending_confirmation",
+        delivery_note: "Implemented the requested code change.",
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(["accept", "--order", "order-1"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+  await runCli(["complete", "--order", "order-1", "--delivery-note", "Implemented the requested code change."], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  assert.deepEqual(JSON.parse(calls[0].options.body), {});
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    delivery_note: "Implemented the requested code change.",
+  });
+  assert.equal(JSON.parse(out[0]).action, "accepted");
+  assert.equal(JSON.parse(out[1]).action, "completed");
+});
+
+test("online starts a receiver and writes webhook events to inbox", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-online-"));
+  const inboxFile = path.join(tempDir, "inbox.jsonl");
+  const sessionRoot = path.join(tempDir, "sessions");
+  const requestSecret = "0123456789abcdef0123456789abcdef";
+  const wait = deferred();
+  let handler = null;
+  const server = {
+    listen(_port, _host, cb) {
+      cb?.();
+    },
+    close(cb) {
+      cb?.();
+    },
+    once() {
+      return this;
+    },
+    off() {
+      return this;
+    },
+  };
+  const { fetch, calls } = recordingFetch([
+    matchRoute("PATCH", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        agent_id: "agent_existing",
+        name: "Agent Existing",
+        webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
+      }),
+    }),
+    matchRoute("POST", "/agents/heartbeat", {
+      status: 200,
+      body: JSON.stringify({ ok: true }),
+    }),
+  ]);
+  const out = [];
+  let spawnCalled = false;
+
+  const run = runCli(
+    [
+      "online",
+      "--webhook-url",
+      "https://example.trycloudflare.com/webhooks/clawlabor",
+      "--webhook-secret",
+      requestSecret,
+      "--inbox-file",
+      inboxFile,
+      "--session-root",
+      sessionRoot,
+      "--session-id",
+      "hermes-current",
+      "--port",
+      "8787",
+    ],
+    {
+      env: {
+        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+        CLAWLABOR_API_KEY: "file-key",
+      },
+      fetch,
+      stdout: (t) => out.push(t),
+      createServer: (cb) => {
+        handler = cb;
+        return server;
+      },
+      spawn: () => {
+        spawnCalled = true;
+        throw new Error("should not start a tunnel when --webhook-url is provided");
+      },
+      waitForExit: wait.promise,
+    },
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(handler, "receiver should be created");
+  assert.equal(spawnCalled, false);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
+    webhook_secret: requestSecret,
+  });
+
+  const buyerPayload = {
+    event_id: 98,
+    event_type: "order.completed",
+    payload: { order_id: "order-buyer-98" },
+    created_at: "2026-05-19T00:00:00.000Z",
+  };
+  const buyerBody = Buffer.from(JSON.stringify(buyerPayload));
+  const buyerSignature = crypto.createHmac("sha256", requestSecret).update(buyerBody).digest("hex");
+  const buyerReq = Readable.from([buyerBody]);
+  buyerReq.method = "POST";
+  buyerReq.url = "/webhooks/clawlabor";
+  buyerReq.headers = { "x-webhook-signature": buyerSignature };
+  const buyerRes = createMockResponse();
+  await handler(buyerReq, buyerRes);
+
+  assert.equal(buyerRes.statusCode, 200);
+  assert.equal(JSON.parse(buyerRes.body).session_id, "hermes-current");
+
+  const payload = {
+    event_id: 99,
+    event_type: "order.received",
+    payload: { order_id: "order-99" },
+    created_at: "2026-05-19T00:00:00.000Z",
+  };
+  const body = Buffer.from(JSON.stringify(payload));
+  const signature = crypto.createHmac("sha256", requestSecret).update(body).digest("hex");
+  const req = Readable.from([body]);
+  req.method = "POST";
+  req.url = "/webhooks/clawlabor";
+  req.headers = { "x-webhook-signature": signature };
+  const res = createMockResponse();
+  await handler(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).session_id, "order:order-99:seller");
+  const retryReq = Readable.from([body]);
+  retryReq.method = "POST";
+  retryReq.url = "/webhooks/clawlabor";
+  retryReq.headers = { "x-webhook-signature": signature };
+  const retryRes = createMockResponse();
+  await handler(retryReq, retryRes);
+
+  assert.equal(retryRes.statusCode, 200);
+  assert.equal(JSON.parse(retryRes.body).duplicate, true);
+  assert.ok(fs.existsSync(inboxFile));
+  const lines = fs.readFileSync(inboxFile, "utf8").trim().split("\n");
+  assert.equal(lines.length, 2);
+  const stored = JSON.parse(lines[1]);
+  assert.equal(stored.event_id, 99);
+  assert.equal(stored.event_type, "order.received");
+  assert.equal(stored.payload.order_id, "order-99");
+
+  assert.ok(fs.existsSync(path.join(sessionRoot, "hermes-current", "inbox.jsonl")));
+  assert.ok(fs.existsSync(path.join(sessionRoot, "order_order-99_seller", "inbox.jsonl")));
+  assert.equal(
+    fs.readFileSync(path.join(sessionRoot, "order_order-99_seller", "inbox.jsonl"), "utf8").trim().split("\n").length,
+    1,
+  );
+  assert.match(
+    fs.readFileSync(path.join(sessionRoot, "order_order-99_seller", "prompt.md"), "utf8"),
+    /SKU\/listing description, and the buyer's order requirement/,
+  );
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(sessionRoot, "order_order-99_seller", "prompt.md"), "utf8"),
+    /Latest event/,
+  );
+
+  const buyerMessagePayload = {
+    event_id: 100,
+    event_type: "message.received",
+    payload: { order_id: "buyer-order-without-seller-session", content: "Any update?" },
+    created_at: "2026-05-19T00:00:01.000Z",
+  };
+  const buyerMessageBody = Buffer.from(JSON.stringify(buyerMessagePayload));
+  const buyerMessageSignature = crypto.createHmac("sha256", requestSecret).update(buyerMessageBody).digest("hex");
+  const buyerMessageReq = Readable.from([buyerMessageBody]);
+  buyerMessageReq.method = "POST";
+  buyerMessageReq.url = "/webhooks/clawlabor";
+  buyerMessageReq.headers = { "x-webhook-signature": buyerMessageSignature };
+  const buyerMessageRes = createMockResponse();
+  await handler(buyerMessageReq, buyerMessageRes);
+
+  assert.equal(buyerMessageRes.statusCode, 200);
+  assert.equal(JSON.parse(buyerMessageRes.body).session_id, "hermes-current");
+
+  const sessionOut = [];
+  await runCli(["session", "--action", "next", "--session-root", sessionRoot, "--session-id", "hermes-current"], {
+    env: BASE_ENV,
+    fetch: async () => {
+      throw new Error("session next should not call API");
+    },
+    stdout: (t) => sessionOut.push(t),
+  });
+  const sessionNext = JSON.parse(sessionOut[0]);
+  assert.equal(sessionNext.pending, true);
+  assert.equal(sessionNext.event.event_type, "order.completed");
+  assert.equal(sessionNext.event.payload.order_id, "order-buyer-98");
+
+  wait.resolve();
+  await run;
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "online");
+  assert.equal(result.receiver_url, "http://127.0.0.1:8787/webhooks/clawlabor");
+  assert.equal(result.current_session_id, "hermes-current");
+  assert.equal(result.heartbeat_ok, true);
+});
+
+test("serve --adapter hermes processes isolated seller order sessions", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-serve-hermes-"));
+  const sessionRoot = path.join(tempDir, "sessions");
+  const sessionDir = path.join(sessionRoot, "order_order-serve-1_seller");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionRoot, "state.json"),
+    JSON.stringify({
+      current_session_id: "hermes-current",
+      sessions: {
+        "order:order-serve-1:seller": {
+          session_id: "order:order-serve-1:seller",
+          kind: "order",
+          role: "seller",
+          context_id: "order-serve-1",
+          purpose: "Fulfill order order-serve-1",
+          last_event_id: 501,
+        },
+      },
+    }),
+  );
+  fs.writeFileSync(path.join(sessionDir, "cursor.json"), JSON.stringify({ last_acked_event_id: 0 }));
+  fs.writeFileSync(
+    path.join(sessionDir, "inbox.jsonl"),
+    `${JSON.stringify({
+      event_id: 501,
+      event_type: "order.received",
+      payload: {
+        order_id: "order-serve-1",
+        requirement: { task: "Write a JavaScript add function from the event payload" },
+        input_schema: { type: "object", required: ["task"] },
+        service_sku_id: "sku-serve-1",
+      },
+      created_at: "2026-05-19T00:00:00.000Z",
+    })}\n`,
+  );
+
+  const calls = [];
+  let orderServeGetCount = 0;
+  const fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    const method = options.method || "GET";
+    if (method === "GET" && url.endsWith("/orders/order-serve-1")) {
+      orderServeGetCount += 1;
+      if (orderServeGetCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            order: {
+              id: "order-serve-1",
+              status: "pending_accept",
+            },
+          }),
+        };
+      }
+      if (orderServeGetCount === 2) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            order: {
+              id: "order-serve-1",
+              status: "in_progress",
+            },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          order: {
+            id: "order-serve-1",
+            status: "pending_confirmation",
+            delivery_note: "Delivered as attached artifact(s). See attachments for the full result.",
+          },
+        }),
+      };
+    }
+    if (method === "POST" && url.endsWith("/orders/order-serve-1/accept")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ id: "order-serve-1", status: "in_progress" }),
+      };
+    }
+    throw new Error(`No mock route matched ${method} ${url}`);
+  };
+
+  const spawnCalls = [];
+  const fakeSpawn = (_command, args) => {
+    spawnCalls.push(args);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    process.nextTick(() => {
+      child.stdout.emit("data", "Here is the implementation: function add(a, b) { return a + b; }");
+      child.emit("exit", 0);
+    });
+    return child;
+  };
+
+  const out = [];
+  await runCli(
+    [
+      "serve",
+      "--adapter",
+      "hermes",
+      "--once",
+      "--session-root",
+      sessionRoot,
+      "--hermes-command",
+      "hermes",
+    ],
+    {
+      env: BASE_ENV,
+      fetch,
+      spawn: fakeSpawn,
+      stdout: (t) => out.push(t),
+    },
+  );
+
+  assert.equal(spawnCalls.length, 1);
+  assert.equal(spawnCalls[0][0], "chat");
+  const hermesPrompt = spawnCalls[0][spawnCalls[0].indexOf("-q") + 1];
+  assert.match(hermesPrompt, /Use the SKU\/listing description, input schema, buyer requirement, messages, and attachments as the contract/);
+  assert.match(hermesPrompt, /Write a JavaScript add function from the event payload/);
+  assert.doesNotMatch(hermesPrompt, /code-writing SKU order/);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(sessionDir, "cursor.json"), "utf8")).last_acked_event_id,
+    501,
+  );
+  const result = JSON.parse(out[0]);
+  assert.equal(result.processed[0].order_id, "order-serve-1");
+  assert.equal(result.processed[0].status, "in_progress");
+});
+
+test("serve --adapter hermes acks seller order after notifying Hermes", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-serve-empty-"));
+  const sessionRoot = path.join(tempDir, "sessions");
+  const sessionDir = path.join(sessionRoot, "order_order-empty_seller");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionRoot, "state.json"),
+    JSON.stringify({
+      current_session_id: "hermes-current",
+      sessions: {
+        "order:order-empty:seller": {
+          session_id: "order:order-empty:seller",
+          kind: "order",
+          role: "seller",
+          context_id: "order-empty",
+          purpose: "Fulfill order order-empty",
+          last_event_id: 601,
+        },
+      },
+    }),
+  );
+  fs.writeFileSync(path.join(sessionDir, "cursor.json"), JSON.stringify({ last_acked_event_id: 0 }));
+  fs.writeFileSync(
+    path.join(sessionDir, "inbox.jsonl"),
+    `${JSON.stringify({
+      event_id: 601,
+      event_type: "order.received",
+      payload: { order_id: "order-empty", requirement: { task: "Return something" } },
+      created_at: "2026-05-19T00:00:00.000Z",
+    })}\n`,
+  );
+
+  const calls = [];
+  let orderEmptyGetCount = 0;
+  const fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    const method = options.method || "GET";
+    if (method === "GET" && url.endsWith("/orders/order-empty")) {
+      orderEmptyGetCount += 1;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ order: { id: "order-empty", status: "in_progress" } }),
+      };
+    }
+    if (method === "GET" && url.endsWith("/orders/order-empty/attachments")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ files: [], file_count: 0, total_size: 0 }),
+      };
+    }
+    throw new Error(`No mock route matched ${method} ${url}`);
+  };
+
+  const fakeSpawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    process.nextTick(() => {
+      child.stdout.emit("data", "   \n");
+      child.emit("exit", 0);
+    });
+    return child;
+  };
+
+  const out = [];
+  await runCli(
+    [
+      "serve",
+      "--adapter",
+      "hermes",
+      "--once",
+      "--session-root",
+      sessionRoot,
+      "--hermes-command",
+      "hermes",
+    ],
+    {
+      env: BASE_ENV,
+      fetch,
+      spawn: fakeSpawn,
+      stdout: (t) => out.push(t),
+    },
+  );
+
+  assert.ok(calls.every((call) => !call.url.endsWith("/orders/order-empty/complete")));
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(sessionDir, "cursor.json"), "utf8")).last_acked_event_id,
+    601,
+  );
+  const result = JSON.parse(out[0]);
+  assert.equal(result.processed.length, 1);
+  assert.equal(result.processed[0].status, "in_progress");
+});
+
+test("online defaults to Cloudflare tunnel discovery and writes the public URL back to the profile", async () => {
+  const wait = deferred();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-online-tunnel-"));
+  const tunnel = new EventEmitter();
+  tunnel.stdout = new EventEmitter();
+  tunnel.stderr = new EventEmitter();
+  tunnel.kill = () => {
+    tunnel.killed = true;
+  };
+  const server = {
+    listen(_port, _host, cb) {
+      cb?.();
+    },
+    close(cb) {
+      cb?.();
+    },
+    once() {
+      return this;
+    },
+    off() {
+      return this;
+    },
+  };
+  const { fetch, calls } = recordingFetch([
+    matchRoute("PATCH", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        agent_id: "agent_existing",
+        name: "Agent Existing",
+        webhook_url: "https://agent.example.com/webhooks/clawlabor",
+      }),
+    }),
+    matchRoute("POST", "/agents/heartbeat", {
+      status: 200,
+      body: JSON.stringify({ ok: true }),
+    }),
+  ]);
+  const out = [];
+  const spawnCalls = [];
+
+  const run = runCli(
+    [
+      "online",
+      "--webhook-secret",
+      "abcdef0123456789abcdef0123456789",
+      "--inbox-file",
+      path.join(tempDir, "inbox.jsonl"),
+      "--session-root",
+      path.join(tempDir, "sessions"),
+      "--port",
+      "8787",
+    ],
+    {
+      env: {
+        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+        CLAWLABOR_API_KEY: "file-key",
+      },
+      fetch,
+      stdout: (t) => out.push(t),
+      createServer: () => server,
+      spawn: (command, args) => {
+        spawnCalls.push({ command, args });
+        return tunnel;
+      },
+      waitForExit: wait.promise,
+    },
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(spawnCalls, [{
+    command: "cloudflared",
+    args: ["tunnel", "--url", "http://127.0.0.1:8787/webhooks/clawlabor"],
+  }]);
+  tunnel.stderr.emit("data", "Your quick Tunnel has been created! Visit https://www.cloudflare.com/website-terms/ for terms\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 0);
+  tunnel.stdout.emit("data", "Visit https://abc.trycloudflare.com for the public URL\n");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    webhook_url: "https://abc.trycloudflare.com/webhooks/clawlabor",
+    webhook_secret: "abcdef0123456789abcdef0123456789",
+  });
+
+  wait.resolve();
+  await run;
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.webhook_url, "https://abc.trycloudflare.com/webhooks/clawlabor");
+  assert.equal(result.tunnel_command, "cloudflared");
+});
+
+test("online closes the receiver when the default tunnel cannot start", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-online-missing-tunnel-"));
+  let closed = false;
+  const server = {
+    listen(_port, _host, cb) {
+      cb?.();
+    },
+    close(cb) {
+      closed = true;
+      cb?.();
+    },
+    once() {
+      return this;
+    },
+    off() {
+      return this;
+    },
+  };
+
+  await assert.rejects(
+    runCli(
+      [
+        "online",
+        "--inbox-file",
+        path.join(tempDir, "inbox.jsonl"),
+        "--session-root",
+        path.join(tempDir, "sessions"),
+      ],
+      {
+        env: BASE_ENV,
+        fetch: async () => {
+          throw new Error("should not call API before tunnel URL is known");
+        },
+        stdout: () => {},
+        createServer: () => server,
+        spawn: () => {
+          const err = new Error("spawn cloudflared ENOENT");
+          err.code = "ENOENT";
+          throw err;
+        },
+      },
+    ),
+    /Install cloudflared/,
+  );
+  assert.equal(closed, true);
 });
 
 test("register requires owner email", async () => {
@@ -1410,6 +2226,33 @@ test("bin emits JSON error and exits nonzero without API key", () => {
   assert.match(err.error, /CLAWLABOR_API_KEY/);
 });
 
+test("bin adds next guidance for insufficient credits", () => {
+  const script = `
+    global.fetch = async () => ({
+      ok: false,
+      status: 402,
+      text: async () => JSON.stringify({ detail: "insufficient_credits" }),
+    });
+    process.argv = ["node", "clawlabor", "buy", "--listing", "sku-123"];
+    require("./bin/clawlabor.js");
+  `;
+  const result = spawnSync(process.execPath, ["-e", script], {
+    cwd: path.join(__dirname, ".."),
+    env: {
+      ...process.env,
+      CLAWLABOR_API_KEY: "test-key",
+      CLAWLABOR_API_BASE: "https://api.example.test/api",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  const err = JSON.parse(result.stderr);
+  assert.equal(err.error_code, "insufficient_credits");
+  assert.match(err.next, /Run clawlabor me/);
+  assert.match(err.next, /lower --max-price/);
+});
+
 test("every COMMANDS entry has handler, summary, usage, and section metadata", () => {
   for (const [name, meta] of Object.entries(COMMANDS)) {
     assert.equal(typeof meta.handler, "function", `${name} missing handler`);
@@ -1504,8 +2347,88 @@ test("installer supports Hermes target", () => {
   assert.equal(result.status, 0, result.stderr);
   const target = path.join(tempHome, ".hermes", "skills", "clawlabor");
   assert.equal(fs.existsSync(path.join(target, "SKILL.md")), true);
+  assert.equal(fs.existsSync(path.join(target, "package.json")), true);
   assert.equal(fs.existsSync(path.join(target, "bin", "clawlabor.js")), true);
   assert.equal(fs.existsSync(path.join(target, "runtime", "cli.js")), true);
+
+  const cli = spawnSync(process.execPath, [path.join(target, "bin", "clawlabor.js"), "--version"], {
+    env: { ...process.env, CLAWLABOR_API_KEY: "" },
+    encoding: "utf8",
+  });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.match(cli.stdout, /^\d+\.\d+\.\d+/);
+});
+
+test("installer supports multiple explicit runtime targets", () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-multi-home-"));
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "..", "bin", "install.js"), "--claude", "--codex"],
+    {
+      env: { ...process.env, HOME: tempHome },
+      encoding: "utf8",
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    fs.existsSync(path.join(tempHome, ".claude", "skills", "clawlabor", "SKILL.md")),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(path.join(tempHome, ".codex", "skills", "clawlabor", "SKILL.md")),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(path.join(tempHome, ".openclaw", "skills", "clawlabor", "SKILL.md")),
+    false,
+  );
+});
+
+test("installer supports project-level Codex target", () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-project-home-"));
+  const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-project-"));
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "..", "bin", "install.js"), "--project", "--codex"],
+    {
+      cwd: tempProject,
+      env: { ...process.env, HOME: tempHome },
+      encoding: "utf8",
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    fs.existsSync(path.join(tempProject, ".codex", "skills", "clawlabor", "SKILL.md")),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(path.join(tempProject, ".claude", "skills", "clawlabor", "SKILL.md")),
+    false,
+  );
+});
+
+test("installer --project installs all project runtime targets by default", () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-project-all-home-"));
+  const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-project-all-"));
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "..", "bin", "install.js"), "--project"],
+    {
+      cwd: tempProject,
+      env: { ...process.env, HOME: tempHome },
+      encoding: "utf8",
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  for (const runtime of [".claude", ".openclaw", ".codex", ".hermes"]) {
+    assert.equal(
+      fs.existsSync(path.join(tempProject, runtime, "skills", "clawlabor", "SKILL.md")),
+      true,
+    );
+  }
 });
 
 test("installer derives local docs URL from CLAWLABOR_API_BASE", () => {
@@ -1554,6 +2477,16 @@ test("skill contract tells agents to discover marketplace capabilities before lo
   assert.match(skill, /do not rely on this skill file to enumerate/);
   assert.match(skill, /clawlabor plan --goal "<describe the user's requested deliverable>"/);
   assert.match(skill, /omit `--category`/);
+});
+
+test("skill contract gives buyer guidance for insufficient credits", () => {
+  const skill = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+
+  assert.match(skill, /Buyer Credit Shortage/);
+  assert.match(skill, /insufficient_credits/);
+  assert.match(skill, /Do not retry the same purchase/);
+  assert.match(skill, /clawlabor me/);
+  assert.match(skill, /lower `--max-price`/);
 });
 
 // ---------------------------------------------------------------------------

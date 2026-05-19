@@ -15,13 +15,14 @@
  *   npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw  # Install for OpenClaw only
  *   npx --yes github:Reinforce-Omega/clawlabor-skill --codex     # Install for Codex CLI only
  *   npx --yes github:Reinforce-Omega/clawlabor-skill --hermes    # Install for Hermes only
- *   npx --yes github:Reinforce-Omega/clawlabor-skill --project   # Install in current project's .claude/skills/
+ *   npx --yes github:Reinforce-Omega/clawlabor-skill --project   # Install in current project's agent skill dirs
  *   npx --yes github:Reinforce-Omega/clawlabor-skill --uninstall # Remove from all platforms
  */
 
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { spawnSync } = require("child_process");
 
 const SKILL_NAME = "clawlabor";
 const HOME = process.env.HOME || os.homedir();
@@ -33,7 +34,17 @@ const PLATFORMS = {
   hermes: path.join(HOME, ".hermes", "skills", SKILL_NAME),
 };
 
+const PROJECT_PLATFORMS = {
+  claude: path.join(process.cwd(), ".claude", "skills", SKILL_NAME),
+  openclaw: path.join(process.cwd(), ".openclaw", "skills", SKILL_NAME),
+  codex: path.join(process.cwd(), ".codex", "skills", SKILL_NAME),
+  hermes: path.join(process.cwd(), ".hermes", "skills", SKILL_NAME),
+};
+
+const PLATFORM_FLAGS = ["claude", "openclaw", "codex", "hermes"];
+
 const FILES_TO_COPY = [
+  "package.json",
   "SKILL.md",
   "REFERENCE.md",
   "WORKFLOW.md",
@@ -43,7 +54,7 @@ const FILES_TO_COPY = [
 const args = process.argv.slice(2);
 const flags = new Set(args.map((a) => a.replace(/^--/, "")));
 
-const DIRS_TO_COPY = ["pipeline", "examples", "runtime", "bin", "docs"];
+const DIRS_TO_COPY = ["examples", "runtime", "bin", "docs"];
 
 function resolveDocsUrl(env = process.env) {
   if (env.CLAWLABOR_DOCS_URL) {
@@ -74,13 +85,22 @@ function copySkillFiles(targetDir) {
     const srcDir = path.join(sourceDir, dir);
     const destDir = path.join(targetDir, dir);
     if (fs.existsSync(srcDir)) {
-      fs.mkdirSync(destDir, { recursive: true });
-      for (const file of fs.readdirSync(srcDir)) {
-        const srcFile = path.join(srcDir, file);
-        if (fs.statSync(srcFile).isFile()) {
-          fs.copyFileSync(srcFile, path.join(destDir, file));
-        }
-      }
+      copyDirectoryRecursive(srcDir, destDir);
+    }
+  }
+}
+
+function copyDirectoryRecursive(srcDir, destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectoryRecursive(srcPath, destPath);
+      continue;
+    }
+    if (entry.isFile()) {
+      fs.copyFileSync(srcPath, destPath);
     }
   }
 }
@@ -104,6 +124,50 @@ function detectPlatforms() {
   return detected;
 }
 
+function selectedPlatformFlags() {
+  return PLATFORM_FLAGS.filter((name) => flags.has(name));
+}
+
+function targetFor(platform, projectMode = false) {
+  return {
+    name: projectMode ? `project:${platform}` : platform,
+    dir: projectMode ? PROJECT_PLATFORMS[platform] : PLATFORMS[platform],
+  };
+}
+
+function selectedTargets() {
+  const selected = selectedPlatformFlags();
+  if (flags.has("project")) {
+    const platforms = selected.length > 0 ? selected : PLATFORM_FLAGS;
+    return platforms.map((platform) => targetFor(platform, true));
+  }
+  if (selected.length > 0) {
+    return selected.map((platform) => targetFor(platform, false));
+  }
+  return detectPlatforms().map((platform) => targetFor(platform, false));
+}
+
+function commandAvailable(command, args = ["--version"]) {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return result.status === 0;
+}
+
+function dependencyHints() {
+  const hints = [];
+  if (!commandAvailable("cloudflared")) {
+    hints.push([
+      "  - cloudflared is not on PATH. Default `clawlabor online` uses Cloudflare Tunnel.",
+      "    macOS: brew install cloudflared",
+      "    Other platforms: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+      "    You can also bypass tunneling with: clawlabor online --webhook-url <https-url>",
+    ].join("\n"));
+  }
+  return hints;
+}
+
 // --- Main ---
 
 if (flags.has("help") || flags.has("h")) {
@@ -117,7 +181,9 @@ Usage:
   npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw   Install for OpenClaw only
   npx --yes github:Reinforce-Omega/clawlabor-skill --codex      Install for Codex CLI only
   npx --yes github:Reinforce-Omega/clawlabor-skill --hermes     Install for Hermes only
-  npx --yes github:Reinforce-Omega/clawlabor-skill --project    Install in current project (.claude/skills/)
+  npx --yes github:Reinforce-Omega/clawlabor-skill --project    Install in current project's .claude/.openclaw/.codex/.hermes skill dirs
+  npx --yes github:Reinforce-Omega/clawlabor-skill --project --codex
+                                                              Install in current project's .codex/skills/ only
   npx --yes github:Reinforce-Omega/clawlabor-skill --uninstall  Remove from all platforms
   npx --yes github:Reinforce-Omega/clawlabor-skill --help       Show this help
 
@@ -143,11 +209,11 @@ if (flags.has("uninstall")) {
       removed++;
     }
   }
-  // Also check project-level
-  const projectDir = path.join(process.cwd(), ".claude", "skills", SKILL_NAME);
-  if (removeSkillDir(projectDir)) {
-    console.log(`  Removed from project: ${projectDir}`);
-    removed++;
+  for (const [platform, dir] of Object.entries(PROJECT_PLATFORMS)) {
+    if (removeSkillDir(dir)) {
+      console.log(`  Removed from project:${platform}: ${dir}`);
+      removed++;
+    }
   }
   if (removed === 0) {
     console.log("  No installations found.");
@@ -155,25 +221,7 @@ if (flags.has("uninstall")) {
   process.exit(0);
 }
 
-// Determine target platforms
-let targets = [];
-
-if (flags.has("project")) {
-  const projectDir = path.join(process.cwd(), ".claude", "skills", SKILL_NAME);
-  targets.push({ name: "project", dir: projectDir });
-} else if (flags.has("claude")) {
-  targets.push({ name: "claude", dir: PLATFORMS.claude });
-} else if (flags.has("openclaw")) {
-  targets.push({ name: "openclaw", dir: PLATFORMS.openclaw });
-} else if (flags.has("codex")) {
-  targets.push({ name: "codex", dir: PLATFORMS.codex });
-} else if (flags.has("hermes")) {
-  targets.push({ name: "hermes", dir: PLATFORMS.hermes });
-} else {
-  // Auto-detect
-  const detected = detectPlatforms();
-  targets = detected.map((p) => ({ name: p, dir: PLATFORMS[p] }));
-}
+const targets = selectedTargets();
 
 console.log("Installing ClawLabor skill...\n");
 
@@ -187,6 +235,7 @@ for (const { name, dir } of targets) {
 }
 
 const docsUrl = resolveDocsUrl();
+const hints = dependencyHints();
 
 console.log(`
 
@@ -206,10 +255,8 @@ console.log(`
   2. Use the runtime CLI when work needs outside capabilities:
      clawlabor solve --goal "Analyze competitor" --requirement-json '{"url":"https://example.com"}'
 
-  3. Choose a listening strategy before going live as a seller or long-running requester:
-     curl -L https://raw.githubusercontent.com/Reinforce-Omega/clawlabor-skill/main/pipeline/pipeline.py -o pipeline.py
-     python3 -m pip install httpx
-     python3 pipeline.py
+  3. Choose a listening strategy before going live:
+     clawlabor online
 
   4. Start using it in your agent:
      "Use ClawLabor when this task needs capabilities beyond local tools."
@@ -217,3 +264,9 @@ console.log(`
   Docs: ${docsUrl}
 
 `);
+
+if (hints.length > 0) {
+  console.log("Optional dependency checks:\n");
+  console.log(hints.join("\n\n"));
+  console.log("");
+}

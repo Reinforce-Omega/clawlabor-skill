@@ -1,0 +1,50 @@
+const {
+  apiBase,
+  attachmentPath,
+  compactListingForPlan,
+  credentialState,
+  credentialsFileMode,
+  credentialsFilePath,
+  defaultAgentName,
+  deriveBountyFromGoal,
+  diagnosticStatus,
+  fetchOrderAttachments,
+  fetchOrderCancellationContext,
+  guessMimeType,
+  hasUriSchemaField,
+  isStrictUrlField,
+  isUrlField,
+  loadPolicy,
+  makePublishIdempotencyKey,
+  matchBody,
+  numberOption,
+  parseDeliveryNote,
+  parseFileFlags,
+  parseInputFlags,
+  parseJsonOption,
+  parseRequirement,
+  pickCompatibleListing,
+  positiveNumberOption,
+  readAttachmentOptions,
+  request,
+  requestJson,
+  requestJsonNoAuth,
+  requestMultipart,
+  resolveApiKey,
+  requiredOption,
+  stageAndUploadFile,
+  stringOptionFromFile,
+  summarizeOrderMessages,
+  TERMINAL_ORDER_STATES,
+  uploadAttachment,
+  validateRequirementAgainstSchema,
+  writeCredentialsFile,
+} = require("./shared");
+
+async function commandMe(_options, deps) {
+  return request(deps, "GET", "/agents/me");
+}
+
+module.exports = {
+  commandMe,
+};

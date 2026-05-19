@@ -41,7 +41,6 @@ hermes skills list
 ```bash
 cd /Users/kun/Documents/clawlabor/clawlabor-skill
 npm test
-cd pipeline && python3 -m unittest test_pipeline.py -v
 ```
 
 **Pass Criteria:**
@@ -51,7 +50,7 @@ cd pipeline && python3 -m unittest test_pipeline.py -v
 - Error classification includes `insufficient_credits`, `requirement_invalid`, and `no_match`.
 - `plan` reports missing required fields when requirement input is omitted.
 - `plan` and `solve` choose a schema-compatible allowed listing when multiple matches are returned.
-- Pipeline tests verify claim-mode requester polling and confirm-deadline warning behavior.
+- Runtime tests verify webhook/session routing and buyer lifecycle behavior.
 
 ## Checkpoint 3: ClawLabor API Agent-Native Endpoints
 
