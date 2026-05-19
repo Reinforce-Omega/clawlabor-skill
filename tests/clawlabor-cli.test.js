@@ -797,25 +797,6 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
         text: async () => JSON.stringify({ id: "order-serve-1", status: "in_progress" }),
       };
     }
-    if (method === "GET" && url.endsWith("/orders/order-serve-1/attachments")) {
-      return {
-        ok: true,
-        status: 200,
-        text: async () =>
-          JSON.stringify({
-            files: [
-              {
-                file_id: "file-order-1",
-                file_type: "seller_delivery",
-                original_filename: "delivery.md",
-                size: 128,
-              },
-            ],
-            file_count: 1,
-            total_size: 128,
-          }),
-      };
-    }
     throw new Error(`No mock route matched ${method} ${url}`);
   };
 
@@ -855,24 +836,19 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
   assert.equal(spawnCalls.length, 1);
   assert.equal(spawnCalls[0][0], "chat");
   const hermesPrompt = spawnCalls[0][spawnCalls[0].indexOf("-q") + 1];
-  assert.match(hermesPrompt, /You must complete delivery yourself by calling the ClawLabor CLI from inside Hermes/);
-  assert.match(hermesPrompt, /clawlabor upload-attachment --entity order --id order-serve-1 --file <path>/);
-  assert.match(hermesPrompt, /clawlabor complete --order order-serve-1 --delivery-note/);
+  assert.match(hermesPrompt, /Use the SKU\/listing description, input schema, buyer requirement, messages, and attachments as the contract/);
   assert.match(hermesPrompt, /Write a JavaScript add function from the event payload/);
   assert.doesNotMatch(hermesPrompt, /code-writing SKU order/);
-  assert.equal(calls.some((call) => call.url.endsWith("/orders/order-serve-1/complete")), false);
-  assert.equal(calls.some((call) => call.url.endsWith("/orders/order-serve-1/attachments")), true);
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(sessionDir, "cursor.json"), "utf8")).last_acked_event_id,
     501,
   );
   const result = JSON.parse(out[0]);
   assert.equal(result.processed[0].order_id, "order-serve-1");
-  assert.equal(result.processed[0].status, "pending_confirmation");
-  assert.match(result.processed[0].delivery_note, /Delivered as attached artifact/);
+  assert.equal(result.processed[0].status, "in_progress");
 });
 
-test("serve --adapter hermes does not ack seller order when Hermes omits delivery attachments", async () => {
+test("serve --adapter hermes acks seller order after notifying Hermes", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-serve-empty-"));
   const sessionRoot = path.join(tempDir, "sessions");
   const sessionDir = path.join(sessionRoot, "order_order-empty_seller");
@@ -961,11 +937,11 @@ test("serve --adapter hermes does not ack seller order when Hermes omits deliver
   assert.ok(calls.every((call) => !call.url.endsWith("/orders/order-empty/complete")));
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(sessionDir, "cursor.json"), "utf8")).last_acked_event_id,
-    0,
+    601,
   );
   const result = JSON.parse(out[0]);
-  assert.equal(result.processed.length, 0);
-  assert.match(result.errors[0].error, /did not upload any seller delivery attachments/);
+  assert.equal(result.processed.length, 1);
+  assert.equal(result.processed[0].status, "in_progress");
 });
 
 test("online can discover a tunnel public URL and write it back to the profile", async () => {
