@@ -737,7 +737,12 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
     `${JSON.stringify({
       event_id: 501,
       event_type: "order.received",
-      payload: { order_id: "order-serve-1" },
+      payload: {
+        order_id: "order-serve-1",
+        requirement: { task: "Write a JavaScript add function from the event payload" },
+        input_schema: { type: "object", required: ["task"] },
+        service_sku_id: "sku-serve-1",
+      },
       created_at: "2026-05-19T00:00:00.000Z",
     })}\n`,
   );
@@ -749,7 +754,6 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
         order: {
           id: "order-serve-1",
           status: "pending_accept",
-          requirement: { task: "Write a JavaScript add function" },
         },
       }),
     }),
@@ -763,7 +767,6 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
         order: {
           id: "order-serve-1",
           status: "in_progress",
-          requirement: { task: "Write a JavaScript add function" },
         },
       }),
     }),
@@ -810,6 +813,8 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
   assert.equal(spawnCalls[0][0], "chat");
   const hermesPrompt = spawnCalls[0][spawnCalls[0].indexOf("-q") + 1];
   assert.match(hermesPrompt, /SKU\/listing description, input schema, buyer requirement/);
+  assert.match(hermesPrompt, /Write a JavaScript add function from the event payload/);
+  assert.match(hermesPrompt, /The wrapper has already fetched the order and will handle accept\/complete API calls/);
   assert.doesNotMatch(hermesPrompt, /code-writing SKU order/);
   const completeCall = calls.find((call) => call.url.endsWith("/orders/order-serve-1/complete"));
   assert.ok(completeCall);
@@ -820,6 +825,90 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
   );
   const result = JSON.parse(out[0]);
   assert.equal(result.processed[0].order_id, "order-serve-1");
+});
+
+test("serve --adapter hermes does not complete seller order when Hermes returns empty output", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-serve-empty-"));
+  const sessionRoot = path.join(tempDir, "sessions");
+  const sessionDir = path.join(sessionRoot, "order_order-empty_seller");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionRoot, "state.json"),
+    JSON.stringify({
+      current_session_id: "hermes-current",
+      sessions: {
+        "order:order-empty:seller": {
+          session_id: "order:order-empty:seller",
+          kind: "order",
+          role: "seller",
+          context_id: "order-empty",
+          purpose: "Fulfill order order-empty",
+          last_event_id: 601,
+        },
+      },
+    }),
+  );
+  fs.writeFileSync(path.join(sessionDir, "cursor.json"), JSON.stringify({ last_acked_event_id: 0 }));
+  fs.writeFileSync(
+    path.join(sessionDir, "inbox.jsonl"),
+    `${JSON.stringify({
+      event_id: 601,
+      event_type: "order.received",
+      payload: { order_id: "order-empty", requirement: { task: "Return something" } },
+      created_at: "2026-05-19T00:00:00.000Z",
+    })}\n`,
+  );
+
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/orders/order-empty", {
+      status: 200,
+      body: JSON.stringify({ order: { id: "order-empty", status: "in_progress" } }),
+    }),
+    matchRoute("GET", "/orders/order-empty", {
+      status: 200,
+      body: JSON.stringify({ order: { id: "order-empty", status: "in_progress" } }),
+    }),
+  ]);
+
+  const fakeSpawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    process.nextTick(() => {
+      child.stdout.emit("data", "   \n");
+      child.emit("exit", 0);
+    });
+    return child;
+  };
+
+  const out = [];
+  await runCli(
+    [
+      "serve",
+      "--adapter",
+      "hermes",
+      "--once",
+      "--session-root",
+      sessionRoot,
+      "--hermes-command",
+      "hermes",
+    ],
+    {
+      env: BASE_ENV,
+      fetch,
+      spawn: fakeSpawn,
+      stdout: (t) => out.push(t),
+    },
+  );
+
+  assert.ok(calls.every((call) => !call.url.endsWith("/orders/order-empty/complete")));
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(sessionDir, "cursor.json"), "utf8")).last_acked_event_id,
+    0,
+  );
+  const result = JSON.parse(out[0]);
+  assert.equal(result.processed.length, 0);
+  assert.match(result.errors[0].error, /empty delivery note/);
 });
 
 test("online can discover a tunnel public URL and write it back to the profile", async () => {

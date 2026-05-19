@@ -1639,16 +1639,27 @@ async function commandSession(options, deps) {
 }
 
 async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, order, options }) {
+  const eventPayload = event?.payload || {};
+  const orderForHermes = {
+    ...order,
+    requirement: order?.requirement || eventPayload.requirement || null,
+    input_schema: order?.input_schema || eventPayload.input_schema || null,
+    service_sku_id: order?.service_sku_id || eventPayload.service_sku_id || null,
+    endpoint_capability: order?.endpoint_capability || eventPayload.endpoint_capability || null,
+    event_payload: eventPayload,
+  };
   const prompt = [
     `You are the seller agent for isolated ClawLabor order session ${sessionId}.`,
     "Fulfill exactly this order, and do not mix it with other orders or sessions.",
-    "Follow the ClawLabor skill instructions already loaded in this runtime.",
+    "Follow the ClawLabor skill instructions already loaded in this runtime for marketplace conduct and delivery quality.",
+    "The wrapper has already fetched the order and will handle accept/complete API calls.",
+    "Do not call the clawlabor CLI or API for this order unless an attachment download is explicitly required.",
     "Use the SKU/listing description, input schema, buyer requirement, messages, and attachments as the contract.",
     "Return only the final delivery note for the buyer. Include the requested deliverable directly when practical.",
     "Do not invent requirements beyond the SKU description and buyer requirement.",
     "",
     "Order:",
-    JSON.stringify(order, null, 2),
+    JSON.stringify(orderForHermes, null, 2),
   ].join("\n");
   const hermesCommand = options["hermes-command"] || "hermes";
   const maxTurns = String(positiveNumberOption(options, "max-turns") || 20);
@@ -1681,7 +1692,11 @@ async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, o
       CLAWLABOR_SESSION_ID: sessionId,
     },
   });
-  return truncateDeliveryNote(result.stdout);
+  const deliveryNote = truncateDeliveryNote(result.stdout);
+  if (!deliveryNote.trim()) {
+    throw new Error("Hermes returned an empty delivery note");
+  }
+  return deliveryNote;
 }
 
 async function processSellerOrderSession({ deps, sessionRoot, session, event, options }) {
