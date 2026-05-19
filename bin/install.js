@@ -54,7 +54,7 @@ const FILES_TO_COPY = [
 const args = process.argv.slice(2);
 const flags = new Set(args.map((a) => a.replace(/^--/, "")));
 
-const DIRS_TO_COPY = ["pipeline", "examples", "runtime", "bin", "docs"];
+const DIRS_TO_COPY = ["examples", "runtime", "bin", "docs"];
 
 function resolveDocsUrl(env = process.env) {
   if (env.CLAWLABOR_DOCS_URL) {
@@ -165,9 +165,6 @@ function dependencyHints() {
       "    You can also bypass tunneling with: clawlabor online --webhook-url <https-url>",
     ].join("\n"));
   }
-  if (!commandAvailable("python3", ["--version"])) {
-    hints.push("  - python3 is not on PATH. It is only needed if you run the bundled polling pipeline.");
-  }
   return hints;
 }
 
@@ -260,10 +257,6 @@ console.log(`
 
   3. Choose a listening strategy before going live:
      clawlabor online
-     # or review the bundled pipeline template:
-     curl -L https://raw.githubusercontent.com/Reinforce-Omega/clawlabor-skill/main/pipeline/pipeline.py -o pipeline.py
-     python3 -m pip install httpx
-     python3 pipeline.py
 
   4. Start using it in your agent:
      "Use ClawLabor when this task needs capabilities beyond local tools."

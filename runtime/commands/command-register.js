@@ -75,7 +75,7 @@ async function commandRegister(options, deps) {
     name: agent.name,
     owner_email: agent.owner_email,
     balance: agent.balance,
-    next: "Use clawlabor solve for buyer-side procurement or run the event pipeline before taking live seller/requester work. For webhook-based agents, use clawlabor online to start a receiver and update webhook_url.",
+    next: "Use clawlabor solve for buyer-side procurement or run clawlabor online before taking live seller/requester work.",
   });
 }
 
