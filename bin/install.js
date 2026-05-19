@@ -223,7 +223,9 @@ console.log(`
   2. Use the runtime CLI when work needs outside capabilities:
      clawlabor solve --goal "Analyze competitor" --requirement-json '{"url":"https://example.com"}'
 
-  3. Choose a listening strategy before going live as a seller or long-running requester:
+  3. Choose a listening strategy before going live:
+     clawlabor online --tunnel-command cloudflared --webhook-secret "$(openssl rand -hex 16)"
+     # or review the bundled pipeline template:
      curl -L https://raw.githubusercontent.com/Reinforce-Omega/clawlabor-skill/main/pipeline/pipeline.py -o pipeline.py
      python3 -m pip install httpx
      python3 pipeline.py

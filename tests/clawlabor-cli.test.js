@@ -1,8 +1,11 @@
 const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
+const { Readable } = require("node:stream");
 const test = require("node:test");
 
 const {
@@ -47,6 +50,31 @@ function matchRoute(method, pathSuffix, respond) {
     match: ({ url, options }) =>
       (options.method || "GET") === method && url.endsWith(pathSuffix),
     respond,
+  };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function createMockResponse() {
+  return {
+    statusCode: null,
+    headers: null,
+    body: "",
+    writeHead(statusCode, headers) {
+      this.statusCode = statusCode;
+      this.headers = headers;
+    },
+    end(body = "") {
+      this.body = body;
+    },
   };
 }
 
@@ -352,6 +380,288 @@ test("register creates an agent and stores credentials", async () => {
   assert.equal(saved.api_key, "new-key");
   assert.equal(saved.agent_id, "agent_new");
   assert.equal(JSON.parse(out[0]).action, "registered");
+});
+
+test("profile updates the current agent webhook configuration", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("PATCH", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        agent_id: "agent_existing",
+        name: "Agent Existing",
+        webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
+      }),
+    }),
+  ]);
+  const out = [];
+
+  await runCli(
+    [
+      "profile",
+      "--webhook-url",
+      "https://example.trycloudflare.com/webhooks/clawlabor",
+      "--webhook-secret",
+      "0123456789abcdef0123456789abcdef",
+    ],
+    {
+      env: {
+        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+        CLAWLABOR_API_KEY: "file-key",
+      },
+      fetch,
+      stdout: (t) => out.push(t),
+    },
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer file-key");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
+    webhook_secret: "0123456789abcdef0123456789abcdef",
+  });
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "updated");
+  assert.equal(result.webhook_url, "https://example.trycloudflare.com/webhooks/clawlabor");
+});
+
+test("online starts a receiver and writes webhook events to inbox", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-online-"));
+  const inboxFile = path.join(tempDir, "inbox.jsonl");
+  const sessionRoot = path.join(tempDir, "sessions");
+  const requestSecret = "0123456789abcdef0123456789abcdef";
+  const wait = deferred();
+  let handler = null;
+  const server = {
+    listen(_port, _host, cb) {
+      cb?.();
+    },
+    close(cb) {
+      cb?.();
+    },
+    once() {
+      return this;
+    },
+    off() {
+      return this;
+    },
+  };
+  const { fetch, calls } = recordingFetch([
+    matchRoute("PATCH", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        agent_id: "agent_existing",
+        name: "Agent Existing",
+        webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
+      }),
+    }),
+  ]);
+  const out = [];
+
+  const run = runCli(
+    [
+      "online",
+      "--webhook-url",
+      "https://example.trycloudflare.com/webhooks/clawlabor",
+      "--webhook-secret",
+      requestSecret,
+      "--inbox-file",
+      inboxFile,
+      "--session-root",
+      sessionRoot,
+      "--session-id",
+      "hermes-current",
+      "--port",
+      "8787",
+    ],
+    {
+      env: {
+        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+        CLAWLABOR_API_KEY: "file-key",
+      },
+      fetch,
+      stdout: (t) => out.push(t),
+      createServer: (cb) => {
+        handler = cb;
+        return server;
+      },
+      waitForExit: wait.promise,
+    },
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(handler, "receiver should be created");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
+    webhook_secret: requestSecret,
+  });
+
+  const buyerPayload = {
+    event_id: 98,
+    event_type: "order.completed",
+    payload: { order_id: "order-buyer-98" },
+    created_at: "2026-05-19T00:00:00.000Z",
+  };
+  const buyerBody = Buffer.from(JSON.stringify(buyerPayload));
+  const buyerSignature = crypto.createHmac("sha256", requestSecret).update(buyerBody).digest("hex");
+  const buyerReq = Readable.from([buyerBody]);
+  buyerReq.method = "POST";
+  buyerReq.url = "/webhooks/clawlabor";
+  buyerReq.headers = { "x-webhook-signature": buyerSignature };
+  const buyerRes = createMockResponse();
+  await handler(buyerReq, buyerRes);
+
+  assert.equal(buyerRes.statusCode, 200);
+  assert.equal(JSON.parse(buyerRes.body).session_id, "hermes-current");
+
+  const payload = {
+    event_id: 99,
+    event_type: "order.received",
+    payload: { order_id: "order-99" },
+    created_at: "2026-05-19T00:00:00.000Z",
+  };
+  const body = Buffer.from(JSON.stringify(payload));
+  const signature = crypto.createHmac("sha256", requestSecret).update(body).digest("hex");
+  const req = Readable.from([body]);
+  req.method = "POST";
+  req.url = "/webhooks/clawlabor";
+  req.headers = { "x-webhook-signature": signature };
+  const res = createMockResponse();
+  await handler(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).session_id, "order:order-99:seller");
+  const retryReq = Readable.from([body]);
+  retryReq.method = "POST";
+  retryReq.url = "/webhooks/clawlabor";
+  retryReq.headers = { "x-webhook-signature": signature };
+  const retryRes = createMockResponse();
+  await handler(retryReq, retryRes);
+
+  assert.equal(retryRes.statusCode, 200);
+  assert.equal(JSON.parse(retryRes.body).duplicate, true);
+  assert.ok(fs.existsSync(inboxFile));
+  const lines = fs.readFileSync(inboxFile, "utf8").trim().split("\n");
+  assert.equal(lines.length, 2);
+  const stored = JSON.parse(lines[1]);
+  assert.equal(stored.event_id, 99);
+  assert.equal(stored.event_type, "order.received");
+  assert.equal(stored.payload.order_id, "order-99");
+
+  assert.ok(fs.existsSync(path.join(sessionRoot, "hermes-current", "inbox.jsonl")));
+  assert.ok(fs.existsSync(path.join(sessionRoot, "order_order-99_seller", "inbox.jsonl")));
+  assert.equal(
+    fs.readFileSync(path.join(sessionRoot, "order_order-99_seller", "inbox.jsonl"), "utf8").trim().split("\n").length,
+    1,
+  );
+  assert.match(
+    fs.readFileSync(path.join(sessionRoot, "order_order-99_seller", "prompt.md"), "utf8"),
+    /isolated seller session/,
+  );
+
+  const sessionOut = [];
+  await runCli(["session", "--action", "next", "--session-root", sessionRoot, "--session-id", "hermes-current"], {
+    env: BASE_ENV,
+    fetch: async () => {
+      throw new Error("session next should not call API");
+    },
+    stdout: (t) => sessionOut.push(t),
+  });
+  const sessionNext = JSON.parse(sessionOut[0]);
+  assert.equal(sessionNext.pending, true);
+  assert.equal(sessionNext.event.event_type, "order.completed");
+  assert.equal(sessionNext.event.payload.order_id, "order-buyer-98");
+
+  wait.resolve();
+  await run;
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "online");
+  assert.equal(result.receiver_url, "http://127.0.0.1:8787/webhooks/clawlabor");
+  assert.equal(result.current_session_id, "hermes-current");
+});
+
+test("online can discover a tunnel public URL and write it back to the profile", async () => {
+  const wait = deferred();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-online-tunnel-"));
+  const tunnel = new EventEmitter();
+  tunnel.stdout = new EventEmitter();
+  tunnel.stderr = new EventEmitter();
+  tunnel.kill = () => {
+    tunnel.killed = true;
+  };
+  const server = {
+    listen(_port, _host, cb) {
+      cb?.();
+    },
+    close(cb) {
+      cb?.();
+    },
+    once() {
+      return this;
+    },
+    off() {
+      return this;
+    },
+  };
+  const { fetch, calls } = recordingFetch([
+    matchRoute("PATCH", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        agent_id: "agent_existing",
+        name: "Agent Existing",
+        webhook_url: "https://agent.example.com/webhooks/clawlabor",
+      }),
+    }),
+  ]);
+  const out = [];
+
+  const run = runCli(
+    [
+      "online",
+      "--tunnel-command",
+      "cloudflared",
+      "--webhook-secret",
+      "abcdef0123456789abcdef0123456789",
+      "--inbox-file",
+      path.join(tempDir, "inbox.jsonl"),
+      "--session-root",
+      path.join(tempDir, "sessions"),
+      "--port",
+      "8787",
+    ],
+    {
+      env: {
+        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
+        CLAWLABOR_API_KEY: "file-key",
+      },
+      fetch,
+      stdout: (t) => out.push(t),
+      createServer: () => server,
+      spawn: () => tunnel,
+      waitForExit: wait.promise,
+    },
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  tunnel.stdout.emit("data", "Visit https://abc.trycloudflare.com for the public URL\n");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    webhook_url: "https://abc.trycloudflare.com",
+    webhook_secret: "abcdef0123456789abcdef0123456789",
+  });
+
+  wait.resolve();
+  await run;
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.webhook_url, "https://abc.trycloudflare.com");
+  assert.equal(result.tunnel_command, "cloudflared");
 });
 
 test("register requires owner email", async () => {
