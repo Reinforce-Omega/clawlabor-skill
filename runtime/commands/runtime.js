@@ -41,8 +41,12 @@ function verifyWebhookSignature(payload, signature, secret) {
 }
 
 function extractPublicUrl(text) {
-  const match = text.match(/https:\/\/[^\s"'`<>]+/);
+  const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i);
   return match ? match[0].replace(/[)\],.]+$/, "") : null;
+}
+
+function tunnelWebhookUrl(publicUrl, receiverPath) {
+  return `${publicUrl.replace(/\/+$/, "")}${normalizeWebhookPath(receiverPath)}`;
 }
 
 async function drainRequestBody(req) {
@@ -281,7 +285,7 @@ async function commandOnline(options, deps, flags = new Set()) {
     const updateFromOutput = async (chunk) => {
       const url = extractPublicUrl(chunk.toString("utf8"));
       if (!url || resolvedWebhookUrl) return;
-      resolvedWebhookUrl = url;
+      resolvedWebhookUrl = tunnelWebhookUrl(url, receiverPath);
       try {
         await requestJson(deps, "PATCH", "/agents/me", {
           body: {

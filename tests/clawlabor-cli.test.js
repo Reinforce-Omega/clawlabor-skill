@@ -1023,13 +1023,16 @@ test("online defaults to Cloudflare tunnel discovery and writes the public URL b
     command: "cloudflared",
     args: ["tunnel", "--url", "http://127.0.0.1:8787/webhooks/clawlabor"],
   }]);
+  tunnel.stderr.emit("data", "Your quick Tunnel has been created! Visit https://www.cloudflare.com/website-terms/ for terms\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 0);
   tunnel.stdout.emit("data", "Visit https://abc.trycloudflare.com for the public URL\n");
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(calls.length, 2);
   assert.equal(calls[0].options.method, "PATCH");
   assert.deepEqual(JSON.parse(calls[0].options.body), {
-    webhook_url: "https://abc.trycloudflare.com",
+    webhook_url: "https://abc.trycloudflare.com/webhooks/clawlabor",
     webhook_secret: "abcdef0123456789abcdef0123456789",
   });
 
@@ -1037,7 +1040,7 @@ test("online defaults to Cloudflare tunnel discovery and writes the public URL b
   await run;
 
   const result = JSON.parse(out[0]);
-  assert.equal(result.webhook_url, "https://abc.trycloudflare.com");
+  assert.equal(result.webhook_url, "https://abc.trycloudflare.com/webhooks/clawlabor");
   assert.equal(result.tunnel_command, "cloudflared");
 });
 
