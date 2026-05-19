@@ -1652,10 +1652,12 @@ async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, o
     `You are the seller agent for isolated ClawLabor order session ${sessionId}.`,
     "Fulfill exactly this order, and do not mix it with other orders or sessions.",
     "Follow the ClawLabor skill instructions already loaded in this runtime for marketplace conduct and delivery quality.",
-    "The wrapper has already fetched the order and will handle accept/complete API calls.",
-    "Do not call the clawlabor CLI or API for this order unless an attachment download is explicitly required.",
     "Use the SKU/listing description, input schema, buyer requirement, messages, and attachments as the contract.",
-    "Return only the final delivery note for the buyer. Include the requested deliverable directly when practical.",
+    "You must complete delivery yourself by calling the ClawLabor CLI from inside Hermes.",
+    `First write the final deliverable to a local file, then upload it with a command like: clawlabor upload-attachment --entity order --id ${orderForHermes.id} --file <path> --description \"Delivery artifact\".`,
+    `Then complete the order with a short platform-style note such as: clawlabor complete --order ${orderForHermes.id} --delivery-note \"Delivered as attached artifact(s). See attachments for the full result.\"`,
+    "Keep the delivery note short and platform-safe; do not put the full deliverable in the note.",
+    "If there are multiple deliverables, upload multiple attachments and mention them briefly in the note.",
     "Do not invent requirements beyond the SKU description and buyer requirement.",
     "",
     "Order:",
@@ -1692,11 +1694,10 @@ async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, o
       CLAWLABOR_SESSION_ID: sessionId,
     },
   });
-  const deliveryNote = truncateDeliveryNote(result.stdout);
-  if (!deliveryNote.trim()) {
-    throw new Error("Hermes returned an empty delivery note");
-  }
-  return deliveryNote;
+  return {
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
 }
 
 async function processSellerOrderSession({ deps, sessionRoot, session, event, options }) {
@@ -1713,7 +1714,7 @@ async function processSellerOrderSession({ deps, sessionRoot, session, event, op
 
   const refreshedDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
   const refreshedOrder = refreshedDetail.order || refreshedDetail;
-  const deliveryNote = await runHermesForOrderSession({
+  await runHermesForOrderSession({
     deps,
     sessionRoot,
     sessionId: session.session_id,
@@ -1722,37 +1723,23 @@ async function processSellerOrderSession({ deps, sessionRoot, session, event, op
     options,
   });
 
-  const completed = await requestJson(deps, "POST", `/orders/${orderId}/complete`, {
-    body: {
-      delivery_note: deliveryNote,
-      delivery_attestation: {
-        version: "1",
-        seller: {
-          status: "passed",
-          metrics: {
-            adapter: "hermes",
-            session_id: session.session_id,
-          },
-          checks: [
-            {
-              name: "hermes_delivery_generated",
-              status: deliveryNote.trim() ? "passed" : "failed",
-              message: deliveryNote.trim()
-                ? "Hermes generated a delivery note."
-                : "Hermes returned an empty delivery note.",
-            },
-          ],
-        },
-      },
-    },
-  });
+  const refreshedAttachments = await fetchOrderAttachments(deps, orderId);
+  if (refreshedAttachments.delivery_file_count < 1) {
+    throw new Error("Hermes did not upload any seller delivery attachments");
+  }
+
+  const finalDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
+  const finalOrder = finalDetail.order || finalDetail;
+  if (!TERMINAL_ORDER_STATES.has(finalOrder.status)) {
+    throw new Error(`Hermes did not complete order ${orderId} via ClawLabor CLI`);
+  }
   writeSessionCursor(sessionRoot, session.session_id, event.event_id);
   return {
     session_id: session.session_id,
     order_id: orderId,
     event_id: event.event_id,
-    status: completed.status || "completed",
-    delivery_note: deliveryNote,
+    status: finalOrder.status || "completed",
+    delivery_note: finalOrder.delivery_note || null,
   };
 }
 

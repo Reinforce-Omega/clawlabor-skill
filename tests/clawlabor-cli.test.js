@@ -747,34 +747,77 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
     })}\n`,
   );
 
-  const { fetch, calls } = recordingFetch([
-    matchRoute("GET", "/orders/order-serve-1", {
-      status: 200,
-      body: JSON.stringify({
-        order: {
-          id: "order-serve-1",
-          status: "pending_accept",
-        },
-      }),
-    }),
-    matchRoute("POST", "/orders/order-serve-1/accept", {
-      status: 200,
-      body: JSON.stringify({ id: "order-serve-1", status: "in_progress" }),
-    }),
-    matchRoute("GET", "/orders/order-serve-1", {
-      status: 200,
-      body: JSON.stringify({
-        order: {
-          id: "order-serve-1",
-          status: "in_progress",
-        },
-      }),
-    }),
-    matchRoute("POST", "/orders/order-serve-1/complete", {
-      status: 200,
-      body: JSON.stringify({ id: "order-serve-1", status: "pending_confirmation" }),
-    }),
-  ]);
+  const calls = [];
+  let orderServeGetCount = 0;
+  const fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    const method = options.method || "GET";
+    if (method === "GET" && url.endsWith("/orders/order-serve-1")) {
+      orderServeGetCount += 1;
+      if (orderServeGetCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            order: {
+              id: "order-serve-1",
+              status: "pending_accept",
+            },
+          }),
+        };
+      }
+      if (orderServeGetCount === 2) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            order: {
+              id: "order-serve-1",
+              status: "in_progress",
+            },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          order: {
+            id: "order-serve-1",
+            status: "pending_confirmation",
+            delivery_note: "Delivered as attached artifact(s). See attachments for the full result.",
+          },
+        }),
+      };
+    }
+    if (method === "POST" && url.endsWith("/orders/order-serve-1/accept")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ id: "order-serve-1", status: "in_progress" }),
+      };
+    }
+    if (method === "GET" && url.endsWith("/orders/order-serve-1/attachments")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            files: [
+              {
+                file_id: "file-order-1",
+                file_type: "seller_delivery",
+                original_filename: "delivery.md",
+                size: 128,
+              },
+            ],
+            file_count: 1,
+            total_size: 128,
+          }),
+      };
+    }
+    throw new Error(`No mock route matched ${method} ${url}`);
+  };
 
   const spawnCalls = [];
   const fakeSpawn = (_command, args) => {
@@ -812,22 +855,24 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
   assert.equal(spawnCalls.length, 1);
   assert.equal(spawnCalls[0][0], "chat");
   const hermesPrompt = spawnCalls[0][spawnCalls[0].indexOf("-q") + 1];
-  assert.match(hermesPrompt, /SKU\/listing description, input schema, buyer requirement/);
+  assert.match(hermesPrompt, /You must complete delivery yourself by calling the ClawLabor CLI from inside Hermes/);
+  assert.match(hermesPrompt, /clawlabor upload-attachment --entity order --id order-serve-1 --file <path>/);
+  assert.match(hermesPrompt, /clawlabor complete --order order-serve-1 --delivery-note/);
   assert.match(hermesPrompt, /Write a JavaScript add function from the event payload/);
-  assert.match(hermesPrompt, /The wrapper has already fetched the order and will handle accept\/complete API calls/);
   assert.doesNotMatch(hermesPrompt, /code-writing SKU order/);
-  const completeCall = calls.find((call) => call.url.endsWith("/orders/order-serve-1/complete"));
-  assert.ok(completeCall);
-  assert.match(JSON.parse(completeCall.options.body).delivery_note, /function add/);
+  assert.equal(calls.some((call) => call.url.endsWith("/orders/order-serve-1/complete")), false);
+  assert.equal(calls.some((call) => call.url.endsWith("/orders/order-serve-1/attachments")), true);
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(sessionDir, "cursor.json"), "utf8")).last_acked_event_id,
     501,
   );
   const result = JSON.parse(out[0]);
   assert.equal(result.processed[0].order_id, "order-serve-1");
+  assert.equal(result.processed[0].status, "pending_confirmation");
+  assert.match(result.processed[0].delivery_note, /Delivered as attached artifact/);
 });
 
-test("serve --adapter hermes does not complete seller order when Hermes returns empty output", async () => {
+test("serve --adapter hermes does not ack seller order when Hermes omits delivery attachments", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-serve-empty-"));
   const sessionRoot = path.join(tempDir, "sessions");
   const sessionDir = path.join(sessionRoot, "order_order-empty_seller");
@@ -859,16 +904,28 @@ test("serve --adapter hermes does not complete seller order when Hermes returns 
     })}\n`,
   );
 
-  const { fetch, calls } = recordingFetch([
-    matchRoute("GET", "/orders/order-empty", {
-      status: 200,
-      body: JSON.stringify({ order: { id: "order-empty", status: "in_progress" } }),
-    }),
-    matchRoute("GET", "/orders/order-empty", {
-      status: 200,
-      body: JSON.stringify({ order: { id: "order-empty", status: "in_progress" } }),
-    }),
-  ]);
+  const calls = [];
+  let orderEmptyGetCount = 0;
+  const fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    const method = options.method || "GET";
+    if (method === "GET" && url.endsWith("/orders/order-empty")) {
+      orderEmptyGetCount += 1;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ order: { id: "order-empty", status: "in_progress" } }),
+      };
+    }
+    if (method === "GET" && url.endsWith("/orders/order-empty/attachments")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ files: [], file_count: 0, total_size: 0 }),
+      };
+    }
+    throw new Error(`No mock route matched ${method} ${url}`);
+  };
 
   const fakeSpawn = () => {
     const child = new EventEmitter();
@@ -908,7 +965,7 @@ test("serve --adapter hermes does not complete seller order when Hermes returns 
   );
   const result = JSON.parse(out[0]);
   assert.equal(result.processed.length, 0);
-  assert.match(result.errors[0].error, /empty delivery note/);
+  assert.match(result.errors[0].error, /did not upload any seller delivery attachments/);
 });
 
 test("online can discover a tunnel public URL and write it back to the profile", async () => {
