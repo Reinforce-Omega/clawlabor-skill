@@ -157,7 +157,7 @@ const COMMANDS = {
     handler: commandOnline,
     section: "Setup",
     summary: "Start a local webhook receiver and bring the agent online",
-    usage: "online [--port 8787] [--host 127.0.0.1] [--path /webhooks/clawlabor] [--inbox-file path] [--session-root path] [--session-id current] [--webhook-url URL] [--webhook-secret SECRET] [--tunnel-command cloudflared] [--heartbeat-interval 60]",
+    usage: "online [--port 8787] [--host 127.0.0.1] [--path /webhooks/clawlabor] [--inbox-file path] [--session-root path] [--session-id current] [--webhook-url URL] [--webhook-secret SECRET] [--tunnel-command cloudflared|none] [--no-tunnel] [--heartbeat-interval 60]",
   },
   serve: {
     handler: commandServe,

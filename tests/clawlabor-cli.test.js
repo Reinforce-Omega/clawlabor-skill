@@ -561,6 +561,7 @@ test("online starts a receiver and writes webhook events to inbox", async () => 
     }),
   ]);
   const out = [];
+  let spawnCalled = false;
 
   const run = runCli(
     [
@@ -589,12 +590,17 @@ test("online starts a receiver and writes webhook events to inbox", async () => 
         handler = cb;
         return server;
       },
+      spawn: () => {
+        spawnCalled = true;
+        throw new Error("should not start a tunnel when --webhook-url is provided");
+      },
       waitForExit: wait.promise,
     },
   );
 
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(handler, "receiver should be created");
+  assert.equal(spawnCalled, false);
   assert.equal(calls.length, 2);
   assert.equal(calls[0].options.method, "PATCH");
   assert.deepEqual(JSON.parse(calls[0].options.body), {
@@ -944,7 +950,7 @@ test("serve --adapter hermes acks seller order after notifying Hermes", async ()
   assert.equal(result.processed[0].status, "in_progress");
 });
 
-test("online can discover a tunnel public URL and write it back to the profile", async () => {
+test("online defaults to Cloudflare tunnel discovery and writes the public URL back to the profile", async () => {
   const wait = deferred();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-online-tunnel-"));
   const tunnel = new EventEmitter();
@@ -982,12 +988,11 @@ test("online can discover a tunnel public URL and write it back to the profile",
     }),
   ]);
   const out = [];
+  const spawnCalls = [];
 
   const run = runCli(
     [
       "online",
-      "--tunnel-command",
-      "cloudflared",
       "--webhook-secret",
       "abcdef0123456789abcdef0123456789",
       "--inbox-file",
@@ -1005,12 +1010,19 @@ test("online can discover a tunnel public URL and write it back to the profile",
       fetch,
       stdout: (t) => out.push(t),
       createServer: () => server,
-      spawn: () => tunnel,
+      spawn: (command, args) => {
+        spawnCalls.push({ command, args });
+        return tunnel;
+      },
       waitForExit: wait.promise,
     },
   );
 
   await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(spawnCalls, [{
+    command: "cloudflared",
+    args: ["tunnel", "--url", "http://127.0.0.1:8787/webhooks/clawlabor"],
+  }]);
   tunnel.stdout.emit("data", "Visit https://abc.trycloudflare.com for the public URL\n");
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -1027,6 +1039,53 @@ test("online can discover a tunnel public URL and write it back to the profile",
   const result = JSON.parse(out[0]);
   assert.equal(result.webhook_url, "https://abc.trycloudflare.com");
   assert.equal(result.tunnel_command, "cloudflared");
+});
+
+test("online closes the receiver when the default tunnel cannot start", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-online-missing-tunnel-"));
+  let closed = false;
+  const server = {
+    listen(_port, _host, cb) {
+      cb?.();
+    },
+    close(cb) {
+      closed = true;
+      cb?.();
+    },
+    once() {
+      return this;
+    },
+    off() {
+      return this;
+    },
+  };
+
+  await assert.rejects(
+    runCli(
+      [
+        "online",
+        "--inbox-file",
+        path.join(tempDir, "inbox.jsonl"),
+        "--session-root",
+        path.join(tempDir, "sessions"),
+      ],
+      {
+        env: BASE_ENV,
+        fetch: async () => {
+          throw new Error("should not call API before tunnel URL is known");
+        },
+        stdout: () => {},
+        createServer: () => server,
+        spawn: () => {
+          const err = new Error("spawn cloudflared ENOENT");
+          err.code = "ENOENT";
+          throw err;
+        },
+      },
+    ),
+    /Install cloudflared/,
+  );
+  assert.equal(closed, true);
 });
 
 test("register requires owner email", async () => {

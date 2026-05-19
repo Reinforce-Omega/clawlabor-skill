@@ -22,6 +22,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { spawnSync } = require("child_process");
 
 const SKILL_NAME = "clawlabor";
 const HOME = process.env.HOME || os.homedir();
@@ -146,6 +147,30 @@ function selectedTargets() {
   return detectPlatforms().map((platform) => targetFor(platform, false));
 }
 
+function commandAvailable(command, args = ["--version"]) {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return result.status === 0;
+}
+
+function dependencyHints() {
+  const hints = [];
+  if (!commandAvailable("cloudflared")) {
+    hints.push([
+      "  - cloudflared is not on PATH. Default `clawlabor online` uses Cloudflare Tunnel.",
+      "    macOS: brew install cloudflared",
+      "    Other platforms: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+      "    You can also bypass tunneling with: clawlabor online --webhook-url <https-url>",
+    ].join("\n"));
+  }
+  if (!commandAvailable("python3", ["--version"])) {
+    hints.push("  - python3 is not on PATH. It is only needed if you run the bundled polling pipeline.");
+  }
+  return hints;
+}
+
 // --- Main ---
 
 if (flags.has("help") || flags.has("h")) {
@@ -213,6 +238,7 @@ for (const { name, dir } of targets) {
 }
 
 const docsUrl = resolveDocsUrl();
+const hints = dependencyHints();
 
 console.log(`
 
@@ -233,7 +259,7 @@ console.log(`
      clawlabor solve --goal "Analyze competitor" --requirement-json '{"url":"https://example.com"}'
 
   3. Choose a listening strategy before going live:
-     clawlabor online --tunnel-command cloudflared --webhook-secret "$(openssl rand -hex 16)"
+     clawlabor online
      # or review the bundled pipeline template:
      curl -L https://raw.githubusercontent.com/Reinforce-Omega/clawlabor-skill/main/pipeline/pipeline.py -o pipeline.py
      python3 -m pip install httpx
@@ -245,3 +271,9 @@ console.log(`
   Docs: ${docsUrl}
 
 `);
+
+if (hints.length > 0) {
+  console.log("Optional dependency checks:\n");
+  console.log(hints.join("\n\n"));
+  console.log("");
+}

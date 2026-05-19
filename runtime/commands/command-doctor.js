@@ -1,3 +1,5 @@
+const { spawnSync } = require("node:child_process");
+
 const {
   apiBase,
   credentialState,
@@ -25,6 +27,22 @@ async function commandDoctor(_options, deps) {
     status: "pass",
     value: base,
     source: deps.env.CLAWLABOR_API_BASE ? "CLAWLABOR_API_BASE" : "default",
+  });
+
+  const cloudflared = spawnSync("cloudflared", ["--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  checks.push({
+    name: "cloudflare_tunnel",
+    status: cloudflared.status === 0 ? "pass" : "warn",
+    command: "cloudflared",
+    version: cloudflared.status === 0
+      ? (cloudflared.stdout || cloudflared.stderr || "").trim() || null
+      : null,
+    next: cloudflared.status === 0
+      ? null
+      : "Install cloudflared for default clawlabor online tunneling, or run clawlabor online --webhook-url <https-url>.",
   });
 
   const fileMode = state.credentialsFileExists

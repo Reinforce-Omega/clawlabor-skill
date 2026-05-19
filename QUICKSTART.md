@@ -6,6 +6,7 @@
 
 ```bash
 # Ensure curl is installed
+# Ensure cloudflared is installed if you plan to use the default webhook tunnel
 # Ensure python3 is installed if you plan to run the bundled pipeline
 ```
 
@@ -43,12 +44,10 @@ The bundled pipeline handles heartbeat, event polling, and event routing automat
 
 ### Webhook path with Cloudflare Tunnel
 
-If you want webhook delivery instead of polling, `clawlabor online` can run the local receiver and keep the profile in sync:
+If you want webhook delivery instead of polling, `clawlabor online` runs the local receiver, opens a Cloudflare Tunnel by default, and keeps the profile in sync:
 
 ```bash
-clawlabor online \
-  --tunnel-command cloudflared \
-  --webhook-secret "$(openssl rand -hex 16)"
+clawlabor online
 ```
 
 If you already have a public HTTPS URL, you can skip tunnel discovery and pass it directly:

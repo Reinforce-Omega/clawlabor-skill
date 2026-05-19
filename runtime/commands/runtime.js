@@ -67,6 +67,12 @@ function startServer(server, host, port) {
   });
 }
 
+function closeServer(server) {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+  });
+}
+
 function waitForSignals() {
   return new Promise((resolve) => {
     const shutdown = () => resolve();
@@ -114,7 +120,19 @@ async function sendHeartbeat(deps) {
   }
 }
 
-async function commandOnline(options, deps) {
+function tunnelInstallHint(command) {
+  const commandName = command || "cloudflared";
+  if (commandName !== "cloudflared") {
+    return `Ensure ${commandName} is installed and available on PATH, or pass --webhook-url with an existing public HTTPS receiver URL.`;
+  }
+  return [
+    "Install cloudflared and retry, or pass --webhook-url with an existing public HTTPS receiver URL.",
+    "macOS: brew install cloudflared",
+    "Other platforms: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+  ].join(" ");
+}
+
+async function commandOnline(options, deps, flags = new Set()) {
   const host = options.host || "127.0.0.1";
   const port = positiveNumberOption(options, "port") || 8787;
   const receiverPath = normalizeWebhookPath(options.path || "/webhooks/clawlabor");
@@ -123,11 +141,14 @@ async function commandOnline(options, deps) {
   const currentSessionId = options["session-id"] || defaultSessionId(deps.env);
   const webhookSecret = options["webhook-secret"] || generateWebhookSecret();
   const explicitWebhookUrl = options["webhook-url"] || null;
-  const tunnelCommand = options["tunnel-command"] || null;
+  const noTunnel = flags.has("no-tunnel") || options["tunnel-command"] === "none";
+  const tunnelCommand = explicitWebhookUrl || noTunnel
+    ? null
+    : options["tunnel-command"] || "cloudflared";
 
   if (!explicitWebhookUrl && !tunnelCommand) {
     throw new Error(
-      "Missing reachability config: provide --webhook-url or --tunnel-command to bring the agent online.",
+      "Missing reachability config: provide --webhook-url or allow the default Cloudflare tunnel.",
     );
   }
 
@@ -244,11 +265,18 @@ async function commandOnline(options, deps) {
       })
     : Promise.resolve();
   if (tunnelCommand) {
-    tunnelProcess = (deps.spawn || spawn)(
-      tunnelCommand,
-      ["tunnel", "--url", localUrl],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+    try {
+      tunnelProcess = (deps.spawn || spawn)(
+        tunnelCommand,
+        ["tunnel", "--url", localUrl],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+    } catch (err) {
+      await closeServer(server);
+      throw new Error(
+        `Failed to start tunnel command "${tunnelCommand}": ${err.message}. ${tunnelInstallHint(tunnelCommand)}`,
+      );
+    }
 
     const updateFromOutput = async (chunk) => {
       const url = extractPublicUrl(chunk.toString("utf8"));
@@ -275,7 +303,11 @@ async function commandOnline(options, deps) {
     });
 
     tunnelProcess.once("error", (err) => {
-      tunnelReadyReject?.(err);
+      const wrapped = new Error(
+        `Failed to start tunnel command "${tunnelCommand}": ${err.message}. ${tunnelInstallHint(tunnelCommand)}`,
+      );
+      wrapped.cause = err;
+      tunnelReadyReject?.(wrapped);
     });
 
     tunnelProcess.once("exit", (code) => {
@@ -287,15 +319,23 @@ async function commandOnline(options, deps) {
     });
   }
 
-  if (resolvedWebhookUrl) {
-    await requestJson(deps, "PATCH", "/agents/me", {
-      body: {
-        webhook_url: resolvedWebhookUrl,
-        webhook_secret: webhookSecret,
-      },
-    });
-  } else if (tunnelCommand) {
-    await tunnelReady;
+  try {
+    if (resolvedWebhookUrl) {
+      await requestJson(deps, "PATCH", "/agents/me", {
+        body: {
+          webhook_url: resolvedWebhookUrl,
+          webhook_secret: webhookSecret,
+        },
+      });
+    } else if (tunnelCommand) {
+      await tunnelReady;
+    }
+  } catch (err) {
+    if (tunnelProcess && !tunnelProcess.killed) {
+      tunnelProcess.kill("SIGTERM");
+    }
+    await closeServer(server);
+    throw err;
   }
 
   const heartbeatOk = await sendHeartbeat(deps);
@@ -334,9 +374,7 @@ async function commandOnline(options, deps) {
     // best effort
   }
 
-  await new Promise((resolve) => {
-    server.close(() => resolve());
-  });
+  await closeServer(server);
 
   return undefined;
 }
