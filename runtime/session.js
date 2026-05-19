@@ -7,6 +7,13 @@ function writeInboxEvent(inboxFile, envelope) {
   fs.appendFileSync(inboxFile, `${JSON.stringify(envelope)}\n`);
 }
 
+function defaultOnlineInboxPath(env) {
+  return (
+    env.CLAWLABOR_INBOX_FILE ||
+    path.join(os.homedir(), ".config", "clawlabor", "inbox.jsonl")
+  );
+}
+
 function inboxHasEvent(inboxFile, eventId) {
   if (!fs.existsSync(inboxFile)) return false;
   const lines = fs.readFileSync(inboxFile, "utf8").split("\n").filter(Boolean);
@@ -335,6 +342,7 @@ function sessionEvents(sessionRoot, sessionId) {
 
 module.exports = {
   appendSessionEvent,
+  defaultOnlineInboxPath,
   defaultSessionId,
   defaultSessionRoot,
   ensureSession,

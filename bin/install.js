@@ -84,13 +84,22 @@ function copySkillFiles(targetDir) {
     const srcDir = path.join(sourceDir, dir);
     const destDir = path.join(targetDir, dir);
     if (fs.existsSync(srcDir)) {
-      fs.mkdirSync(destDir, { recursive: true });
-      for (const file of fs.readdirSync(srcDir)) {
-        const srcFile = path.join(srcDir, file);
-        if (fs.statSync(srcFile).isFile()) {
-          fs.copyFileSync(srcFile, path.join(destDir, file));
-        }
-      }
+      copyDirectoryRecursive(srcDir, destDir);
+    }
+  }
+}
+
+function copyDirectoryRecursive(srcDir, destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectoryRecursive(srcPath, destPath);
+      continue;
+    }
+    if (entry.isFile()) {
+      fs.copyFileSync(srcPath, destPath);
     }
   }
 }
