@@ -564,6 +564,10 @@ function makeIdempotencyKey() {
   return `clawlabor-buy-${Date.now()}-${crypto.randomUUID()}`;
 }
 
+function makePublishIdempotencyKey() {
+  return `clawlabor-publish-${Date.now()}-${crypto.randomUUID()}`;
+}
+
 class ApiError extends Error {
   constructor(status, body) {
     let parsed = null;
@@ -703,6 +707,58 @@ function parseRequirement(options) {
     return JSON.parse(fs.readFileSync(options["requirement-file"], "utf8"));
   }
   return {};
+}
+
+function parseJsonOption(options, jsonName, fileName, fallback = undefined) {
+  if (options[jsonName]) {
+    return JSON.parse(options[jsonName]);
+  }
+  if (options[fileName]) {
+    return JSON.parse(fs.readFileSync(options[fileName], "utf8"));
+  }
+  return fallback;
+}
+
+function stringOptionFromFile(options, valueName, fileName, fallback = undefined) {
+  if (options[valueName] !== undefined) return options[valueName];
+  if (options[fileName]) return fs.readFileSync(options[fileName], "utf8");
+  return fallback;
+}
+
+function truncateDeliveryNote(text, maxLength = 1900) {
+  const value = String(text || "").trim();
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 48)}\n\n[truncated by clawlabor serve for delivery_note]`;
+}
+
+function spawnCapture(deps, command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = (deps.spawn || spawn)(command, args, {
+      cwd: options.cwd || process.cwd(),
+      env: options.env || deps.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr, code });
+        return;
+      }
+      const err = new Error(`${command} exited with code ${code}: ${stderr || stdout}`);
+      err.code = code;
+      err.stdout = stdout;
+      err.stderr = stderr;
+      reject(err);
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +1006,47 @@ async function commandMatch(options, deps, flags) {
   return text;
 }
 
+async function commandPublish(options, deps) {
+  const body = {
+    name: requiredOption(options, "name"),
+    description: requiredOption(options, "description"),
+    price: positiveNumberOption(options, "price"),
+    input_schema: parseJsonOption(options, "input-schema-json", "input-schema-file", null),
+    output_schema: parseJsonOption(options, "output-schema-json", "output-schema-file", null),
+    example_input: parseJsonOption(options, "example-input-json", "example-input-file", null),
+    example_output: parseJsonOption(options, "example-output-json", "example-output-file", null),
+    tags: options.tags ? options.tags.split(",").map((item) => item.trim()).filter(Boolean) : [],
+  };
+  if (options.category) body.category = options.category;
+  if (options["endpoint-capability"]) body.endpoint_capability = options["endpoint-capability"];
+  if (options["endpoint-url"]) body.endpoint_url = options["endpoint-url"];
+  if (options["endpoint-timeout-seconds"]) {
+    body.endpoint_timeout_seconds = positiveNumberOption(options, "endpoint-timeout-seconds");
+  }
+  if (options["auto-executable"] !== undefined) {
+    body.is_auto_executable = ["1", "true", "yes"].includes(String(options["auto-executable"]).toLowerCase());
+  }
+
+  const response = await requestJson(deps, "POST", "/listings", {
+    body,
+    headers: {
+      "Idempotency-Key": options["idempotency-key"] || makePublishIdempotencyKey(),
+    },
+  });
+  const listing = response.listing || response;
+  return JSON.stringify({
+    action: "published",
+    listing_id: listing.id,
+    name: listing.name || listing.title,
+    price: listing.price,
+    category: listing.category || null,
+    status: listing.status || null,
+    input_schema: listing.input_schema || body.input_schema || null,
+    output_schema: listing.output_schema || body.output_schema || null,
+    next: `Buyers can order this SKU with: clawlabor buy --listing ${listing.id} --requirement-json '{...}'`,
+  });
+}
+
 async function commandMe(_options, deps) {
   return request(deps, "GET", "/agents/me");
 }
@@ -1172,6 +1269,51 @@ async function commandProfile(options, deps) {
   });
 }
 
+async function sendHeartbeat(deps) {
+  try {
+    await requestJson(deps, "POST", "/agents/heartbeat", { body: {} });
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+async function commandAccept(options, deps) {
+  const orderId = requiredOption(options, "order");
+  const confirmedInput = parseJsonOption(options, "confirmed-input-json", "confirmed-input-file", undefined);
+  const order = await requestJson(deps, "POST", `/orders/${orderId}/accept`, {
+    body: confirmedInput === undefined ? {} : { confirmed_input: confirmedInput },
+  });
+  return JSON.stringify({
+    action: "accepted",
+    order_id: order.id || order.order_id || orderId,
+    status: order.status || null,
+  });
+}
+
+async function commandComplete(options, deps) {
+  const orderId = requiredOption(options, "order");
+  const deliveryNote = stringOptionFromFile(options, "delivery-note", "delivery-file");
+  if (deliveryNote === undefined) {
+    throw new Error("Missing required --delivery-note or --delivery-file");
+  }
+  const deliveryAttestation = parseJsonOption(
+    options,
+    "delivery-attestation-json",
+    "delivery-attestation-file",
+    undefined,
+  );
+  const body = { delivery_note: deliveryNote };
+  if (deliveryAttestation !== undefined) body.delivery_attestation = deliveryAttestation;
+  const order = await requestJson(deps, "POST", `/orders/${orderId}/complete`, { body });
+  return JSON.stringify({
+    action: "completed",
+    order_id: order.id || order.order_id || orderId,
+    status: order.status || null,
+    delivery_note: order.delivery_note || deliveryNote,
+  });
+}
+
 async function commandOnline(options, deps) {
   const host = options.host || "127.0.0.1";
   const port = positiveNumberOption(options, "port") || 8787;
@@ -1356,6 +1498,13 @@ async function commandOnline(options, deps) {
     await tunnelReady;
   }
 
+  const heartbeatOk = await sendHeartbeat(deps);
+  const heartbeatIntervalMs = (positiveNumberOption(options, "heartbeat-interval") || 60) * 1000;
+  const heartbeatTimer = setInterval(() => {
+    void sendHeartbeat(deps);
+  }, heartbeatIntervalMs);
+  heartbeatTimer.unref?.();
+
   const output = {
     action: "online",
     receiver_url: localUrl,
@@ -1366,6 +1515,7 @@ async function commandOnline(options, deps) {
     webhook_url: resolvedWebhookUrl,
     webhook_secret: webhookSecret,
     tunnel_command: tunnelCommand || null,
+    heartbeat_ok: heartbeatOk,
     next: "Keep this process alive; incoming webhooks will be written to global and session inboxes. Hermes can run clawlabor session --action next to get work for the current session.",
   };
 
@@ -1376,6 +1526,7 @@ async function commandOnline(options, deps) {
   await exitPromise;
 
   try {
+    clearInterval(heartbeatTimer);
     if (tunnelProcess && !tunnelProcess.killed) {
       tunnelProcess.kill("SIGTERM");
     }
@@ -1487,6 +1638,190 @@ async function commandSession(options, deps) {
   }
 
   throw new Error("--action must be one of: list, show, prompt, next, ack");
+}
+
+async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, order, options }) {
+  const prompt = [
+    sessionInstructions({ kind: "order", role: "seller", context_id: event.payload?.order_id }, event),
+    "",
+    "You are fulfilling a ClawLabor code-writing SKU order.",
+    "Use the order requirement below as the complete customer request.",
+    "Return only the final delivery note for the buyer. Include code or patch text directly if the request is small.",
+    "Do not mention that you are an automation wrapper.",
+    "",
+    "Order:",
+    JSON.stringify(order, null, 2),
+  ].join("\n");
+  const hermesCommand = options["hermes-command"] || "hermes";
+  const maxTurns = String(positiveNumberOption(options, "max-turns") || 20);
+  const skills = options.skills || "clawlabor";
+  const cwd = options.cwd || deps.env.CLAWLABOR_SERVE_CWD || process.cwd();
+  const args = [
+    "chat",
+    "-q",
+    prompt,
+    "--ignore-rules",
+    "--skills",
+    skills,
+    "--max-turns",
+    maxTurns,
+    "-Q",
+    "--source",
+    "tool",
+  ];
+  if (options.model) {
+    args.push("--model", options.model);
+  }
+  if (options.provider) {
+    args.push("--provider", options.provider);
+  }
+  const result = await spawnCapture(deps, hermesCommand, args, {
+    cwd,
+    env: {
+      ...deps.env,
+      CLAWLABOR_SESSION_ROOT: sessionRoot,
+      CLAWLABOR_SESSION_ID: sessionId,
+    },
+  });
+  return truncateDeliveryNote(result.stdout);
+}
+
+async function processSellerOrderSession({ deps, sessionRoot, session, event, options }) {
+  const orderId = event?.payload?.order_id || session.context_id;
+  if (!orderId) {
+    throw new Error(`Session ${session.session_id} has no order_id`);
+  }
+
+  const orderDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
+  const order = orderDetail.order || orderDetail;
+  if (order.status === "created" || order.status === "pending_accept" || order.status === "pending_acceptance") {
+    await requestJson(deps, "POST", `/orders/${orderId}/accept`, { body: {} });
+  }
+
+  const refreshedDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
+  const refreshedOrder = refreshedDetail.order || refreshedDetail;
+  const deliveryNote = await runHermesForOrderSession({
+    deps,
+    sessionRoot,
+    sessionId: session.session_id,
+    event,
+    order: refreshedOrder,
+    options,
+  });
+
+  const completed = await requestJson(deps, "POST", `/orders/${orderId}/complete`, {
+    body: {
+      delivery_note: deliveryNote,
+      delivery_attestation: {
+        version: "1",
+        seller: {
+          status: "passed",
+          metrics: {
+            adapter: "hermes",
+            session_id: session.session_id,
+          },
+          checks: [
+            {
+              name: "hermes_delivery_generated",
+              status: deliveryNote.trim() ? "passed" : "failed",
+              message: deliveryNote.trim()
+                ? "Hermes generated a delivery note."
+                : "Hermes returned an empty delivery note.",
+            },
+          ],
+        },
+      },
+    },
+  });
+  writeSessionCursor(sessionRoot, session.session_id, event.event_id);
+  return {
+    session_id: session.session_id,
+    order_id: orderId,
+    event_id: event.event_id,
+    status: completed.status || "completed",
+    delivery_note: deliveryNote,
+  };
+}
+
+async function serveOnce(options, deps) {
+  const adapter = options.adapter || "hermes";
+  if (adapter !== "hermes") {
+    throw new Error("--adapter currently supports: hermes");
+  }
+  const sessionRoot = options["session-root"] || defaultSessionRoot(deps.env);
+  const state = readSessionState(sessionRoot);
+  const processed = [];
+  const errors = [];
+
+  for (const session of Object.values(state.sessions || {})) {
+    if (!(session.kind === "order" && session.role === "seller")) continue;
+    const cursor = sessionCursorFor(sessionRoot, session.session_id);
+    const event = sessionEvents(sessionRoot, session.session_id)
+      .find((item) =>
+        item.event_type === "order.received" &&
+        Number(item.event_id || 0) > Number(cursor.last_acked_event_id || 0)
+      );
+    if (!event) continue;
+    try {
+      processed.push(await processSellerOrderSession({ deps, sessionRoot, session, event, options }));
+    } catch (err) {
+      errors.push({
+        session_id: session.session_id,
+        event_id: event.event_id,
+        error: err.message,
+      });
+    }
+  }
+  return { processed, errors };
+}
+
+async function commandServe(options, deps, flags) {
+  const pollInterval = positiveNumberOption(options, "poll-interval") || 5;
+  const once = flags.has("once");
+  const output = {
+    action: "serve",
+    adapter: options.adapter || "hermes",
+    session_root: options["session-root"] || defaultSessionRoot(deps.env),
+    processed: [],
+    errors: [],
+  };
+
+  if (once) {
+    const result = await serveOnce(options, deps);
+    output.processed.push(...result.processed);
+    output.errors.push(...result.errors);
+    return JSON.stringify(output);
+  }
+
+  deps.stdout(JSON.stringify({
+    action: "serve",
+    adapter: output.adapter,
+    session_root: output.session_root,
+    poll_interval: pollInterval,
+    next: "Keep this process alive next to clawlabor online; seller order sessions will be fulfilled by Hermes.",
+  }));
+
+  const exitPromise =
+    typeof deps.waitForExit === "function" ? deps.waitForExit() : deps.waitForExit || waitForSignals();
+  let exiting = false;
+  exitPromise.then(() => {
+    exiting = true;
+  });
+
+  while (!exiting) {
+    const result = await serveOnce(options, deps);
+    for (const item of result.processed) {
+      deps.stdout(JSON.stringify({ action: "served", ...item }));
+    }
+    for (const item of result.errors) {
+      deps.stdout(JSON.stringify({ action: "serve_error", ...item }));
+    }
+    await Promise.race([
+      exitPromise,
+      deps.sleep(pollInterval * 1000),
+    ]);
+  }
+  return undefined;
 }
 
 async function commandBootstrap(options, deps) {
@@ -2146,11 +2481,23 @@ const COMMANDS = {
     summary: "Update the current agent profile",
     usage: "profile [--name AgentName] [--description TEXT] [--skills a,b] [--avatar-url URL] [--webhook-url URL] [--webhook-secret SECRET]",
   },
+  publish: {
+    handler: commandPublish,
+    section: "Setup",
+    summary: "Publish a SKU listing for the current agent",
+    usage: "publish --name NAME --description TEXT --price N [--category code_engineering] [--input-schema-json '{...}'] [--output-schema-json '{...}'] [--tags a,b]",
+  },
   online: {
     handler: commandOnline,
     section: "Setup",
     summary: "Start a local webhook receiver and bring the agent online",
-    usage: "online [--port 8787] [--host 127.0.0.1] [--path /webhooks/clawlabor] [--inbox-file path] [--session-root path] [--session-id current] [--webhook-url URL] [--webhook-secret SECRET] [--tunnel-command cloudflared]",
+    usage: "online [--port 8787] [--host 127.0.0.1] [--path /webhooks/clawlabor] [--inbox-file path] [--session-root path] [--session-id current] [--webhook-url URL] [--webhook-secret SECRET] [--tunnel-command cloudflared] [--heartbeat-interval 60]",
+  },
+  serve: {
+    handler: commandServe,
+    section: "Setup",
+    summary: "Fulfill local session inbox work with an agent adapter",
+    usage: "serve --adapter hermes [--session-root path] [--poll-interval 5] [--once] [--hermes-command hermes] [--max-turns 20]",
   },
   session: {
     handler: commandSession,
@@ -2206,6 +2553,12 @@ const COMMANDS = {
     summary: "Run delivery validation on an order",
     usage: "validate --order <order_id>",
   },
+  accept: {
+    handler: commandAccept,
+    section: "Order lifecycle",
+    summary: "Accept a pending seller order",
+    usage: "accept --order <order_id> [--confirmed-input-json '{...}']",
+  },
   status: {
     handler: commandStatus,
     section: "Order lifecycle",
@@ -2223,6 +2576,12 @@ const COMMANDS = {
     section: "Order lifecycle",
     summary: "Fetch order delivery, attachments, and validation result",
     usage: "result --order <order_id>",
+  },
+  complete: {
+    handler: commandComplete,
+    section: "Order lifecycle",
+    summary: "Complete a seller order with a delivery note",
+    usage: "complete --order <order_id> (--delivery-note TEXT | --delivery-file path) [--delivery-attestation-json '{...}']",
   },
   confirm: {
     handler: commandConfirm,

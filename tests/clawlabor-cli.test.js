@@ -425,6 +425,106 @@ test("profile updates the current agent webhook configuration", async () => {
   assert.equal(result.webhook_url, "https://example.trycloudflare.com/webhooks/clawlabor");
 });
 
+test("publish creates a SKU listing for the current agent", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/listings", {
+      status: 201,
+      body: JSON.stringify({
+        listing: {
+          id: "listing-code-1",
+          name: "Hermes Code Writer",
+          price: 25,
+          category: "code_engineering",
+          status: "active",
+          input_schema: {
+            type: "object",
+            required: ["task"],
+            properties: { task: { type: "string" } },
+          },
+        },
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    [
+      "publish",
+      "--name",
+      "Hermes Code Writer",
+      "--description",
+      "Writes small code changes and returns a concise patch.",
+      "--price",
+      "25",
+      "--category",
+      "code_engineering",
+      "--input-schema-json",
+      '{"type":"object","required":["task"],"properties":{"task":{"type":"string"}}}',
+      "--tags",
+      "code,hermes",
+      "--idempotency-key",
+      "publish-code-1",
+    ],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+
+  assert.equal(calls[0].options.method, "POST");
+  assert.ok(calls[0].url.endsWith("/listings"));
+  assert.equal(calls[0].options.headers["Idempotency-Key"], "publish-code-1");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    name: "Hermes Code Writer",
+    description: "Writes small code changes and returns a concise patch.",
+    price: 25,
+    input_schema: {
+      type: "object",
+      required: ["task"],
+      properties: { task: { type: "string" } },
+    },
+    output_schema: null,
+    example_input: null,
+    example_output: null,
+    tags: ["code", "hermes"],
+    category: "code_engineering",
+  });
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "published");
+  assert.equal(result.listing_id, "listing-code-1");
+});
+
+test("accept and complete seller order lifecycle commands", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/orders/order-1/accept", {
+      status: 200,
+      body: JSON.stringify({ id: "order-1", status: "in_progress" }),
+    }),
+    matchRoute("POST", "/orders/order-1/complete", {
+      status: 200,
+      body: JSON.stringify({
+        id: "order-1",
+        status: "pending_confirmation",
+        delivery_note: "Implemented the requested code change.",
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(["accept", "--order", "order-1"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+  await runCli(["complete", "--order", "order-1", "--delivery-note", "Implemented the requested code change."], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+  });
+
+  assert.deepEqual(JSON.parse(calls[0].options.body), {});
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    delivery_note: "Implemented the requested code change.",
+  });
+  assert.equal(JSON.parse(out[0]).action, "accepted");
+  assert.equal(JSON.parse(out[1]).action, "completed");
+});
+
 test("online starts a receiver and writes webhook events to inbox", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-online-"));
   const inboxFile = path.join(tempDir, "inbox.jsonl");
@@ -454,6 +554,10 @@ test("online starts a receiver and writes webhook events to inbox", async () => 
         name: "Agent Existing",
         webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
       }),
+    }),
+    matchRoute("POST", "/agents/heartbeat", {
+      status: 200,
+      body: JSON.stringify({ ok: true }),
     }),
   ]);
   const out = [];
@@ -491,7 +595,7 @@ test("online starts a receiver and writes webhook events to inbox", async () => 
 
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(handler, "receiver should be created");
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
   assert.equal(calls[0].options.method, "PATCH");
   assert.deepEqual(JSON.parse(calls[0].options.body), {
     webhook_url: "https://example.trycloudflare.com/webhooks/clawlabor",
@@ -581,6 +685,116 @@ test("online starts a receiver and writes webhook events to inbox", async () => 
   assert.equal(result.action, "online");
   assert.equal(result.receiver_url, "http://127.0.0.1:8787/webhooks/clawlabor");
   assert.equal(result.current_session_id, "hermes-current");
+  assert.equal(result.heartbeat_ok, true);
+});
+
+test("serve --adapter hermes processes isolated seller order sessions", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-serve-hermes-"));
+  const sessionRoot = path.join(tempDir, "sessions");
+  const sessionDir = path.join(sessionRoot, "order_order-serve-1_seller");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionRoot, "state.json"),
+    JSON.stringify({
+      current_session_id: "hermes-current",
+      sessions: {
+        "order:order-serve-1:seller": {
+          session_id: "order:order-serve-1:seller",
+          kind: "order",
+          role: "seller",
+          context_id: "order-serve-1",
+          purpose: "Fulfill order order-serve-1",
+          last_event_id: 501,
+        },
+      },
+    }),
+  );
+  fs.writeFileSync(path.join(sessionDir, "cursor.json"), JSON.stringify({ last_acked_event_id: 0 }));
+  fs.writeFileSync(
+    path.join(sessionDir, "inbox.jsonl"),
+    `${JSON.stringify({
+      event_id: 501,
+      event_type: "order.received",
+      payload: { order_id: "order-serve-1" },
+      created_at: "2026-05-19T00:00:00.000Z",
+    })}\n`,
+  );
+
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/orders/order-serve-1", {
+      status: 200,
+      body: JSON.stringify({
+        order: {
+          id: "order-serve-1",
+          status: "pending_accept",
+          requirement: { task: "Write a JavaScript add function" },
+        },
+      }),
+    }),
+    matchRoute("POST", "/orders/order-serve-1/accept", {
+      status: 200,
+      body: JSON.stringify({ id: "order-serve-1", status: "in_progress" }),
+    }),
+    matchRoute("GET", "/orders/order-serve-1", {
+      status: 200,
+      body: JSON.stringify({
+        order: {
+          id: "order-serve-1",
+          status: "in_progress",
+          requirement: { task: "Write a JavaScript add function" },
+        },
+      }),
+    }),
+    matchRoute("POST", "/orders/order-serve-1/complete", {
+      status: 200,
+      body: JSON.stringify({ id: "order-serve-1", status: "pending_confirmation" }),
+    }),
+  ]);
+
+  const spawnCalls = [];
+  const fakeSpawn = (_command, args) => {
+    spawnCalls.push(args);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    process.nextTick(() => {
+      child.stdout.emit("data", "Here is the implementation: function add(a, b) { return a + b; }");
+      child.emit("exit", 0);
+    });
+    return child;
+  };
+
+  const out = [];
+  await runCli(
+    [
+      "serve",
+      "--adapter",
+      "hermes",
+      "--once",
+      "--session-root",
+      sessionRoot,
+      "--hermes-command",
+      "hermes",
+    ],
+    {
+      env: BASE_ENV,
+      fetch,
+      spawn: fakeSpawn,
+      stdout: (t) => out.push(t),
+    },
+  );
+
+  assert.equal(spawnCalls.length, 1);
+  assert.equal(spawnCalls[0][0], "chat");
+  const completeCall = calls.find((call) => call.url.endsWith("/orders/order-serve-1/complete"));
+  assert.ok(completeCall);
+  assert.match(JSON.parse(completeCall.options.body).delivery_note, /function add/);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(sessionDir, "cursor.json"), "utf8")).last_acked_event_id,
+    501,
+  );
+  const result = JSON.parse(out[0]);
+  assert.equal(result.processed[0].order_id, "order-serve-1");
 });
 
 test("online can discover a tunnel public URL and write it back to the profile", async () => {
@@ -614,6 +828,10 @@ test("online can discover a tunnel public URL and write it back to the profile",
         name: "Agent Existing",
         webhook_url: "https://agent.example.com/webhooks/clawlabor",
       }),
+    }),
+    matchRoute("POST", "/agents/heartbeat", {
+      status: 200,
+      body: JSON.stringify({ ok: true }),
     }),
   ]);
   const out = [];
@@ -649,7 +867,7 @@ test("online can discover a tunnel public URL and write it back to the profile",
   tunnel.stdout.emit("data", "Visit https://abc.trycloudflare.com for the public URL\n");
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
   assert.equal(calls[0].options.method, "PATCH");
   assert.deepEqual(JSON.parse(calls[0].options.body), {
     webhook_url: "https://abc.trycloudflare.com",
