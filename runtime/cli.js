@@ -261,14 +261,10 @@ function sessionInstructions(session, latestEvent) {
     return [
       `You are the isolated seller session for order ${session.context_id}.`,
       "Handle only this order in this session.",
-      "Steps:",
-      "1. Fetch the order details from ClawLabor.",
-      "2. Review the requirement, messages, and attachments.",
-      "3. Accept or reject the order.",
-      "4. If accepted, complete the order when work is ready.",
-      "",
-      "Latest event:",
-      eventBlock,
+      "Follow the ClawLabor skill instructions, the SKU/listing description, and the buyer's order requirement.",
+      "Use order details, messages, and attachments as the source of truth.",
+      "Accept the order only when the requirement is clear enough to fulfill.",
+      "Complete the order with the deliverable the buyer requested.",
       "",
       `Session purpose: ${summary}`,
     ].join("\n");
@@ -415,18 +411,20 @@ function sessionEventTarget(event, currentSessionId, state) {
       ? `order:${orderId}:seller`
       : taskId
         ? `task:${taskId}:requester`
-        : currentSessionId;
+        : null;
+    const hasContextSession = candidate && state.sessions[candidate];
+    const sessionId = hasContextSession ? candidate : currentSessionId;
     return {
-      sessionId: state.sessions[candidate] ? candidate : currentSessionId,
+      sessionId,
       meta: {
-        kind: orderId ? "order" : taskId ? "task" : "current",
-        role: orderId ? "seller" : taskId ? "requester" : "current",
-        context_id: orderId || taskId || null,
-        purpose: orderId
-          ? `Handle messages for order ${orderId}`
-          : taskId
-            ? `Handle messages for task ${taskId}`
-            : "Handle incoming messages",
+        kind: hasContextSession ? (orderId ? "order" : "task") : "current",
+        role: hasContextSession ? (orderId ? "seller" : "requester") : "current",
+        context_id: hasContextSession ? (orderId || taskId || null) : null,
+        purpose: hasContextSession
+          ? orderId
+            ? `Handle messages for order ${orderId}`
+            : `Handle messages for task ${taskId}`
+          : "Handle incoming platform event in the current agent session",
       },
     };
   }
@@ -1642,12 +1640,12 @@ async function commandSession(options, deps) {
 
 async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, order, options }) {
   const prompt = [
-    sessionInstructions({ kind: "order", role: "seller", context_id: event.payload?.order_id }, event),
-    "",
-    "You are fulfilling a ClawLabor code-writing SKU order.",
-    "Use the order requirement below as the complete customer request.",
-    "Return only the final delivery note for the buyer. Include code or patch text directly if the request is small.",
-    "Do not mention that you are an automation wrapper.",
+    `You are the seller agent for isolated ClawLabor order session ${sessionId}.`,
+    "Fulfill exactly this order, and do not mix it with other orders or sessions.",
+    "Follow the ClawLabor skill instructions already loaded in this runtime.",
+    "Use the SKU/listing description, input schema, buyer requirement, messages, and attachments as the contract.",
+    "Return only the final delivery note for the buyer. Include the requested deliverable directly when practical.",
+    "Do not invent requirements beyond the SKU description and buyer requirement.",
     "",
     "Order:",
     JSON.stringify(order, null, 2),

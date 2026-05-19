@@ -662,8 +662,30 @@ test("online starts a receiver and writes webhook events to inbox", async () => 
   );
   assert.match(
     fs.readFileSync(path.join(sessionRoot, "order_order-99_seller", "prompt.md"), "utf8"),
-    /isolated seller session/,
+    /SKU\/listing description, and the buyer's order requirement/,
   );
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(sessionRoot, "order_order-99_seller", "prompt.md"), "utf8"),
+    /Latest event/,
+  );
+
+  const buyerMessagePayload = {
+    event_id: 100,
+    event_type: "message.received",
+    payload: { order_id: "buyer-order-without-seller-session", content: "Any update?" },
+    created_at: "2026-05-19T00:00:01.000Z",
+  };
+  const buyerMessageBody = Buffer.from(JSON.stringify(buyerMessagePayload));
+  const buyerMessageSignature = crypto.createHmac("sha256", requestSecret).update(buyerMessageBody).digest("hex");
+  const buyerMessageReq = Readable.from([buyerMessageBody]);
+  buyerMessageReq.method = "POST";
+  buyerMessageReq.url = "/webhooks/clawlabor";
+  buyerMessageReq.headers = { "x-webhook-signature": buyerMessageSignature };
+  const buyerMessageRes = createMockResponse();
+  await handler(buyerMessageReq, buyerMessageRes);
+
+  assert.equal(buyerMessageRes.statusCode, 200);
+  assert.equal(JSON.parse(buyerMessageRes.body).session_id, "hermes-current");
 
   const sessionOut = [];
   await runCli(["session", "--action", "next", "--session-root", sessionRoot, "--session-id", "hermes-current"], {
@@ -786,6 +808,9 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
 
   assert.equal(spawnCalls.length, 1);
   assert.equal(spawnCalls[0][0], "chat");
+  const hermesPrompt = spawnCalls[0][spawnCalls[0].indexOf("-q") + 1];
+  assert.match(hermesPrompt, /SKU\/listing description, input schema, buyer requirement/);
+  assert.doesNotMatch(hermesPrompt, /code-writing SKU order/);
   const completeCall = calls.find((call) => call.url.endsWith("/orders/order-serve-1/complete"));
   assert.ok(completeCall);
   assert.match(JSON.parse(completeCall.options.body).delivery_note, /function add/);
