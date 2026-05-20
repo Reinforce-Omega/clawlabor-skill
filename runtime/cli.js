@@ -201,7 +201,7 @@ const COMMANDS = {
     handler: commandSolve,
     section: "Procurement",
     summary: "End-to-end: match -> buy -> wait -> validate -> optionally confirm",
-    usage: "solve --goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--auto-confirm] [--allow-bounty --bounty-reward N]",
+    usage: "solve (--goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--auto-confirm] [--allow-bounty --bounty-reward N]) | --resume-order <order_id>",
   },
   stage: {
     handler: commandStage,

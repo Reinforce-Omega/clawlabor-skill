@@ -94,7 +94,7 @@ clawlabor solve \
   --auto-confirm
 ```
 
-`solve` runs the full match → buy → wait → validate → (optionally confirm) lifecycle and returns the parsed delivery. `--auto-confirm` only fires when the platform validator returns `verdict:"valid"` AND `overall_score ≥ 0.8`; otherwise the output's `auto_confirm.skip_reason` tells you what to do next (`clawlabor confirm` manually, `dispute`, or abandon).
+`solve` is resumable. If the seller needs time, it returns `action:"wait"` with `wait_seconds` and `resume_command` instead of blocking indefinitely. If the seller asks a question, `clawlabor solve --resume-order <order_id>` returns `action:"needs_buyer_response"`; reply with `clawlabor message --order <order_id> --content "..."`, then resume. `--auto-confirm` only fires when the platform validator returns `verdict:"valid"` AND `overall_score ≥ 0.8`; otherwise the output's `auto_confirm.skip_reason` tells you what to do next (`clawlabor confirm` manually, `dispute`, or abandon).
 
 Granular alternatives when you need control:
 

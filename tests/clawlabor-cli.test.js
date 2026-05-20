@@ -2014,6 +2014,142 @@ test("solve uploads attachment after purchase before waiting for delivery", asyn
   );
 });
 
+test("solve returns wait action instead of blocking indefinitely", async () => {
+  const routes = [
+    matchRoute("POST", "/listings/match", {
+      status: 200,
+      body: JSON.stringify({
+        matches: [
+          {
+            id: "sku-wait",
+            price: 20,
+            input_schema: { type: "object", required: ["input"] },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+        ],
+      }),
+    }),
+    matchRoute("POST", "/listings/sku-wait/purchase", {
+      status: 201,
+      body: '{"id":"order-wait"}',
+    }),
+    matchRoute("GET", "/orders/order-wait", {
+      status: 200,
+      body: JSON.stringify({ order: { id: "order-wait", status: "in_progress" } }),
+    }),
+  ];
+  const { fetch } = recordingFetch(routes);
+  let nowVal = 0;
+  const out = [];
+  await runCli(
+    [
+      "solve",
+      "--goal",
+      "Long task",
+      "--requirement-json",
+      '{"input":"x"}',
+      "--timeout",
+      "1",
+      "--interval",
+      "1",
+    ],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      makeIdempotencyKey: () => "fixed",
+      sleep: async (ms) => {
+        nowVal += ms;
+      },
+      now: () => nowVal,
+    },
+  );
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "wait");
+  assert.equal(result.order_id, "order-wait");
+  assert.equal(result.status, "in_progress");
+  assert.equal(result.wait_seconds, 300);
+  assert.equal(result.resume_command, "clawlabor solve --resume-order order-wait");
+});
+
+test("solve --resume-order returns needs_buyer_response for seller message", async () => {
+  const routes = [
+    matchRoute("GET", "/orders/order-msg", {
+      status: 200,
+      body: JSON.stringify({ order: { id: "order-msg", status: "in_progress" } }),
+    }),
+    matchRoute("GET", "/orders/order-msg/messages?limit=20", {
+      status: 200,
+      body: JSON.stringify({
+        messages: [
+          {
+            id: "msg-1",
+            sender_id: "seller-1",
+            content: "Please clarify the target audience.",
+            created_at: "2026-05-20T10:00:00Z",
+          },
+        ],
+      }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "buyer-1", agent_id: "buyer-agent" }),
+    }),
+  ];
+  const { fetch } = recordingFetch(routes);
+  const out = [];
+  await runCli(
+    ["solve", "--resume-order", "order-msg"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      now: () => 0,
+    },
+  );
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "needs_buyer_response");
+  assert.equal(result.latest_message.id, "msg-1");
+  assert.equal(result.next_command, "clawlabor message --order order-msg --content <reply>");
+  assert.equal(result.resume_command, "clawlabor solve --resume-order order-msg");
+});
+
+test("solve --resume-order returns wait when no counterparty message is pending", async () => {
+  const routes = [
+    matchRoute("GET", "/orders/order-idle", {
+      status: 200,
+      body: JSON.stringify({ order: { id: "order-idle", status: "pending_accept" } }),
+    }),
+    matchRoute("GET", "/orders/order-idle/messages?limit=20", {
+      status: 200,
+      body: JSON.stringify({ messages: [] }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "buyer-1", agent_id: "buyer-agent" }),
+    }),
+  ];
+  const { fetch } = recordingFetch(routes);
+  const out = [];
+  await runCli(
+    ["solve", "--resume-order", "order-idle"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      now: () => 0,
+    },
+  );
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "wait");
+  assert.equal(result.status, "pending_accept");
+  assert.equal(result.wait_seconds, 60);
+  assert.equal(result.check_after, "1970-01-01T00:01:00.000Z");
+});
+
 test("solve buys the first schema-compatible allowed listing", async () => {
   const routes = [
     matchRoute("POST", "/listings/match", {
