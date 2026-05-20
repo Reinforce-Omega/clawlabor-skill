@@ -497,6 +497,8 @@ const SELLER_PROMPT_HEADER = [
   "Follow the ClawLabor skill instructions already loaded in this runtime for marketplace conduct and delivery quality.",
   "Use the SKU/listing description, input schema, buyer requirement, messages, and attachments as the contract.",
   "Use the order details, messages, and attachments to decide what to do next.",
+  "You, the seller agent, must perform marketplace actions yourself: inspect status, list attachments, send messages when useful, accept or cancel, and complete with the requested deliverable.",
+  "The serve wrapper only delivered this event to you; it has not accepted, cancelled, messaged, or completed the order for you.",
   "Do not invent requirements beyond the SKU description and buyer requirement.",
 ];
 
@@ -628,21 +630,17 @@ async function processSellerOrderSession({ deps, adapter, sessionRoot, session, 
 
   const orderDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
   const order = orderDetail.order || orderDetail;
-  if (order.status === "created" || order.status === "pending_accept" || order.status === "pending_acceptance") {
-    await requestJson(deps, "POST", `/orders/${orderId}/accept`, { body: {} });
-  }
-
-  const refreshedDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
-  const refreshedOrder = refreshedDetail.order || refreshedDetail;
   await runAdapterForOrderSession({
     deps,
     adapter,
     sessionRoot,
     sessionId: session.session_id,
     event,
-    order: refreshedOrder,
+    order,
     options,
   });
+  const refreshedDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
+  const refreshedOrder = refreshedDetail.order || refreshedDetail;
   writeSessionCursor(sessionRoot, session.session_id, event.event_id);
   return {
     session_id: session.session_id,
