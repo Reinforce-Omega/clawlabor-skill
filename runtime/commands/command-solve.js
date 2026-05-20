@@ -58,6 +58,56 @@ function resumeCommand(orderId) {
   return `clawlabor solve --resume-order ${orderId}`;
 }
 
+function terminalNextAction(action) {
+  return {
+    type: "terminal",
+    terminal: true,
+    action,
+    command: null,
+  };
+}
+
+function waitNextAction(orderId, waitSeconds, checkAfter, reason) {
+  return {
+    type: "wait",
+    terminal: false,
+    reason,
+    wait_seconds: waitSeconds,
+    check_after: checkAfter,
+    command: resumeCommand(orderId),
+  };
+}
+
+function replyNextAction(orderId) {
+  return {
+    type: "reply",
+    terminal: false,
+    decision_required: true,
+    command: `clawlabor message --order ${orderId} --content <reply>`,
+    after_command: resumeCommand(orderId),
+  };
+}
+
+function reviewDeliveryNextAction(orderId) {
+  return {
+    type: "review_delivery",
+    terminal: false,
+    decision_required: true,
+    command: `clawlabor confirm --order ${orderId}`,
+    when: "delivery_acceptable",
+    otherwise: `Do not confirm; keep the order pending while you decide the correct buyer action for order ${orderId}.`,
+  };
+}
+
+function openOrderRetryPolicy(orderId) {
+  return {
+    initial_solve_repeat_safe: false,
+    duplicate_purchase_risk: true,
+    resume_command: resumeCommand(orderId),
+    rule: "Once solve returns an order_id, do not run the original solve --goal command again for this purchase; use resume_command or next_action.command.",
+  };
+}
+
 async function fetchOrderMessages(deps, orderId) {
   const detail = await requestJson(deps, "GET", `/orders/${orderId}/messages?limit=20`);
   return Array.isArray(detail?.messages)
@@ -133,6 +183,8 @@ async function deliveredResult(orderId, listingId, options, deps, flags, trace) 
     auto_confirm: autoConfirm,
     decision_required: !confirmed,
     next_command: confirmed ? null : `clawlabor confirm --order ${orderId}`,
+    next_action: confirmed ? terminalNextAction("completed") : reviewDeliveryNextAction(orderId),
+    retry_policy: confirmed ? null : openOrderRetryPolicy(orderId),
     resume_command: resumeCommand(orderId),
     trace,
   };
@@ -155,6 +207,7 @@ async function observeOrder(orderId, options, deps, flags, trace = [], listingId
       cancel_reason: order?.cancel_reason || null,
       cancellation_context: cancellationContext,
       terminal: true,
+      next_action: terminalNextAction("cancelled"),
       trace,
     };
   }
@@ -165,6 +218,7 @@ async function observeOrder(orderId, options, deps, flags, trace = [], listingId
       order_id: orderId,
       status: "completed",
       terminal: true,
+      next_action: terminalNextAction("confirmed"),
       trace,
     };
   }
@@ -181,6 +235,8 @@ async function observeOrder(orderId, options, deps, flags, trace = [], listingId
       status,
       latest_message: latestMessage,
       next_command: `clawlabor message --order ${orderId} --content <reply>`,
+      next_action: replyNextAction(orderId),
+      retry_policy: openOrderRetryPolicy(orderId),
       resume_command: resumeCommand(orderId),
       decision_required: true,
       trace,
@@ -188,17 +244,20 @@ async function observeOrder(orderId, options, deps, flags, trace = [], listingId
   }
 
   const waitSeconds = waitSecondsForStatus(status, options);
+  const reason = status === "in_progress"
+    ? "seller_is_working"
+    : "waiting_for_seller_state_change";
+  const checkAfter = checkAfterIso(deps, waitSeconds);
   return {
     action: "wait",
     order_id: orderId,
     status,
-    reason:
-      status === "in_progress"
-        ? "seller_is_working"
-        : "waiting_for_seller_state_change",
+    reason,
     wait_seconds: waitSeconds,
-    check_after: checkAfterIso(deps, waitSeconds),
+    check_after: checkAfter,
     resume_command: resumeCommand(orderId),
+    next_action: waitNextAction(orderId, waitSeconds, checkAfter, reason),
+    retry_policy: openOrderRetryPolicy(orderId),
     deadline: {
       accept_deadline: order?.accept_deadline || null,
       confirm_deadline: order?.confirm_deadline || null,
@@ -354,18 +413,25 @@ async function commandSolve(options, deps, flags) {
         cancel_reason: waitResult.cancel_reason || null,
         cancellation_context: waitResult.cancellation_context || null,
         terminal: true,
+        next_action: terminalNextAction("cancelled"),
         trace,
       });
     }
     const waitSeconds = waitSecondsForStatus(waitResult.status, options);
+    const reason = waitResult.status === "in_progress"
+      ? "seller_is_working"
+      : waitResult.reason || "waiting_for_seller_state_change";
+    const checkAfter = checkAfterIso(deps, waitSeconds);
     return JSON.stringify({
       action: "wait",
       order_id: orderId,
       status: waitResult.status,
-      reason: waitResult.reason || "seller_is_working",
+      reason,
       wait_seconds: waitSeconds,
-      check_after: checkAfterIso(deps, waitSeconds),
+      check_after: checkAfter,
       resume_command: resumeCommand(orderId),
+      next_action: waitNextAction(orderId, waitSeconds, checkAfter, reason),
+      retry_policy: openOrderRetryPolicy(orderId),
       trace,
     });
   }

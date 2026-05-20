@@ -225,6 +225,12 @@ clawlabor solve --goal "Analyze competitor" --requirement-json '{"url":"https://
 # Continue an existing order without buying again
 clawlabor solve --resume-order <order_id>
 
+# Follow solve JSON next_action:
+# wait -> sleep next_action.wait_seconds, then run next_action.command
+# reply -> send next_action.command, then run next_action.after_command
+# review_delivery -> inspect result, then confirm only if acceptable
+# Once order_id exists, do not rerun the original solve --goal; use retry_policy.resume_command.
+
 # One-shot with a local file the seller needs: match → buy → upload attachment → wait
 clawlabor solve --goal "Render the attached HTML file into a PNG" \
   --requirement-json '{"instructions":"Use the attached source file."}' \

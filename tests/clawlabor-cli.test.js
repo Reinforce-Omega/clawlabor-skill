@@ -2071,6 +2071,17 @@ test("solve returns wait action instead of blocking indefinitely", async () => {
   assert.equal(result.status, "in_progress");
   assert.equal(result.wait_seconds, 300);
   assert.equal(result.resume_command, "clawlabor solve --resume-order order-wait");
+  assert.deepEqual(result.next_action, {
+    type: "wait",
+    terminal: false,
+    reason: "seller_is_working",
+    wait_seconds: 300,
+    check_after: "1970-01-01T00:05:01.000Z",
+    command: "clawlabor solve --resume-order order-wait",
+  });
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.duplicate_purchase_risk, true);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order order-wait");
 });
 
 test("solve --resume-order returns needs_buyer_response for seller message", async () => {
@@ -2114,6 +2125,15 @@ test("solve --resume-order returns needs_buyer_response for seller message", asy
   assert.equal(result.latest_message.id, "msg-1");
   assert.equal(result.next_command, "clawlabor message --order order-msg --content <reply>");
   assert.equal(result.resume_command, "clawlabor solve --resume-order order-msg");
+  assert.deepEqual(result.next_action, {
+    type: "reply",
+    terminal: false,
+    decision_required: true,
+    command: "clawlabor message --order order-msg --content <reply>",
+    after_command: "clawlabor solve --resume-order order-msg",
+  });
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order order-msg");
 });
 
 test("solve --resume-order returns wait when no counterparty message is pending", async () => {
@@ -2148,6 +2168,16 @@ test("solve --resume-order returns wait when no counterparty message is pending"
   assert.equal(result.status, "pending_accept");
   assert.equal(result.wait_seconds, 60);
   assert.equal(result.check_after, "1970-01-01T00:01:00.000Z");
+  assert.deepEqual(result.next_action, {
+    type: "wait",
+    terminal: false,
+    reason: "waiting_for_seller_state_change",
+    wait_seconds: 60,
+    check_after: "1970-01-01T00:01:00.000Z",
+    command: "clawlabor solve --resume-order order-idle",
+  });
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order order-idle");
 });
 
 test("solve buys the first schema-compatible allowed listing", async () => {
@@ -3000,6 +3030,10 @@ test("solve with --auto-confirm but low score reports skip_reason and next_actio
   assert.equal(result.auto_confirm.requested, true);
   assert.equal(result.auto_confirm.fired, false);
   assert.equal(result.auto_confirm.skip_reason, "overall_score 0.50 below required 0.80");
+  assert.equal(result.next_action.type, "review_delivery");
+  assert.equal(result.next_action.command, "clawlabor confirm --order ord_2");
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order ord_2");
   assert.ok(
     result.auto_confirm.next_action.includes("clawlabor confirm --order ord_2"),
     `next_action should reference manual confirm: ${result.auto_confirm.next_action}`,
@@ -3041,6 +3075,10 @@ test("solve without --auto-confirm reports auto_confirm.requested=false", async 
   assert.equal(result.auto_confirm.requested, false);
   assert.equal(result.auto_confirm.fired, false);
   assert.equal(result.auto_confirm.skip_reason, null);
+  assert.equal(result.next_action.type, "review_delivery");
+  assert.equal(result.next_action.command, "clawlabor confirm --order ord_3");
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order ord_3");
 });
 
 test("orders --as seller --status pending_accept sends correct query and compacts response", async () => {
