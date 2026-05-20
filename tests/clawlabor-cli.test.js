@@ -1419,6 +1419,53 @@ test("validate calls delivery validation endpoint", async () => {
   assert.equal(calls[0].url, "https://api.example.test/api/orders/order-123/validate-delivery");
 });
 
+test("message sends an order message", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/orders/order-123/messages", {
+      status: 200,
+      body: JSON.stringify({
+        message: { id: "msg-1", content: "Need the missing CSV." },
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["message", "--order", "order-123", "--content", "Need the missing CSV."],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  const result = JSON.parse(out[0]);
+  const body = JSON.parse(calls[0].options.body);
+
+  assert.equal(result.action, "sent");
+  assert.equal(result.entity, "order");
+  assert.equal(body.content, "Need the missing CSV.");
+});
+
+test("message lists task messages", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/tasks/task-123/messages?limit=2", {
+      status: 200,
+      body: JSON.stringify({
+        data: [
+          { id: "msg-1", content: "First" },
+          { id: "msg-2", content: "Second" },
+        ],
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["message", "--task", "task-123", "--limit", "2"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  const result = JSON.parse(out[0]);
+
+  assert.equal(calls[0].url, "https://api.example.test/api/tasks/task-123/messages?limit=2");
+  assert.equal(result.entity, "task");
+  assert.equal(result.count, 2);
+  assert.equal(result.messages[1].content, "Second");
+});
+
 // ---------------------------------------------------------------------------
 // new commands
 // ---------------------------------------------------------------------------
@@ -2488,19 +2535,17 @@ test("skill contract gives buyer guidance for insufficient credits", () => {
   assert.match(skill, /lower `--max-price`/);
 });
 
-test("skill contract gives agents marketplace message templates for blockers", () => {
+test("skill contract points agents to the message CLI without prescribing copy", () => {
   const skill = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
   const workflow = fs.readFileSync(path.join(__dirname, "..", "WORKFLOW.md"), "utf8");
 
   assert.match(skill, /### Marketplace messages/);
-  assert.match(skill, /Clarify missing input before accepting/);
-  assert.match(skill, /Attachment cannot be opened/);
-  assert.match(skill, /Unsandboxable high-risk input/);
-  assert.match(skill, /Deadline risk or delay/);
-  assert.match(skill, /Dispute evidence/);
-  assert.match(skill, /POST "\$CLAWLABOR_API_BASE\/orders\/<order_id>\/messages"/);
-  assert.match(workflow, /Classify the message before replying/);
-  assert.match(workflow, /Marketplace messages for full copy-ready templates/);
+  assert.match(skill, /clawlabor message --order <order_id>/);
+  assert.match(skill, /clawlabor message --task <task_id>/);
+  assert.doesNotMatch(skill, /Use these message templates/);
+  assert.doesNotMatch(skill, /Clarify missing input before accepting/);
+  assert.match(workflow, /clawlabor message --order <order_id> --content/);
+  assert.match(workflow, /Raw fallback: `POST \/orders\/\{order_id\}\/messages`/);
 });
 
 // ---------------------------------------------------------------------------
