@@ -2475,17 +2475,16 @@ test("skill contract tells agents to discover marketplace capabilities before lo
   assert.match(skill, /Discovery-first trigger/);
   assert.match(skill, /marketplace is the source of truth/);
   assert.match(skill, /do not rely on this skill file to enumerate/);
-  assert.match(skill, /clawlabor plan --goal "<describe the user's requested deliverable>"/);
+  assert.match(skill, /clawlabor plan --goal "<requested deliverable>"/);
   assert.match(skill, /omit `--category`/);
 });
 
 test("skill contract gives buyer guidance for insufficient credits", () => {
   const skill = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
 
-  assert.match(skill, /Buyer Credit Shortage/);
   assert.match(skill, /insufficient_credits/);
-  assert.match(skill, /Do not retry the same purchase/);
-  assert.match(skill, /clawlabor me/);
+  assert.match(skill, /Do not retry the same `buy` \/ `solve` \/ `post`/);
+  assert.match(skill, /clawlabor status --self/);
   assert.match(skill, /lower `--max-price`/);
 });
 
@@ -2878,4 +2877,257 @@ test("solve without --auto-confirm reports auto_confirm.requested=false", async 
   assert.equal(result.auto_confirm.requested, false);
   assert.equal(result.auto_confirm.fired, false);
   assert.equal(result.auto_confirm.skip_reason, null);
+});
+
+test("orders --as seller --status pending_accept sends correct query and compacts response", async () => {
+  const { commandOrders } = require("../runtime/commands/command-orders");
+
+  const requestedUrls = [];
+  const fakeFetch = async (url) => {
+    requestedUrls.push(url);
+    return {
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          orders: [
+            {
+              id: "ord_1",
+              status: "pending_accept",
+              role: "seller",
+              listing_title: "URL Ingestion",
+              price: 3,
+              buyer: { id: "ag_buy", name: "BuyerBot" },
+              created_at: "2026-05-20T10:00:00Z",
+              updated_at: "2026-05-20T10:00:30Z",
+              extra_field: "should_be_dropped_when_compact",
+            },
+          ],
+          pagination: { page: 1, limit: 20, total: 1, totalPages: 1 },
+        }),
+    };
+  };
+  const deps = {
+    env: { CLAWLABOR_API_KEY: "test-key", CLAWLABOR_API_BASE: "https://api.test/api" },
+    fetch: fakeFetch,
+  };
+
+  const out = await commandOrders(
+    { as: "seller", status: "pending_accept", limit: 5 },
+    deps,
+  );
+  const parsed = JSON.parse(out);
+
+  assert.equal(requestedUrls.length, 1);
+  assert.ok(requestedUrls[0].includes("/orders?"));
+  assert.ok(requestedUrls[0].includes("role=seller"));
+  assert.ok(requestedUrls[0].includes("status=pending_accept"));
+  assert.ok(requestedUrls[0].includes("limit=5"));
+  assert.equal(parsed.count, 1);
+  assert.equal(parsed.filter.as, "seller");
+  assert.equal(parsed.orders[0].id, "ord_1");
+  assert.equal(parsed.orders[0].counterparty.name, "BuyerBot");
+  assert.equal(parsed.orders[0].extra_field, undefined, "compact form drops extras");
+});
+
+test("orders --raw returns full payload without compacting", async () => {
+  const { commandOrders } = require("../runtime/commands/command-orders");
+  const fakeFetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () =>
+      JSON.stringify({
+        orders: [{ id: "ord_2", extra: "kept" }],
+        pagination: { page: 1, limit: 20, total: 1, totalPages: 1 },
+      }),
+  });
+  const deps = {
+    env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" },
+    fetch: fakeFetch,
+  };
+  const parsed = JSON.parse(await commandOrders({ raw: true }, deps));
+  assert.equal(parsed.orders[0].extra, "kept");
+});
+
+test("orders --since filters by updated_at cutoff", async () => {
+  const { commandOrders } = require("../runtime/commands/command-orders");
+  const now = Date.now();
+  const fakeFetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () =>
+      JSON.stringify({
+        orders: [
+          { id: "fresh", updated_at: new Date(now - 60 * 1000).toISOString() },
+          { id: "stale", updated_at: new Date(now - 7200 * 1000).toISOString() },
+        ],
+        pagination: {},
+      }),
+  });
+  const deps = {
+    env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" },
+    fetch: fakeFetch,
+  };
+  const parsed = JSON.parse(await commandOrders({ since: "30m" }, deps));
+  assert.equal(parsed.count, 1);
+  assert.equal(parsed.orders[0].id, "fresh");
+});
+
+test("orders rejects invalid --as value", async () => {
+  const { commandOrders } = require("../runtime/commands/command-orders");
+  const deps = { env: {}, fetch: async () => ({ ok: true, status: 200, text: async () => "{}" }) };
+  await assert.rejects(
+    () => commandOrders({ as: "bogus" }, deps),
+    /Unknown --as value/,
+  );
+});
+
+test("serve adapter dispatch: hermes builds chat args with skill and max-turns", () => {
+  const { _internals } = require("../runtime/commands/runtime");
+  const args = _internals.ADAPTERS.hermes.buildArgs("ORDER-PROMPT", {
+    "max-turns": 30,
+    model: "minimax/minimax-m2.7",
+    env: {},
+  });
+  assert.equal(args[0], "chat");
+  assert.equal(args[1], "-q");
+  assert.equal(args[2], "ORDER-PROMPT");
+  assert.ok(args.includes("--ignore-rules"));
+  assert.ok(args.includes("clawlabor"));
+  assert.ok(args.includes("30"));
+  assert.ok(args.includes("--model"));
+  assert.ok(args.includes("minimax/minimax-m2.7"));
+});
+
+test("serve adapter dispatch: claude builds -p with permission bypass by default", () => {
+  const { _internals } = require("../runtime/commands/runtime");
+  const args = _internals.ADAPTERS.claude.buildArgs("ORDER-PROMPT", { env: {} });
+  assert.equal(args[0], "-p");
+  assert.equal(args[1], "ORDER-PROMPT");
+  assert.ok(
+    args.includes("--dangerously-skip-permissions"),
+    "claude adapter must bypass permissions for unattended serve",
+  );
+});
+
+test("serve adapter dispatch: claude respects CLAWLABOR_SERVE_NO_BYPASS=1", () => {
+  const { _internals } = require("../runtime/commands/runtime");
+  const args = _internals.ADAPTERS.claude.buildArgs("ORDER-PROMPT", {
+    env: { CLAWLABOR_SERVE_NO_BYPASS: "1" },
+  });
+  assert.ok(!args.includes("--dangerously-skip-permissions"));
+});
+
+test("serve adapter dispatch: codex uses exec subcommand", () => {
+  const { _internals } = require("../runtime/commands/runtime");
+  const args = _internals.ADAPTERS.codex.buildArgs("ORDER-PROMPT", {
+    model: "gpt-5",
+    sandbox: "workspace-write",
+    env: {},
+  });
+  assert.equal(args[0], "exec");
+  assert.equal(args[1], "ORDER-PROMPT");
+  assert.ok(args.includes("--model"));
+  assert.ok(args.includes("gpt-5"));
+  assert.ok(args.includes("--sandbox"));
+  assert.ok(args.includes("workspace-write"));
+});
+
+test("serve adapter dispatch: resolveAdapterCommand honors --adapter-command override", () => {
+  const { _internals } = require("../runtime/commands/runtime");
+  assert.equal(_internals.resolveAdapterCommand("hermes", {}), "hermes");
+  assert.equal(_internals.resolveAdapterCommand("claude", {}), "claude");
+  assert.equal(_internals.resolveAdapterCommand("codex", {}), "codex");
+  assert.equal(
+    _internals.resolveAdapterCommand("hermes", { "adapter-command": "/custom/hermes" }),
+    "/custom/hermes",
+  );
+  // back-compat: legacy --hermes-command still works
+  assert.equal(
+    _internals.resolveAdapterCommand("hermes", { "hermes-command": "/legacy/hermes" }),
+    "/legacy/hermes",
+  );
+});
+
+test("serve rejects unknown adapter with a list of supported ones", async () => {
+  const { serveOnce } = require("../runtime/commands/runtime");
+  const deps = { env: {}, fetch: async () => ({ ok: true, status: 200, text: async () => "{}" }) };
+  await assert.rejects(
+    () => serveOnce({ adapter: "bogus" }, deps),
+    /adapter "bogus" is not supported.*hermes.*claude.*codex/,
+  );
+});
+
+test("serve seller prompt embeds session id and order json", () => {
+  const { _internals } = require("../runtime/commands/runtime");
+  const prompt = _internals.buildSellerPrompt("session-XYZ", { id: "ord_1", status: "in_progress" });
+  assert.ok(prompt.includes("session-XYZ"));
+  assert.ok(prompt.includes('"id": "ord_1"'));
+  assert.ok(prompt.includes("Do not invent requirements"));
+});
+
+test("status --self returns agent profile, balance, online state, and session counts", async () => {
+  const { commandStatus } = require("../runtime/commands/command-status");
+
+  const fakeFetch = async (url) => {
+    assert.ok(url.endsWith("/agents/me"), `unexpected URL ${url}`);
+    return {
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          id: "uuid-1",
+          agent_id: "agent_abc",
+          name: "TestAgent",
+          owner_email: "test@example.com",
+          balance: "123.45",
+          frozen: "10.00",
+          is_online: true,
+          webhook_url: "https://example.com/hook",
+          tasks_completed: 7,
+          tasks_confirmed: 6,
+          response_success_count: 5,
+          response_timeout_count: 1,
+          last_heartbeat_at: "2026-05-20T12:00:00Z",
+        }),
+    };
+  };
+  const deps = {
+    env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" },
+    fetch: fakeFetch,
+  };
+  const flags = new Set(["self"]);
+  const out = await commandStatus({}, deps, flags);
+  const parsed = JSON.parse(out);
+
+  assert.equal(parsed.agent.name, "TestAgent");
+  assert.equal(parsed.agent.agent_id, "agent_abc");
+  assert.equal(parsed.balance, "123.45");
+  assert.equal(parsed.is_online, true);
+  assert.equal(parsed.webhook_url, "https://example.com/hook");
+  assert.equal(parsed.tasks_completed, 7);
+  // sessions may be null when no local session root exists; presence of the field is enough
+  assert.ok("sessions" in parsed);
+});
+
+test("status --self rejects combining with --order or --task", async () => {
+  const { commandStatus } = require("../runtime/commands/command-status");
+  const deps = { env: {}, fetch: async () => ({ ok: true, status: 200, text: async () => "{}" }) };
+  await assert.rejects(
+    () => commandStatus({ order: "abc" }, deps, new Set(["self"])),
+    /--self alone/,
+  );
+  await assert.rejects(
+    () => commandStatus({ task: "xyz" }, deps, new Set(["self"])),
+    /--self alone/,
+  );
+});
+
+test("status without --self still requires --order or --task", async () => {
+  const { commandStatus } = require("../runtime/commands/command-status");
+  const deps = { env: {}, fetch: async () => ({ ok: true, status: 200, text: async () => "{}" }) };
+  await assert.rejects(
+    () => commandStatus({}, deps, new Set()),
+    /Missing required --order or --task/,
+  );
 });

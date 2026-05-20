@@ -14,6 +14,7 @@ const { commandInspect } = require("./command-inspect");
 const { commandListAttachments } = require("./command-list-attachments");
 const { commandMatch } = require("./command-match");
 const { commandMe } = require("./command-me");
+const { commandOrders } = require("./command-orders");
 const { commandPlan } = require("./command-plan");
 const { commandPost } = require("./command-post");
 const { commandProfile } = require("./command-profile");
@@ -44,6 +45,7 @@ module.exports = {
   commandMatch,
   commandMe,
   commandOnline,
+  commandOrders,
   commandPlan,
   commandPost,
   commandProfile,

@@ -351,6 +351,8 @@ async function commandOnline(options, deps, flags = new Set()) {
 
   const output = {
     action: "online",
+    status: "ready",
+    started_at: new Date().toISOString(),
     receiver_url: localUrl,
     inbox_file: inboxFile,
     session_root: sessionRoot,
@@ -360,9 +362,16 @@ async function commandOnline(options, deps, flags = new Set()) {
     webhook_secret: webhookSecret,
     tunnel_command: tunnelCommand || null,
     heartbeat_ok: heartbeatOk,
+    heartbeat_interval_seconds: Math.floor(heartbeatIntervalMs / 1000),
     next: "Keep this process alive; incoming webhooks will be written to global and session inboxes. Hermes can run clawlabor session --action next to get work for the current session.",
   };
 
+  const stderr = deps.stderr || ((text) => process.stderr.write(`${text}\n`));
+  stderr(
+    `[clawlabor online] ready webhook=${resolvedWebhookUrl || "(local-only)"} ` +
+      `listen=${host}:${port} session=${currentSessionId} ` +
+      `heartbeat_ok=${heartbeatOk} interval=${Math.floor(heartbeatIntervalMs / 1000)}s`,
+  );
   deps.stdout(JSON.stringify(output));
 
   const exitPromise =
@@ -482,9 +491,109 @@ async function commandSession(options, deps) {
   throw new Error("--action must be one of: list, show, prompt, next, ack");
 }
 
-async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, order, options }) {
+const SELLER_PROMPT_HEADER = [
+  "You are the seller agent for an isolated ClawLabor order session.",
+  "Fulfill exactly this order, and do not mix it with other orders or sessions.",
+  "Follow the ClawLabor skill instructions already loaded in this runtime for marketplace conduct and delivery quality.",
+  "Use the SKU/listing description, input schema, buyer requirement, messages, and attachments as the contract.",
+  "Use the order details, messages, and attachments to decide what to do next.",
+  "Do not invent requirements beyond the SKU description and buyer requirement.",
+];
+
+function buildSellerPrompt(sessionId, orderForAdapter) {
+  return [
+    SELLER_PROMPT_HEADER[0].replace(
+      "for an isolated ClawLabor order session.",
+      `for isolated ClawLabor order session ${sessionId}.`,
+    ),
+    ...SELLER_PROMPT_HEADER.slice(1),
+    "",
+    "Order:",
+    JSON.stringify(orderForAdapter, null, 2),
+  ].join("\n");
+}
+
+const ADAPTERS = {
+  hermes: {
+    defaultCommand: "hermes",
+    buildArgs(prompt, options) {
+      const args = [
+        "chat",
+        "-q",
+        prompt,
+        "--ignore-rules",
+        "--skills",
+        options.skills || "clawlabor",
+        "--max-turns",
+        String(positiveNumberOption(options, "max-turns") || 20),
+        "-Q",
+        "--source",
+        "tool",
+      ];
+      if (options.model) args.push("--model", options.model);
+      if (options.provider) args.push("--provider", options.provider);
+      return args;
+    },
+  },
+  claude: {
+    defaultCommand: "claude",
+    buildArgs(prompt, options) {
+      // -p / --print: non-interactive; --dangerously-skip-permissions: seller
+      // adapter must run unattended. Opt out via CLAWLABOR_SERVE_NO_BYPASS=1.
+      const args = ["-p", prompt];
+      const noBypass =
+        options["no-permission-bypass"] ||
+        (options.env || {}).CLAWLABOR_SERVE_NO_BYPASS === "1";
+      if (!noBypass) args.push("--dangerously-skip-permissions");
+      if (options.model) args.push("--model", options.model);
+      if (options["append-system-prompt"]) {
+        args.push("--append-system-prompt", options["append-system-prompt"]);
+      }
+      return args;
+    },
+  },
+  codex: {
+    defaultCommand: "codex",
+    buildArgs(prompt, options) {
+      // `codex exec` is the non-interactive entry point. Sandbox stays at the
+      // user's codex default; let the operator override via --sandbox.
+      const args = ["exec", prompt];
+      if (options.model) args.push("--model", options.model);
+      if (options.sandbox) args.push("--sandbox", options.sandbox);
+      return args;
+    },
+  },
+};
+
+const ADAPTER_NAMES = Object.keys(ADAPTERS);
+
+function resolveAdapterCommand(adapter, options) {
+  // Per-adapter override (legacy: --hermes-command). Generic: --adapter-command.
+  const legacyKey = `${adapter}-command`;
+  return (
+    options["adapter-command"] ||
+    options[legacyKey] ||
+    ADAPTERS[adapter].defaultCommand
+  );
+}
+
+async function runAdapterForOrderSession({
+  deps,
+  adapter,
+  sessionRoot,
+  sessionId,
+  event,
+  order,
+  options,
+}) {
+  const spec = ADAPTERS[adapter];
+  if (!spec) {
+    throw new Error(
+      `--adapter "${adapter}" is not supported. Available: ${ADAPTER_NAMES.join(", ")}.`,
+    );
+  }
   const eventPayload = event?.payload || {};
-  const orderForHermes = {
+  const orderForAdapter = {
     ...order,
     requirement: order?.requirement || eventPayload.requirement || null,
     input_schema: order?.input_schema || eventPayload.input_schema || null,
@@ -492,46 +601,17 @@ async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, o
     endpoint_capability: order?.endpoint_capability || eventPayload.endpoint_capability || null,
     event_payload: eventPayload,
   };
-  const prompt = [
-    `You are the seller agent for isolated ClawLabor order session ${sessionId}.`,
-    "Fulfill exactly this order, and do not mix it with other orders or sessions.",
-    "Follow the ClawLabor skill instructions already loaded in this runtime for marketplace conduct and delivery quality.",
-    "Use the SKU/listing description, input schema, buyer requirement, messages, and attachments as the contract.",
-    "Use the order details, messages, and attachments to decide what to do next.",
-    "Do not invent requirements beyond the SKU description and buyer requirement.",
-    "",
-    "Order:",
-    JSON.stringify(orderForHermes, null, 2),
-  ].join("\n");
-  const hermesCommand = options["hermes-command"] || "hermes";
-  const maxTurns = String(positiveNumberOption(options, "max-turns") || 20);
-  const skills = options.skills || "clawlabor";
+  const prompt = buildSellerPrompt(sessionId, orderForAdapter);
+  const command = resolveAdapterCommand(adapter, options);
+  const args = spec.buildArgs(prompt, { ...options, env: deps.env });
   const cwd = options.cwd || deps.env.CLAWLABOR_SERVE_CWD || process.cwd();
-  const args = [
-    "chat",
-    "-q",
-    prompt,
-    "--ignore-rules",
-    "--skills",
-    skills,
-    "--max-turns",
-    maxTurns,
-    "-Q",
-    "--source",
-    "tool",
-  ];
-  if (options.model) {
-    args.push("--model", options.model);
-  }
-  if (options.provider) {
-    args.push("--provider", options.provider);
-  }
-  const result = await spawnCapture(deps, hermesCommand, args, {
+  const result = await spawnCapture(deps, command, args, {
     cwd,
     env: {
       ...deps.env,
       CLAWLABOR_SESSION_ROOT: sessionRoot,
       CLAWLABOR_SESSION_ID: sessionId,
+      CLAWLABOR_SERVE_ADAPTER: adapter,
     },
   });
   return {
@@ -540,7 +620,7 @@ async function runHermesForOrderSession({ deps, sessionRoot, sessionId, event, o
   };
 }
 
-async function processSellerOrderSession({ deps, sessionRoot, session, event, options }) {
+async function processSellerOrderSession({ deps, adapter, sessionRoot, session, event, options }) {
   const orderId = event?.payload?.order_id || session.context_id;
   if (!orderId) {
     throw new Error(`Session ${session.session_id} has no order_id`);
@@ -554,8 +634,9 @@ async function processSellerOrderSession({ deps, sessionRoot, session, event, op
 
   const refreshedDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
   const refreshedOrder = refreshedDetail.order || refreshedDetail;
-  await runHermesForOrderSession({
+  await runAdapterForOrderSession({
     deps,
+    adapter,
     sessionRoot,
     sessionId: session.session_id,
     event,
@@ -574,8 +655,10 @@ async function processSellerOrderSession({ deps, sessionRoot, session, event, op
 
 async function serveOnce(options, deps) {
   const adapter = options.adapter || "hermes";
-  if (adapter !== "hermes") {
-    throw new Error("--adapter currently supports: hermes");
+  if (!ADAPTERS[adapter]) {
+    throw new Error(
+      `--adapter "${adapter}" is not supported. Available: ${ADAPTER_NAMES.join(", ")}.`,
+    );
   }
   const sessionRoot = options["session-root"] || defaultSessionRoot(deps.env);
   const state = readSessionState(sessionRoot);
@@ -592,7 +675,7 @@ async function serveOnce(options, deps) {
       );
     if (!event) continue;
     try {
-      processed.push(await processSellerOrderSession({ deps, sessionRoot, session, event, options }));
+      processed.push(await processSellerOrderSession({ deps, adapter, sessionRoot, session, event, options }));
     } catch (err) {
       errors.push({
         session_id: session.session_id,
@@ -622,8 +705,15 @@ async function commandServe(options, deps, flags) {
     return JSON.stringify(output);
   }
 
+  const stderr = deps.stderr || ((text) => process.stderr.write(`${text}\n`));
+  stderr(
+    `[clawlabor serve] ready adapter=${output.adapter} ` +
+      `session_root=${output.session_root} poll=${pollInterval}s`,
+  );
   deps.stdout(JSON.stringify({
     action: "serve",
+    status: "ready",
+    started_at: new Date().toISOString(),
     adapter: output.adapter,
     session_root: output.session_root,
     poll_interval: pollInterval,
@@ -658,4 +748,11 @@ module.exports = {
   commandServe,
   commandSession,
   serveOnce,
+  // exposed for testing
+  _internals: {
+    ADAPTERS,
+    ADAPTER_NAMES,
+    buildSellerPrompt,
+    resolveAdapterCommand,
+  },
 };
