@@ -42,7 +42,235 @@ const {
 } = require("./shared");
 const { commandWait } = require("./command-wait");
 
+function waitSecondsForStatus(status, options) {
+  const explicit = positiveNumberOption(options, "wait-seconds");
+  if (explicit) return explicit;
+  if (status === "pending_accept" || status === "pending_acceptance" || status === "created") return 60;
+  if (status === "in_progress") return 300;
+  return 120;
+}
+
+function checkAfterIso(deps, waitSeconds) {
+  return new Date(deps.now() + (waitSeconds * 1000)).toISOString();
+}
+
+function resumeCommand(orderId) {
+  return `clawlabor solve --resume-order ${orderId}`;
+}
+
+function terminalNextAction(action) {
+  return {
+    type: "terminal",
+    terminal: true,
+    action,
+    command: null,
+  };
+}
+
+function waitNextAction(orderId, waitSeconds, checkAfter, reason) {
+  return {
+    type: "wait",
+    terminal: false,
+    reason,
+    wait_seconds: waitSeconds,
+    check_after: checkAfter,
+    command: resumeCommand(orderId),
+  };
+}
+
+function replyNextAction(orderId) {
+  return {
+    type: "reply",
+    terminal: false,
+    decision_required: true,
+    command: `clawlabor message --order ${orderId} --content <reply>`,
+    after_command: resumeCommand(orderId),
+  };
+}
+
+function reviewDeliveryNextAction(orderId) {
+  return {
+    type: "review_delivery",
+    terminal: false,
+    decision_required: true,
+    command: `clawlabor confirm --order ${orderId}`,
+    when: "delivery_acceptable",
+    otherwise: `Do not confirm; keep the order pending while you decide the correct buyer action for order ${orderId}.`,
+  };
+}
+
+function openOrderRetryPolicy(orderId) {
+  return {
+    initial_solve_repeat_safe: false,
+    duplicate_purchase_risk: true,
+    resume_command: resumeCommand(orderId),
+    rule: "Once solve returns an order_id, do not run the original solve --goal command again for this purchase; use resume_command or next_action.command.",
+  };
+}
+
+async function fetchOrderMessages(deps, orderId) {
+  const detail = await requestJson(deps, "GET", `/orders/${orderId}/messages?limit=20`);
+  return Array.isArray(detail?.messages)
+    ? detail.messages
+    : Array.isArray(detail?.data)
+      ? detail.data
+      : [];
+}
+
+async function currentAgentId(deps) {
+  const me = await requestJson(deps, "GET", "/agents/me");
+  return me?.id || me?.agent?.id || me?.agent_id || me?.agent?.agent_id || null;
+}
+
+async function latestCounterpartyMessage(deps, orderId) {
+  const [messages, selfId] = await Promise.all([
+    fetchOrderMessages(deps, orderId),
+    currentAgentId(deps),
+  ]);
+  const latest = [...messages].reverse().find((message) => {
+    const senderId = message?.sender_id || message?.sender?.id || null;
+    return senderId && senderId !== selfId;
+  });
+  return latest || null;
+}
+
+async function deliveredResult(orderId, listingId, options, deps, flags, trace) {
+  const validation = await requestJson(deps, "POST", `/orders/${orderId}/validate-delivery`, {
+    body: {},
+  });
+  trace.push({
+    step: "validate",
+    verdict: validation?.verdict,
+    can_auto_confirm: validation?.can_auto_confirm,
+  });
+
+  const autoConfirmRequested = flags.has("auto-confirm");
+  let confirmed = null;
+  if (autoConfirmRequested && validation?.can_auto_confirm) {
+    confirmed = await requestJson(deps, "POST", `/orders/${orderId}/confirm`, { body: {} });
+    trace.push({ step: "confirm", order_id: orderId });
+  }
+
+  const orderDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
+  const order = orderDetail.order || orderDetail;
+  const delivery = parseDeliveryNote(order?.delivery_note);
+  const attachments = await fetchOrderAttachments(deps, orderId);
+
+  const autoConfirm = {
+    requested: autoConfirmRequested,
+    fired: Boolean(confirmed),
+    policy: validation?.auto_confirm_policy || null,
+    skip_reason:
+      autoConfirmRequested && !confirmed
+        ? validation?.auto_confirm_skip_reason || "validation response did not permit auto-confirm"
+        : null,
+    next_action:
+      autoConfirmRequested && !confirmed
+        ? `Review delivery, then run: clawlabor confirm --order ${orderId}`
+        : null,
+  };
+
+  return {
+    action: confirmed ? "completed" : "delivered",
+    order_id: orderId,
+    listing_id: listingId || order?.service_sku_id || null,
+    validation,
+    delivery_format: delivery.format,
+    delivery: delivery.value,
+    delivery_attestation: order?.delivery_attestation || null,
+    attachments,
+    auto_confirmed: Boolean(confirmed),
+    auto_confirm: autoConfirm,
+    decision_required: !confirmed,
+    next_command: confirmed ? null : `clawlabor confirm --order ${orderId}`,
+    next_action: confirmed ? terminalNextAction("completed") : reviewDeliveryNextAction(orderId),
+    retry_policy: confirmed ? null : openOrderRetryPolicy(orderId),
+    resume_command: resumeCommand(orderId),
+    trace,
+  };
+}
+
+async function observeOrder(orderId, options, deps, flags, trace = [], listingId = null) {
+  const detail = await requestJson(deps, "GET", `/orders/${orderId}`);
+  const order = detail.order || detail;
+  const status = order?.status || null;
+  trace.push({ step: "observe", order_id: orderId, status });
+
+  if (status === "cancelled") {
+    const cancellationContext = !order?.cancel_reason
+      ? await fetchOrderCancellationContext(deps, orderId)
+      : null;
+    return {
+      action: "cancelled",
+      order_id: orderId,
+      status,
+      cancel_reason: order?.cancel_reason || null,
+      cancellation_context: cancellationContext,
+      terminal: true,
+      next_action: terminalNextAction("cancelled"),
+      trace,
+    };
+  }
+
+  if (status === "completed" || order?.confirmed_at) {
+    return {
+      action: "confirmed",
+      order_id: orderId,
+      status: "completed",
+      terminal: true,
+      next_action: terminalNextAction("confirmed"),
+      trace,
+    };
+  }
+
+  if (status === "pending_confirmation") {
+    return deliveredResult(orderId, listingId, options, deps, flags, trace);
+  }
+
+  const latestMessage = await latestCounterpartyMessage(deps, orderId);
+  if (latestMessage) {
+    return {
+      action: "needs_buyer_response",
+      order_id: orderId,
+      status,
+      latest_message: latestMessage,
+      next_command: `clawlabor message --order ${orderId} --content <reply>`,
+      next_action: replyNextAction(orderId),
+      retry_policy: openOrderRetryPolicy(orderId),
+      resume_command: resumeCommand(orderId),
+      decision_required: true,
+      trace,
+    };
+  }
+
+  const waitSeconds = waitSecondsForStatus(status, options);
+  const reason = status === "in_progress"
+    ? "seller_is_working"
+    : "waiting_for_seller_state_change";
+  const checkAfter = checkAfterIso(deps, waitSeconds);
+  return {
+    action: "wait",
+    order_id: orderId,
+    status,
+    reason,
+    wait_seconds: waitSeconds,
+    check_after: checkAfter,
+    resume_command: resumeCommand(orderId),
+    next_action: waitNextAction(orderId, waitSeconds, checkAfter, reason),
+    retry_policy: openOrderRetryPolicy(orderId),
+    deadline: {
+      accept_deadline: order?.accept_deadline || null,
+      confirm_deadline: order?.confirm_deadline || null,
+    },
+    trace,
+  };
+}
+
 async function commandSolve(options, deps, flags) {
+  if (options["resume-order"]) {
+    return JSON.stringify(await observeOrder(options["resume-order"], options, deps, flags));
+  }
+
   const goal = requiredOption(options, "goal");
   const trace = [];
   const requirement = (options["requirement-json"] || options["requirement-file"])
@@ -164,73 +392,51 @@ async function commandSolve(options, deps, flags) {
     });
   }
 
-  // 4. wait until pending_confirmation
+  // 4. wait briefly until pending_confirmation; return action=wait when seller is still working
   const waitOutput = await commandWait(
-    { ...options, order: orderId, until: "pending_confirmation" },
+    {
+      ...options,
+      order: orderId,
+      until: "pending_confirmation",
+      timeout: options.timeout ?? "30",
+    },
     deps,
   );
   const waitResult = JSON.parse(waitOutput);
   trace.push({ step: "wait", ...waitResult });
   if (!waitResult.reached) {
+    if (waitResult.status === "cancelled") {
+      return JSON.stringify({
+        action: "cancelled",
+        order_id: orderId,
+        status: waitResult.status,
+        cancel_reason: waitResult.cancel_reason || null,
+        cancellation_context: waitResult.cancellation_context || null,
+        terminal: true,
+        next_action: terminalNextAction("cancelled"),
+        trace,
+      });
+    }
+    const waitSeconds = waitSecondsForStatus(waitResult.status, options);
+    const reason = waitResult.status === "in_progress"
+      ? "seller_is_working"
+      : waitResult.reason || "waiting_for_seller_state_change";
+    const checkAfter = checkAfterIso(deps, waitSeconds);
     return JSON.stringify({
-      action: "waiting",
+      action: "wait",
       order_id: orderId,
-      reason: waitResult.reason,
+      status: waitResult.status,
+      reason,
+      wait_seconds: waitSeconds,
+      check_after: checkAfter,
+      resume_command: resumeCommand(orderId),
+      next_action: waitNextAction(orderId, waitSeconds, checkAfter, reason),
+      retry_policy: openOrderRetryPolicy(orderId),
       trace,
     });
   }
 
-  // 5. validate
-  const validation = await requestJson(deps, "POST", `/orders/${orderId}/validate-delivery`, {
-    body: {},
-  });
-  trace.push({
-    step: "validate",
-    verdict: validation?.verdict,
-    can_auto_confirm: validation?.can_auto_confirm,
-  });
-
-  // 6. optionally confirm
-  const autoConfirmRequested = flags.has("auto-confirm");
-  let confirmed = null;
-  if (autoConfirmRequested && validation?.can_auto_confirm) {
-    confirmed = await requestJson(deps, "POST", `/orders/${orderId}/confirm`, { body: {} });
-    trace.push({ step: "confirm", order_id: orderId });
-  }
-
-  // 7. fetch result
-  const orderDetail = await requestJson(deps, "GET", `/orders/${orderId}`);
-  const order = orderDetail.order || orderDetail;
-  const delivery = parseDeliveryNote(order?.delivery_note);
-  const attachments = await fetchOrderAttachments(deps, orderId);
-
-  const autoConfirm = {
-    requested: autoConfirmRequested,
-    fired: Boolean(confirmed),
-    policy: validation?.auto_confirm_policy || null,
-    skip_reason:
-      autoConfirmRequested && !confirmed
-        ? validation?.auto_confirm_skip_reason || "validation response did not permit auto-confirm"
-        : null,
-    next_action:
-      autoConfirmRequested && !confirmed
-        ? `Review delivery, then run: clawlabor confirm --order ${orderId}`
-        : null,
-  };
-
-  return JSON.stringify({
-    action: confirmed ? "completed" : "delivered",
-    order_id: orderId,
-    listing_id: selected.id,
-    validation,
-    delivery_format: delivery.format,
-    delivery: delivery.value,
-    delivery_attestation: order?.delivery_attestation || null,
-    attachments,
-    auto_confirmed: Boolean(confirmed),
-    auto_confirm: autoConfirm,
-    trace,
-  });
+  return JSON.stringify(await deliveredResult(orderId, selected.id, options, deps, flags, trace));
 }
 
 module.exports = {

@@ -35,6 +35,7 @@ const {
   commandInspect,
   commandListAttachments,
   commandMatch,
+  commandMessage,
   commandMe,
   commandOrders,
   commandPlan,
@@ -200,7 +201,7 @@ const COMMANDS = {
     handler: commandSolve,
     section: "Procurement",
     summary: "End-to-end: match -> buy -> wait -> validate -> optionally confirm",
-    usage: "solve --goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--auto-confirm] [--allow-bounty --bounty-reward N]",
+    usage: "solve (--goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--auto-confirm] [--allow-bounty --bounty-reward N]) | --resume-order <order_id>",
   },
   stage: {
     handler: commandStage,
@@ -237,6 +238,12 @@ const COMMANDS = {
     section: "Order lifecycle",
     summary: "List my orders, filtered by role/status/recency",
     usage: "orders [--as buyer|seller|all] [--status pending_accept|in_progress|pending_confirmation|completed|cancelled|all] [--since 1h|30m|7d] [--page 1] [--limit 20] [--raw]",
+  },
+  message: {
+    handler: commandMessage,
+    section: "Order lifecycle",
+    summary: "List or send on-platform messages for an order or task",
+    usage: "message (--order <id> | --task <id>) [--content \"...\" | --content-file path] [--limit 20]",
   },
   wait: {
     handler: commandWait,

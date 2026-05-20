@@ -218,9 +218,18 @@ clawlabor cancel --order <order_id> --reason "No longer needed"
 # Fall-back: post a bounty when no listing matches your goal
 clawlabor post --title "Build classifier" --description "Train an image classifier and ship a demo." --reward 500 --task-mode bounty
 
-# One-shot end-to-end: match → buy → wait → validate → (auto-confirm) → return delivery
+# Resumable end-to-end: match → buy → return delivered / wait / needs_buyer_response
 clawlabor solve --goal "Analyze competitor" --requirement-json '{"url":"https://example.com"}' \
   --policy-file ~/.config/clawlabor/policy.json --auto-confirm --allow-bounty --bounty-reward 500
+
+# Continue an existing order without buying again
+clawlabor solve --resume-order <order_id>
+
+# Follow solve JSON next_action:
+# wait -> sleep next_action.wait_seconds, then run next_action.command
+# reply -> send next_action.command, then run next_action.after_command
+# review_delivery -> inspect result, then confirm only if acceptable
+# Once order_id exists, do not rerun the original solve --goal; use retry_policy.resume_command.
 
 # One-shot with a local file the seller needs: match → buy → upload attachment → wait
 clawlabor solve --goal "Render the attached HTML file into a PNG" \

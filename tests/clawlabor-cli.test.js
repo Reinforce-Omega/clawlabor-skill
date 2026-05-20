@@ -754,53 +754,19 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
   );
 
   const calls = [];
-  let orderServeGetCount = 0;
   const fetch = async (url, options = {}) => {
     calls.push({ url, options });
     const method = options.method || "GET";
     if (method === "GET" && url.endsWith("/orders/order-serve-1")) {
-      orderServeGetCount += 1;
-      if (orderServeGetCount === 1) {
-        return {
-          ok: true,
-          status: 200,
-          text: async () => JSON.stringify({
-            order: {
-              id: "order-serve-1",
-              status: "pending_accept",
-            },
-          }),
-        };
-      }
-      if (orderServeGetCount === 2) {
-        return {
-          ok: true,
-          status: 200,
-          text: async () => JSON.stringify({
-            order: {
-              id: "order-serve-1",
-              status: "in_progress",
-            },
-          }),
-        };
-      }
       return {
         ok: true,
         status: 200,
         text: async () => JSON.stringify({
           order: {
             id: "order-serve-1",
-            status: "pending_confirmation",
-            delivery_note: "Delivered as attached artifact(s). See attachments for the full result.",
+            status: "pending_accept",
           },
         }),
-      };
-    }
-    if (method === "POST" && url.endsWith("/orders/order-serve-1/accept")) {
-      return {
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify({ id: "order-serve-1", status: "in_progress" }),
       };
     }
     throw new Error(`No mock route matched ${method} ${url}`);
@@ -843,15 +809,17 @@ test("serve --adapter hermes processes isolated seller order sessions", async ()
   assert.equal(spawnCalls[0][0], "chat");
   const hermesPrompt = spawnCalls[0][spawnCalls[0].indexOf("-q") + 1];
   assert.match(hermesPrompt, /Use the SKU\/listing description, input schema, buyer requirement, messages, and attachments as the contract/);
+  assert.match(hermesPrompt, /The serve wrapper only delivered this event to you/);
   assert.match(hermesPrompt, /Write a JavaScript add function from the event payload/);
   assert.doesNotMatch(hermesPrompt, /code-writing SKU order/);
+  assert.ok(calls.every((call) => !call.url.endsWith("/orders/order-serve-1/accept")));
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(sessionDir, "cursor.json"), "utf8")).last_acked_event_id,
     501,
   );
   const result = JSON.parse(out[0]);
   assert.equal(result.processed[0].order_id, "order-serve-1");
-  assert.equal(result.processed[0].status, "in_progress");
+  assert.equal(result.processed[0].status, "pending_accept");
 });
 
 test("serve --adapter hermes acks seller order after notifying Hermes", async () => {
@@ -1417,6 +1385,53 @@ test("validate calls delivery validation endpoint", async () => {
   ]);
   await runCli(["validate", "--order", "order-123"], { env: BASE_ENV, fetch, stdout: () => {} });
   assert.equal(calls[0].url, "https://api.example.test/api/orders/order-123/validate-delivery");
+});
+
+test("message sends an order message", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/orders/order-123/messages", {
+      status: 200,
+      body: JSON.stringify({
+        message: { id: "msg-1", content: "Need the missing CSV." },
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["message", "--order", "order-123", "--content", "Need the missing CSV."],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  const result = JSON.parse(out[0]);
+  const body = JSON.parse(calls[0].options.body);
+
+  assert.equal(result.action, "sent");
+  assert.equal(result.entity, "order");
+  assert.equal(body.content, "Need the missing CSV.");
+});
+
+test("message lists task messages", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/tasks/task-123/messages?limit=2", {
+      status: 200,
+      body: JSON.stringify({
+        data: [
+          { id: "msg-1", content: "First" },
+          { id: "msg-2", content: "Second" },
+        ],
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["message", "--task", "task-123", "--limit", "2"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  const result = JSON.parse(out[0]);
+
+  assert.equal(calls[0].url, "https://api.example.test/api/tasks/task-123/messages?limit=2");
+  assert.equal(result.entity, "task");
+  assert.equal(result.count, 2);
+  assert.equal(result.messages[1].content, "Second");
 });
 
 // ---------------------------------------------------------------------------
@@ -1999,6 +2014,172 @@ test("solve uploads attachment after purchase before waiting for delivery", asyn
   );
 });
 
+test("solve returns wait action instead of blocking indefinitely", async () => {
+  const routes = [
+    matchRoute("POST", "/listings/match", {
+      status: 200,
+      body: JSON.stringify({
+        matches: [
+          {
+            id: "sku-wait",
+            price: 20,
+            input_schema: { type: "object", required: ["input"] },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+        ],
+      }),
+    }),
+    matchRoute("POST", "/listings/sku-wait/purchase", {
+      status: 201,
+      body: '{"id":"order-wait"}',
+    }),
+    matchRoute("GET", "/orders/order-wait", {
+      status: 200,
+      body: JSON.stringify({ order: { id: "order-wait", status: "in_progress" } }),
+    }),
+  ];
+  const { fetch } = recordingFetch(routes);
+  let nowVal = 0;
+  const out = [];
+  await runCli(
+    [
+      "solve",
+      "--goal",
+      "Long task",
+      "--requirement-json",
+      '{"input":"x"}',
+      "--timeout",
+      "1",
+      "--interval",
+      "1",
+    ],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      makeIdempotencyKey: () => "fixed",
+      sleep: async (ms) => {
+        nowVal += ms;
+      },
+      now: () => nowVal,
+    },
+  );
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "wait");
+  assert.equal(result.order_id, "order-wait");
+  assert.equal(result.status, "in_progress");
+  assert.equal(result.wait_seconds, 300);
+  assert.equal(result.resume_command, "clawlabor solve --resume-order order-wait");
+  assert.deepEqual(result.next_action, {
+    type: "wait",
+    terminal: false,
+    reason: "seller_is_working",
+    wait_seconds: 300,
+    check_after: "1970-01-01T00:05:01.000Z",
+    command: "clawlabor solve --resume-order order-wait",
+  });
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.duplicate_purchase_risk, true);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order order-wait");
+});
+
+test("solve --resume-order returns needs_buyer_response for seller message", async () => {
+  const routes = [
+    matchRoute("GET", "/orders/order-msg", {
+      status: 200,
+      body: JSON.stringify({ order: { id: "order-msg", status: "in_progress" } }),
+    }),
+    matchRoute("GET", "/orders/order-msg/messages?limit=20", {
+      status: 200,
+      body: JSON.stringify({
+        messages: [
+          {
+            id: "msg-1",
+            sender_id: "seller-1",
+            content: "Please clarify the target audience.",
+            created_at: "2026-05-20T10:00:00Z",
+          },
+        ],
+      }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "buyer-1", agent_id: "buyer-agent" }),
+    }),
+  ];
+  const { fetch } = recordingFetch(routes);
+  const out = [];
+  await runCli(
+    ["solve", "--resume-order", "order-msg"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      now: () => 0,
+    },
+  );
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "needs_buyer_response");
+  assert.equal(result.latest_message.id, "msg-1");
+  assert.equal(result.next_command, "clawlabor message --order order-msg --content <reply>");
+  assert.equal(result.resume_command, "clawlabor solve --resume-order order-msg");
+  assert.deepEqual(result.next_action, {
+    type: "reply",
+    terminal: false,
+    decision_required: true,
+    command: "clawlabor message --order order-msg --content <reply>",
+    after_command: "clawlabor solve --resume-order order-msg",
+  });
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order order-msg");
+});
+
+test("solve --resume-order returns wait when no counterparty message is pending", async () => {
+  const routes = [
+    matchRoute("GET", "/orders/order-idle", {
+      status: 200,
+      body: JSON.stringify({ order: { id: "order-idle", status: "pending_accept" } }),
+    }),
+    matchRoute("GET", "/orders/order-idle/messages?limit=20", {
+      status: 200,
+      body: JSON.stringify({ messages: [] }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "buyer-1", agent_id: "buyer-agent" }),
+    }),
+  ];
+  const { fetch } = recordingFetch(routes);
+  const out = [];
+  await runCli(
+    ["solve", "--resume-order", "order-idle"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      now: () => 0,
+    },
+  );
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "wait");
+  assert.equal(result.status, "pending_accept");
+  assert.equal(result.wait_seconds, 60);
+  assert.equal(result.check_after, "1970-01-01T00:01:00.000Z");
+  assert.deepEqual(result.next_action, {
+    type: "wait",
+    terminal: false,
+    reason: "waiting_for_seller_state_change",
+    wait_seconds: 60,
+    check_after: "1970-01-01T00:01:00.000Z",
+    command: "clawlabor solve --resume-order order-idle",
+  });
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order order-idle");
+});
+
 test("solve buys the first schema-compatible allowed listing", async () => {
   const routes = [
     matchRoute("POST", "/listings/match", {
@@ -2488,6 +2669,19 @@ test("skill contract gives buyer guidance for insufficient credits", () => {
   assert.match(skill, /lower `--max-price`/);
 });
 
+test("skill contract points agents to the message CLI without prescribing copy", () => {
+  const skill = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+  const workflow = fs.readFileSync(path.join(__dirname, "..", "WORKFLOW.md"), "utf8");
+
+  assert.match(skill, /### Marketplace messages/);
+  assert.match(skill, /clawlabor message --order <order_id>/);
+  assert.match(skill, /clawlabor message --task <task_id>/);
+  assert.doesNotMatch(skill, /Use these message templates/);
+  assert.doesNotMatch(skill, /Clarify missing input before accepting/);
+  assert.match(workflow, /clawlabor message --order <order_id> --content/);
+  assert.match(workflow, /Raw fallback: `POST \/orders\/\{order_id\}\/messages`/);
+});
+
 // ---------------------------------------------------------------------------
 // --input / --file parsing
 // ---------------------------------------------------------------------------
@@ -2836,6 +3030,10 @@ test("solve with --auto-confirm but low score reports skip_reason and next_actio
   assert.equal(result.auto_confirm.requested, true);
   assert.equal(result.auto_confirm.fired, false);
   assert.equal(result.auto_confirm.skip_reason, "overall_score 0.50 below required 0.80");
+  assert.equal(result.next_action.type, "review_delivery");
+  assert.equal(result.next_action.command, "clawlabor confirm --order ord_2");
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order ord_2");
   assert.ok(
     result.auto_confirm.next_action.includes("clawlabor confirm --order ord_2"),
     `next_action should reference manual confirm: ${result.auto_confirm.next_action}`,
@@ -2877,6 +3075,10 @@ test("solve without --auto-confirm reports auto_confirm.requested=false", async 
   assert.equal(result.auto_confirm.requested, false);
   assert.equal(result.auto_confirm.fired, false);
   assert.equal(result.auto_confirm.skip_reason, null);
+  assert.equal(result.next_action.type, "review_delivery");
+  assert.equal(result.next_action.command, "clawlabor confirm --order ord_3");
+  assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
+  assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order ord_3");
 });
 
 test("orders --as seller --status pending_accept sends correct query and compacts response", async () => {
