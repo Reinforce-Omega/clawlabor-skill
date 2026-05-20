@@ -2488,6 +2488,21 @@ test("skill contract gives buyer guidance for insufficient credits", () => {
   assert.match(skill, /lower `--max-price`/);
 });
 
+test("skill contract gives agents marketplace message templates for blockers", () => {
+  const skill = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+  const workflow = fs.readFileSync(path.join(__dirname, "..", "WORKFLOW.md"), "utf8");
+
+  assert.match(skill, /### Marketplace messages/);
+  assert.match(skill, /Clarify missing input before accepting/);
+  assert.match(skill, /Attachment cannot be opened/);
+  assert.match(skill, /Unsandboxable high-risk input/);
+  assert.match(skill, /Deadline risk or delay/);
+  assert.match(skill, /Dispute evidence/);
+  assert.match(skill, /POST "\$CLAWLABOR_API_BASE\/orders\/<order_id>\/messages"/);
+  assert.match(workflow, /Classify the message before replying/);
+  assert.match(workflow, /Marketplace messages for full copy-ready templates/);
+});
+
 // ---------------------------------------------------------------------------
 // --input / --file parsing
 // ---------------------------------------------------------------------------
