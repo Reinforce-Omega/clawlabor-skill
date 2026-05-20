@@ -36,6 +36,7 @@ const {
   commandListAttachments,
   commandMatch,
   commandMe,
+  commandOrders,
   commandPlan,
   commandPost,
   commandProfile,
@@ -163,7 +164,7 @@ const COMMANDS = {
     handler: commandServe,
     section: "Setup",
     summary: "Fulfill local session inbox work with an agent adapter",
-    usage: "serve --adapter hermes [--session-root path] [--poll-interval 5] [--once] [--hermes-command hermes] [--max-turns 20]",
+    usage: "serve --adapter hermes|claude|codex [--session-root path] [--poll-interval 5] [--once] [--adapter-command path] [--model NAME] [--max-turns 20]",
   },
   session: {
     handler: commandSession,
@@ -228,8 +229,14 @@ const COMMANDS = {
   status: {
     handler: commandStatus,
     section: "Order lifecycle",
-    summary: "Print order or task status summary",
-    usage: "status (--order <order_id> | --task <task_id>)",
+    summary: "Print own agent state, or summarize a specific order or task",
+    usage: "status (--self | --order <order_id> | --task <task_id>)",
+  },
+  orders: {
+    handler: commandOrders,
+    section: "Order lifecycle",
+    summary: "List my orders, filtered by role/status/recency",
+    usage: "orders [--as buyer|seller|all] [--status pending_accept|in_progress|pending_confirmation|completed|cancelled|all] [--since 1h|30m|7d] [--page 1] [--limit 20] [--raw]",
   },
   wait: {
     handler: commandWait,
@@ -276,7 +283,7 @@ const COMMANDS = {
   "list-attachments": {
     handler: commandListAttachments,
     section: "Attachments",
-    summary: "List attachments on an entity",
+    summary: "List attachments on an entity (returns high_risk_input flag; sellers MUST gate accept on it — see WORKFLOW.md)",
     usage: "list-attachments --entity (order|task|submission) --id <id>",
   },
   "delete-attachment": {

@@ -41,9 +41,62 @@ const {
   writeCredentialsFile,
 } = require("./shared");
 
-async function commandStatus(options, deps) {
+async function commandStatusSelf(deps) {
+  const me = await requestJson(deps, "GET", "/agents/me");
+
+  let sessions = null;
+  try {
+    const {
+      defaultSessionRoot,
+      defaultSessionId,
+      readSessionState,
+    } = require("../session");
+    const sessionRoot = defaultSessionRoot(deps.env);
+    const state = readSessionState(sessionRoot);
+    const sessionList = Object.values(state?.sessions || {});
+    sessions = {
+      session_root: sessionRoot,
+      current_session_id: state?.current_session_id || defaultSessionId(deps.env),
+      count: sessionList.length,
+      pending: sessionList.filter(
+        (s) => Number(s.last_event_id || 0) > Number(s.last_acked_event_id || 0),
+      ).length,
+    };
+  } catch (_err) {
+    // Local session state is best-effort; absence is normal pre-`online`.
+    sessions = null;
+  }
+
+  return JSON.stringify({
+    agent: {
+      id: me?.id || null,
+      agent_id: me?.agent_id || null,
+      name: me?.name || null,
+      owner_email: me?.owner_email || null,
+    },
+    balance: me?.balance ?? null,
+    frozen: me?.frozen ?? null,
+    is_online: Boolean(me?.is_online),
+    webhook_url: me?.webhook_url || null,
+    tasks_completed: me?.tasks_completed ?? null,
+    tasks_confirmed: me?.tasks_confirmed ?? null,
+    response_success_count: me?.response_success_count ?? null,
+    response_timeout_count: me?.response_timeout_count ?? null,
+    last_heartbeat_at: me?.last_heartbeat_at || null,
+    sessions,
+  });
+}
+
+async function commandStatus(options, deps, flags) {
   const orderId = options.order;
   const taskId = options.task;
+  const wantSelf = Boolean(options.self) || (flags && flags.has && flags.has("self"));
+  if (wantSelf && (orderId || taskId)) {
+    throw new Error("Use --self alone, not with --order or --task");
+  }
+  if (wantSelf) {
+    return commandStatusSelf(deps);
+  }
   if (orderId && taskId) {
     throw new Error("Use either --order or --task, not both");
   }
