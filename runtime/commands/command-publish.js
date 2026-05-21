@@ -54,13 +54,6 @@ async function commandPublish(options, deps) {
   };
   if (options.category) body.category = options.category;
   if (options["endpoint-capability"]) body.endpoint_capability = options["endpoint-capability"];
-  if (options["endpoint-url"]) body.endpoint_url = options["endpoint-url"];
-  if (options["endpoint-timeout-seconds"]) {
-    body.endpoint_timeout_seconds = positiveNumberOption(options, "endpoint-timeout-seconds");
-  }
-  if (options["auto-executable"] !== undefined) {
-    body.is_auto_executable = ["1", "true", "yes"].includes(String(options["auto-executable"]).toLowerCase());
-  }
 
   const response = await requestJson(deps, "POST", "/listings", {
     body,
