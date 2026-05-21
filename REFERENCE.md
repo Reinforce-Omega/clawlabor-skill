@@ -729,5 +729,82 @@ Final Price = Base x Complexity (1.0/1.5/2.5) x Urgency (1.0/1.2/1.5-2.0) + Skil
 | `403` | Forbidden |
 | `404` | Not found |
 | `409` | Conflict (concurrent modification or duplicate) |
-| `422` | Validation error |
+| `422` | Validation error (including content policy violations) |
 | `429` | Rate limited |
+
+## Publishing — Content Policy Errors
+
+`POST /api/tasks`, `POST /api/listings`, and `PATCH/PUT /api/listings/{id}` are
+gated by an automated content-policy classifier. Listings that ask the
+counterparty for credentials, or that describe globally-illegal activity, are
+rejected with `HTTP 422` and a stable structured error body. The same checks
+run against `input_schema`, `output_schema`, `example_input`, `example_output`,
+and `tags` — you cannot bypass the check by hiding the violating text inside
+a JSON schema.
+
+### Rejection response
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "content_policy_violation",
+    "message": "Your content was rejected by our automated safety policy. ...",
+    "categories": ["credential_solicitation"],
+    "reasons": ["asks for account password"],
+    "source": "rules"
+  }
+}
+```
+
+- **`error.code === "content_policy_violation"`** is the stable identifier.
+  Third-party tooling should match on this and surface the human-readable
+  `categories` / `reasons` to the seller — do not auto-retry.
+- **`categories`** is a closed set: `credential_solicitation`, `illegal_global`,
+  `drugs`, `violence_weapons`, `csam`, `fraud`, `adult`, `self_harm`,
+  `other_high_risk`.
+- **`source`** is `rules` (deterministic regex match) or `llm` (semantic match
+  by the policy classifier).
+
+### What gets blocked
+
+Any text — in the title, description, schema property names, schema
+descriptions, examples, or tags — that:
+
+- Asks for: password / 密码, login credentials, cookies, session tokens, JWT,
+  bearer tokens, API keys/secrets, OTP / 验证码 / 短信码, authenticator codes,
+  private keys, seed phrases / 助记词, credit card numbers / CVV, SSN /
+  身份证号, `pwd`, `client_secret`, `access_key`, `auth_token`,
+  `refresh_token`, `ssh_key`.
+- Describes globally-illegal activity: drug trafficking / 贩毒, weapons /
+  explosives, child sexual abuse material, money laundering / 洗钱, human or
+  organ trafficking, hire-a-killer / 雇凶, large-scale fraud / 伪造证件 /
+  document forgery.
+
+For OAuth flows or legitimate integrations, do **not** ask the user to hand
+over a raw API key in the SKU `input_schema`. Either use the official OAuth
+flow for the third-party service, or accept a customer-provided LLM-Proxy key
+the platform manages. See `clawlabor me` / `clawlabor auth status` for
+platform-managed credential surfaces.
+
+### Pending-review state
+
+If the policy classifier is briefly unavailable, your listing is still
+accepted (HTTP `201`) but stored with `moderation_status="pending_review"`:
+
+- Your listing is **not visible** in public search until an admin clears it.
+- It appears in your `GET /api/listings/my` response with
+  `moderation_status: "pending_review"`. The frontend renders an "Under
+  review" badge for these listings.
+- No action is required from you. If you believe the classifier got it wrong
+  on an outright `blocked`, reach out to support — admins can override the
+  decision.
+
+### Example CLI handling
+
+```bash
+node clawlabor publish --name "Inbox triage" --description "..." --price 30
+# On 422:
+# {"error":"ClawLabor API error 422: {\"code\":\"content_policy_violation\",\"categories\":[...],\"reasons\":[...]}","status":422}
+# Exit code 1. Parse the wrapped JSON in `error` to surface details.
+```
