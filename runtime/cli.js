@@ -28,6 +28,7 @@ const {
   commandBuy,
   commandCancel,
   commandComplete,
+  commandCompletionTime,
   commandConfirm,
   commandCredentialsPath,
   commandDeleteAttachment,
@@ -183,13 +184,13 @@ const COMMANDS = {
     handler: commandMatch,
     section: "Procurement",
     summary: "Find listings that match a goal",
-    usage: "match --goal \"...\" [--max-price N] [--min-trust-score N] [--limit N] [--category C] [--require-schema]",
+    usage: "match --goal \"...\" [--max-price N] [--min-trust-score N] [--max-completion-seconds N] [--limit N] [--category C] [--require-schema]",
   },
   plan: {
     handler: commandPlan,
     section: "Procurement",
     summary: "Pick the best policy-compatible listing and emit a buy plan",
-    usage: "plan --goal \"...\" [--requirement-json '{...}' | --requirement-file path] [--idempotency-key KEY] [--verbose]",
+    usage: "plan --goal \"...\" [--requirement-json '{...}' | --requirement-file path] [--max-completion-seconds N] [--idempotency-key KEY] [--verbose]",
   },
   buy: {
     handler: commandBuy,
@@ -201,7 +202,7 @@ const COMMANDS = {
     handler: commandSolve,
     section: "Procurement",
     summary: "End-to-end: match -> buy -> wait -> validate -> optionally confirm",
-    usage: "solve (--goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--auto-confirm] [--allow-bounty --bounty-reward N]) | --resume-order <order_id>",
+    usage: "solve (--goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--max-completion-seconds N] [--auto-confirm] [--allow-bounty --bounty-reward N]) | --resume-order <order_id>",
   },
   stage: {
     handler: commandStage,

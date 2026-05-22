@@ -42,12 +42,12 @@ const {
 } = require("./shared");
 const { commandWait } = require("./command-wait");
 
-function waitSecondsForStatus(status, options) {
+function waitSecondsForStatus(status, options, avgCompletionSeconds) {
   const explicit = positiveNumberOption(options, "wait-seconds");
   if (explicit) return explicit;
   if (status === "pending_accept" || status === "pending_acceptance" || status === "created") return 60;
-  if (status === "in_progress") return 300;
-  return 120;
+  if (status === "in_progress") return avgCompletionSeconds || 300;
+  return avgCompletionSeconds || 120;
 }
 
 function checkAfterIso(deps, waitSeconds) {
@@ -72,9 +72,11 @@ function waitNextAction(orderId, waitSeconds, checkAfter, reason) {
     type: "wait",
     terminal: false,
     reason,
-    wait_seconds: waitSeconds,
-    check_after: checkAfter,
+    check_after_seconds: waitSeconds,
+    check_after_iso: checkAfter,
     command: resumeCommand(orderId),
+    non_blocking: true,
+    scheduling_note: "Do not sleep or block. Schedule next_action.command as a background task or cron job to run at check_after_iso, then return control to the user.",
   };
 }
 
@@ -253,9 +255,11 @@ async function observeOrder(orderId, options, deps, flags, trace = [], listingId
     order_id: orderId,
     status,
     reason,
-    wait_seconds: waitSeconds,
-    check_after: checkAfter,
+    check_after_seconds: waitSeconds,
+    check_after_iso: checkAfter,
     resume_command: resumeCommand(orderId),
+    non_blocking: true,
+    scheduling_note: "Do not sleep or block. Schedule resume_command as a background task or cron job to run at check_after_iso, then return control to the user.",
     next_action: waitNextAction(orderId, waitSeconds, checkAfter, reason),
     retry_policy: openOrderRetryPolicy(orderId),
     deadline: {
@@ -417,7 +421,7 @@ async function commandSolve(options, deps, flags) {
         trace,
       });
     }
-    const waitSeconds = waitSecondsForStatus(waitResult.status, options);
+    const waitSeconds = waitSecondsForStatus(waitResult.status, options, selected.avg_completion_seconds);
     const reason = waitResult.status === "in_progress"
       ? "seller_is_working"
       : waitResult.reason || "waiting_for_seller_state_change";
@@ -427,9 +431,11 @@ async function commandSolve(options, deps, flags) {
       order_id: orderId,
       status: waitResult.status,
       reason,
-      wait_seconds: waitSeconds,
-      check_after: checkAfter,
+      check_after_seconds: waitSeconds,
+      check_after_iso: checkAfter,
       resume_command: resumeCommand(orderId),
+      non_blocking: true,
+      scheduling_note: "Do not sleep or block. Schedule resume_command as a background task or cron job to run at check_after_iso, then return control to the user.",
       next_action: waitNextAction(orderId, waitSeconds, checkAfter, reason),
       retry_policy: openOrderRetryPolicy(orderId),
       trace,

@@ -294,6 +294,11 @@ function matchBody(options, flags, env) {
     body.require_schema = true;
   }
 
+  const maxCompletionSeconds = positiveNumberOption(options, "max-completion-seconds");
+  if (maxCompletionSeconds !== undefined) {
+    body.max_completion_seconds = maxCompletionSeconds;
+  }
+
   return body;
 }
 
