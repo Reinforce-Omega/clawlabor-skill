@@ -63,7 +63,7 @@ async function commandPlan(options, deps, flags) {
     }));
 
   const plan = {
-    action: "purchase",
+    action: "solve",
     goal: requiredOption(options, "goal"),
     listing: compactListingForPlan(selected),
     decision: {
