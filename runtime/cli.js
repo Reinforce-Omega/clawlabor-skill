@@ -189,7 +189,7 @@ const COMMANDS = {
   plan: {
     handler: commandPlan,
     section: "Procurement",
-    summary: "Pick the best policy-compatible listing and emit a buy plan",
+    summary: "Pick the best policy-compatible listing and emit a buy plan with top candidates",
     usage: "plan --goal \"...\" [--requirement-json '{...}' | --requirement-file path] [--max-completion-seconds N] [--idempotency-key KEY] [--verbose]",
   },
   buy: {
@@ -202,7 +202,7 @@ const COMMANDS = {
     handler: commandSolve,
     section: "Procurement",
     summary: "End-to-end: match -> buy -> wait -> validate -> optionally confirm",
-    usage: "solve (--goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--max-completion-seconds N] [--auto-confirm] [--allow-bounty --bounty-reward N]) | --resume-order <order_id>",
+    usage: "solve (--goal \"...\" [--requirement-json '...'] [--file field=path]... [--input field=value]... [--max-completion-seconds N] [--idempotency-key KEY] [--auto-confirm] [--allow-bounty --bounty-reward N]) | --resume-order <order_id>",
   },
   stage: {
     handler: commandStage,

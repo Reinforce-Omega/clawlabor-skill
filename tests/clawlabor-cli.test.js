@@ -1263,8 +1263,21 @@ test("plan emits a compact agent-facing purchase plan", async () => {
   assert.deepEqual(plan.input.requirement, { url: "https://x.com" });
   assert.equal(plan.input.valid, false);
   assert.deepEqual(plan.input.missing_required_fields, ["question"]);
+  assert.equal(
+    plan.execute_command,
+    "clawlabor solve --goal 'Analyze' --requirement-json '{\"url\":\"https://x.com\"}' --idempotency-key 'fixed-key'",
+  );
+  assert.equal(plan.legacy_buy_command, "clawlabor buy --listing sku-123 --idempotency-key fixed-key");
   assert.equal(plan.decision.why_matched, "Matched because the task needs public evidence.");
   assert.deepEqual(plan.decision.how_to_use, ["Expected outcome: sourced research brief"]);
+  assert.equal(plan.candidates.length, 1);
+  assert.equal(plan.candidates[0].id, "sku-123");
+  assert.equal(plan.candidates[0].description, "Long listing text that should not be duplicated in the default plan.");
+  assert.deepEqual(plan.candidates[0].tags, ["research"]);
+  assert.deepEqual(plan.candidates[0].input_schema.required, ["url", "question"]);
+  assert.equal(plan.candidates[0].schema_compatibility.valid, false);
+  assert.deepEqual(plan.candidates[0].schema_compatibility.missing_required_fields, ["question"]);
+  assert.equal(plan.candidates[0].decision.why_matched, "Matched because the task needs public evidence.");
   assert.equal(plan.selected_listing, undefined);
   assert.equal(plan.match_explanation, undefined);
   assert.equal(plan.invocation_guidance, undefined);
@@ -1347,6 +1360,16 @@ test("plan chooses a schema-compatible allowed listing", async () => {
   const plan = JSON.parse(out[0]);
   assert.equal(plan.listing.id, "sku-url");
   assert.equal(plan.input.valid, true);
+  assert.match(plan.execute_command, /^clawlabor solve --goal 'Analyze site'/);
+  assert.equal(plan.execute_command.includes("clawlabor buy"), false);
+  assert.deepEqual(plan.candidates.map((candidate) => candidate.id), ["sku-repo", "sku-url"]);
+  assert.deepEqual(
+    plan.candidates.map((candidate) => candidate.schema_compatibility),
+    [
+      { valid: false, missing_required_fields: ["repo_url"] },
+      { valid: true, missing_required_fields: [] },
+    ],
+  );
 });
 
 test("plan reports missing required fields when requirement is omitted", async () => {
@@ -2069,15 +2092,18 @@ test("solve returns wait action instead of blocking indefinitely", async () => {
   assert.equal(result.action, "wait");
   assert.equal(result.order_id, "order-wait");
   assert.equal(result.status, "in_progress");
-  assert.equal(result.wait_seconds, 300);
+  assert.equal(result.check_after_seconds, 300);
+  assert.equal(result.check_after_iso, "1970-01-01T00:05:01.000Z");
   assert.equal(result.resume_command, "clawlabor solve --resume-order order-wait");
   assert.deepEqual(result.next_action, {
     type: "wait",
     terminal: false,
     reason: "seller_is_working",
-    wait_seconds: 300,
-    check_after: "1970-01-01T00:05:01.000Z",
+    check_after_seconds: 300,
+    check_after_iso: "1970-01-01T00:05:01.000Z",
     command: "clawlabor solve --resume-order order-wait",
+    non_blocking: true,
+    scheduling_note: "Do not sleep or block. Schedule next_action.command as a background task or cron job to run at check_after_iso, then return control to the user.",
   });
   assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
   assert.equal(result.retry_policy.duplicate_purchase_risk, true);
@@ -2166,15 +2192,17 @@ test("solve --resume-order returns wait when no counterparty message is pending"
   const result = JSON.parse(out[0]);
   assert.equal(result.action, "wait");
   assert.equal(result.status, "pending_accept");
-  assert.equal(result.wait_seconds, 60);
-  assert.equal(result.check_after, "1970-01-01T00:01:00.000Z");
+  assert.equal(result.check_after_seconds, 60);
+  assert.equal(result.check_after_iso, "1970-01-01T00:01:00.000Z");
   assert.deepEqual(result.next_action, {
     type: "wait",
     terminal: false,
     reason: "waiting_for_seller_state_change",
-    wait_seconds: 60,
-    check_after: "1970-01-01T00:01:00.000Z",
+    check_after_seconds: 60,
+    check_after_iso: "1970-01-01T00:01:00.000Z",
     command: "clawlabor solve --resume-order order-idle",
+    non_blocking: true,
+    scheduling_note: "Do not sleep or block. Schedule next_action.command as a background task or cron job to run at check_after_iso, then return control to the user.",
   });
   assert.equal(result.retry_policy.initial_solve_repeat_safe, false);
   assert.equal(result.retry_policy.resume_command, "clawlabor solve --resume-order order-idle");

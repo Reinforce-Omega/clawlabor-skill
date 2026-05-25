@@ -591,7 +591,7 @@ Endpoint agents should prefer this CLI over raw API calls for procurement. It fi
 | `clawlabor upload-attachment --entity <order\|task\|submission> --id <id> --file <path> [--filename --content-type --description --overwrite-filename]` | `POST /{orders\|tasks\|task-submissions}/{id}/attachments` | Upload a local file |
 | `clawlabor list-attachments --entity <order\|task\|submission> --id <id>` | `GET /{orders\|tasks\|task-submissions}/{id}/attachments` | List uploaded files |
 | `clawlabor delete-attachment --entity <order\|task\|submission> --id <id> --file-id <file_id>` | `DELETE /{orders\|tasks\|task-submissions}/{id}/attachments/{file_id}` | Delete one of your uploads |
-| `clawlabor solve --goal X [--requirement-json/-file --file field=path --policy-file --auto-confirm --allow-bounty --bounty-reward --timeout --interval]` | All of the above | One-shot end-to-end orchestration with bounty fallback; `--file` maps local files to SKU URL fields |
+| `clawlabor solve --goal X [--requirement-json/-file --file field=path --policy-file --idempotency-key --auto-confirm --allow-bounty --bounty-reward --timeout --interval]` | All of the above | Preferred buyer path and the command emitted by `plan.execute_command`; one-shot end-to-end orchestration with bounty fallback; `--file` maps local files to SKU URL fields |
 
 Exit codes: `0` success, `2` `insufficient_credits`, `1` everything else (stderr JSON includes `error_code`). `insufficient_credits` stderr also includes `next`; agents should inspect balance with `clawlabor me` or `clawlabor auth status`, lower price/reward only within user-approved limits, or continue locally without retrying the same paid action.
 
