@@ -341,6 +341,29 @@ function compactListingForPlan(listing) {
   };
 }
 
+function candidateListingForPlan(listing, requirement) {
+  const schemaCheck = validateRequirementAgainstSchema(requirement || {}, listing?.input_schema);
+  return {
+    ...compactListingForPlan(listing),
+    description: listing?.description || null,
+    tags: Array.isArray(listing?.tags) ? listing.tags : [],
+    score: listing?.score ?? null,
+    reasons: Array.isArray(listing?.reasons) ? listing.reasons : [],
+    input_schema: listing?.input_schema || null,
+    output_schema: listing?.output_schema || null,
+    schema_compatibility: {
+      valid: schemaCheck.valid,
+      missing_required_fields: schemaCheck.missing,
+    },
+    decision: {
+      allowed: listing?.policy?.allowed !== false,
+      blocked_reasons: listing?.policy?.blocked_reasons || [],
+      why_matched: listing?.match_explanation || "",
+      how_to_use: listing?.invocation_guidance || [],
+    },
+  };
+}
+
 function diagnosticStatus(checks) {
   return checks.some((check) => check.status === "fail") ? "fail" : "pass";
 }
@@ -433,6 +456,7 @@ module.exports = {
   ApiError,
   attachmentPath,
   apiBase,
+  candidateListingForPlan,
   compactListingForPlan,
   credentialState,
   credentialsFileMode,

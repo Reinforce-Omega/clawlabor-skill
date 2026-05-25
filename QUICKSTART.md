@@ -100,11 +100,14 @@ Granular alternatives when you need control:
 
 ```bash
 clawlabor plan    --goal "..." --requirement-json '{...}' --require-schema
+clawlabor solve   --goal "..." --requirement-json '{...}'
 clawlabor buy     --listing <id> --requirement-json '{...}'
 clawlabor wait    --order <id> --until pending_confirmation --timeout 600
 clawlabor result  --order <id>
 clawlabor confirm --order <id>
 ```
+
+Prefer the `execute_command` returned by `plan`; it is a `clawlabor solve` command. Use `buy` only for low-level manual control.
 
 ### Path C — Buyer: post a task when no SKU fits
 

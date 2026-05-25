@@ -1,6 +1,7 @@
 const {
   apiBase,
   attachmentPath,
+  candidateListingForPlan,
   compactListingForPlan,
   credentialState,
   credentialsFileMode,
@@ -41,6 +42,30 @@ const {
   writeCredentialsFile,
 } = require("./shared");
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function solveCommand(options, flags, goal, requirementProvided, requirement, idempotencyKey) {
+  const parts = ["clawlabor", "solve", "--goal", shellQuote(goal)];
+  if (options["requirement-file"]) {
+    parts.push("--requirement-file", shellQuote(options["requirement-file"]));
+  } else if (requirementProvided) {
+    parts.push("--requirement-json", shellQuote(JSON.stringify(requirement)));
+  }
+  if (options["policy-file"]) {
+    parts.push("--policy-file", shellQuote(options["policy-file"]));
+  }
+  if (options["max-completion-seconds"]) {
+    parts.push("--max-completion-seconds", shellQuote(options["max-completion-seconds"]));
+  }
+  if (flags.has("require-schema")) {
+    parts.push("--require-schema");
+  }
+  parts.push("--idempotency-key", shellQuote(idempotencyKey));
+  return parts.join(" ");
+}
+
 async function commandPlan(options, deps, flags) {
   const body = matchBody(options, flags, deps.env);
   const matchResult = await requestJson(deps, "POST", "/listings/match", { body });
@@ -55,6 +80,9 @@ async function commandPlan(options, deps, flags) {
   const idempotencyKey = options["idempotency-key"] || deps.makeIdempotencyKey();
   const schemaCheck = validateRequirementAgainstSchema(requirement, selected.input_schema);
   const policy = selected.policy || { allowed: true, blocked_reasons: [] };
+  const candidates = matches
+    .filter((item) => item.policy?.allowed !== false)
+    .map((item) => candidateListingForPlan(item, requirement));
   const rejectedListings = matches
     .filter((item) => item.policy?.allowed === false)
     .map((item) => ({
@@ -62,10 +90,12 @@ async function commandPlan(options, deps, flags) {
       blocked_reasons: item.policy?.blocked_reasons || [],
     }));
 
+  const goal = requiredOption(options, "goal");
   const plan = {
     action: "solve",
-    goal: requiredOption(options, "goal"),
+    goal,
     listing: compactListingForPlan(selected),
+    candidates,
     decision: {
       allowed: policy.allowed !== false,
       blocked_reasons: policy.blocked_reasons || [],
@@ -79,7 +109,8 @@ async function commandPlan(options, deps, flags) {
       valid: schemaCheck.valid,
       missing_required_fields: schemaCheck.missing,
     },
-    execute_command: `clawlabor buy --listing ${selected.id} --idempotency-key ${idempotencyKey}`,
+    execute_command: solveCommand(options, flags, goal, requirementProvided, requirement, idempotencyKey),
+    legacy_buy_command: `clawlabor buy --listing ${selected.id} --idempotency-key ${idempotencyKey}`,
   };
   if (flags.has("verbose")) {
     plan.debug = {
