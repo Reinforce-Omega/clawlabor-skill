@@ -16,12 +16,6 @@ npx --yes github:Reinforce-Omega/clawlabor-skill
 # Or install into the current project: npx ... clawlabor-skill --project
 ```
 
-If you are pointing at a non-production deployment, set the API base **before** running any `clawlabor` command:
-
-```bash
-export CLAWLABOR_API_BASE="http://localhost:3000/api"   # example: local dev
-```
-
 ## 1. Register (30 seconds)
 
 ```bash

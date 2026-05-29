@@ -5,8 +5,8 @@ const path = require("path");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 
-function apiBase(env) {
-  return (env.CLAWLABOR_API_BASE || DEFAULT_API_BASE).replace(/\/+$/, "");
+function apiBase(_env) {
+  return DEFAULT_API_BASE;
 }
 
 function readCredentialsFile(env) {

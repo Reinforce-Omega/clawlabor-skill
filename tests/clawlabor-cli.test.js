@@ -7,7 +7,6 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { Readable } = require("node:stream");
 const test = require("node:test");
-
 const {
   runCli,
   validateRequirementAgainstSchema,
@@ -18,9 +17,10 @@ const {
   COMMANDS,
 } = require("../runtime/cli");
 
+const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
+
 const BASE_ENV = {
   CLAWLABOR_API_KEY: "test-key",
-  CLAWLABOR_API_BASE: "https://api.example.test/api",
 };
 
 function tempTestFile(name) {
@@ -92,7 +92,7 @@ test("match posts an agent-native capability matching request", async () => {
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
   );
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "https://api.example.test/api/listings/match");
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/listings/match");
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.headers.Authorization, "Bearer test-key");
   assert.deepEqual(JSON.parse(calls[0].options.body), {
@@ -155,13 +155,26 @@ test("credentials-path prints the configured credentials file", async () => {
   assert.equal(out[0], credentialsFile);
 });
 
+test("api-base prints the compiled API base", async () => {
+  const out = [];
+
+  await runCli(["api-base"], {
+    env: {},
+    fetch: async () => {
+      throw new Error("should not call API");
+    },
+    stdout: (t) => out.push(t),
+  });
+
+  assert.equal(out[0], DEFAULT_API_BASE);
+});
+
 test("auth status reports missing credentials without calling the API", async () => {
   const credentialsFile = tempTestFile("credentials.json");
   const out = [];
 
   await runCli(["auth", "status"], {
     env: {
-      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
       CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
     },
     fetch: async () => {
@@ -172,7 +185,7 @@ test("auth status reports missing credentials without calling the API", async ()
 
   const result = JSON.parse(out[0]);
   assert.equal(result.authenticated, false);
-  assert.equal(result.api_base, BASE_ENV.CLAWLABOR_API_BASE);
+  assert.equal(result.api_base, DEFAULT_API_BASE);
   assert.equal(result.api_key_source, null);
   assert.equal(result.credentials_file, credentialsFile);
   assert.equal(result.credentials_file_exists, false);
@@ -217,8 +230,7 @@ test("auth status validates credentials from credentials file", async () => {
 
   await runCli(["auth", "status"], {
     env: {
-      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
-      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+          CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
     },
     fetch,
     stdout: (t) => out.push(t),
@@ -243,7 +255,6 @@ test("doctor reports missing credentials but still checks API health", async () 
 
   await runCli(["doctor"], {
     env: {
-      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
       CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
     },
     fetch,
@@ -258,7 +269,7 @@ test("doctor reports missing credentials but still checks API health", async () 
   assert.equal(result.checks.find((check) => check.name === "credentials").status, "fail");
   assert.equal(result.checks.find((check) => check.name === "auth").error_code, "missing_credentials");
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "https://api.example.test/api/health");
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/health");
 });
 
 test("doctor validates auth without leaking the API key", async () => {
@@ -298,8 +309,7 @@ test("doctor reports malformed credentials file as a diagnostic failure", async 
 
   await runCli(["doctor"], {
     env: {
-      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
-      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+          CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
     },
     fetch,
     stdout: (t) => out.push(t),
@@ -327,8 +337,7 @@ test("bootstrap validates existing credentials without registering again", async
 
   await runCli(["bootstrap"], {
     env: {
-      CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
-      CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+          CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
     },
     fetch,
     stdout: (t) => out.push(t),
@@ -363,8 +372,7 @@ test("register creates an agent and stores credentials", async () => {
     ["register", "--owner-email", "agent@example.com", "--name", "HermesBuyer"],
     {
       env: {
-        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
-        CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
+              CLAWLABOR_CREDENTIALS_FILE: credentialsFile,
       },
       fetch,
       stdout: (t) => out.push(t),
@@ -405,8 +413,7 @@ test("profile updates the current agent webhook configuration", async () => {
     ],
     {
       env: {
-        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
-        CLAWLABOR_API_KEY: "file-key",
+              CLAWLABOR_API_KEY: "file-key",
       },
       fetch,
       stdout: (t) => out.push(t),
@@ -581,8 +588,7 @@ test("online starts a receiver and writes webhook events to inbox", async () => 
     ],
     {
       env: {
-        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
-        CLAWLABOR_API_KEY: "file-key",
+              CLAWLABOR_API_KEY: "file-key",
       },
       fetch,
       stdout: (t) => out.push(t),
@@ -972,8 +978,7 @@ test("online defaults to Cloudflare tunnel discovery and writes the public URL b
     ],
     {
       env: {
-        CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE,
-        CLAWLABOR_API_KEY: "file-key",
+              CLAWLABOR_API_KEY: "file-key",
       },
       fetch,
       stdout: (t) => out.push(t),
@@ -1062,7 +1067,7 @@ test("online closes the receiver when the default tunnel cannot start", async ()
 test("register requires owner email", async () => {
   await assert.rejects(
     runCli(["register"], {
-      env: { CLAWLABOR_API_BASE: BASE_ENV.CLAWLABOR_API_BASE },
+      env: {},
       fetch: async () => {
         throw new Error("should not call API");
       },
@@ -1407,7 +1412,7 @@ test("validate calls delivery validation endpoint", async () => {
     }),
   ]);
   await runCli(["validate", "--order", "order-123"], { env: BASE_ENV, fetch, stdout: () => {} });
-  assert.equal(calls[0].url, "https://api.example.test/api/orders/order-123/validate-delivery");
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/orders/order-123/validate-delivery");
 });
 
 test("message sends an order message", async () => {
@@ -1451,7 +1456,7 @@ test("message lists task messages", async () => {
   );
   const result = JSON.parse(out[0]);
 
-  assert.equal(calls[0].url, "https://api.example.test/api/tasks/task-123/messages?limit=2");
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/tasks/task-123/messages?limit=2");
   assert.equal(result.entity, "task");
   assert.equal(result.count, 2);
   assert.equal(result.messages[1].content, "Second");
@@ -1658,7 +1663,7 @@ test("result includes delivery attachments with download URLs", async () => {
   await runCli(["result", "--order", "order-1"], { env: BASE_ENV, fetch, stdout: (t) => out.push(t) });
   const data = JSON.parse(out[0]);
 
-  assert.equal(calls[1].url, "https://api.example.test/api/orders/order-1/attachments");
+  assert.equal(calls[1].url, "https://www.clawlabor.com/api/orders/order-1/attachments");
   assert.equal(data.attachments.file_count, 2);
   assert.equal(data.attachments.delivery_file_count, 1);
   assert.equal(data.attachments.delivery_files[0].download_url, "https://storage.example.test/report.pdf?sig=abc");
@@ -1695,7 +1700,7 @@ test("status can fetch a task without treating open zero escrow as cancelled", a
     stdout: (t) => out.push(t),
   });
 
-  assert.equal(calls[0].url, "https://api.example.test/api/tasks/task-1");
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/tasks/task-1");
   const result = JSON.parse(out[0]);
   assert.equal(result.status, "open");
   assert.equal(result.escrow_amount, 0);
@@ -1839,8 +1844,8 @@ test("post uploads attachment after task creation when attachment-file is provid
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
   );
 
-  assert.equal(calls[0].url, "https://api.example.test/api/tasks");
-  assert.equal(calls[1].url, "https://api.example.test/api/tasks/task-1/attachments");
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/tasks");
+  assert.equal(calls[1].url, "https://www.clawlabor.com/api/tasks/task-1/attachments");
   assert.equal(calls[1].options.body.get("description"), "Source HTML");
   assert.equal(JSON.parse(out[0]).attachment.file_id, "file-task-1");
 });
@@ -1866,10 +1871,10 @@ test("list and delete attachment map entity aliases to API paths", async () => {
     { env: BASE_ENV, fetch, stdout: () => {} },
   );
 
-  assert.equal(calls[0].url, "https://api.example.test/api/tasks/task-1/attachments");
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/tasks/task-1/attachments");
   assert.equal(
     calls[1].url,
-    "https://api.example.test/api/task-submissions/sub-1/attachments/file-1",
+    "https://www.clawlabor.com/api/task-submissions/sub-1/attachments/file-1",
   );
 });
 
@@ -2028,8 +2033,8 @@ test("solve uploads attachment after purchase before waiting for delivery", asyn
   );
 
   const urls = calls.map((call) => call.url);
-  assert.ok(urls.indexOf("https://api.example.test/api/listings/sku-1/purchase") < urls.indexOf("https://api.example.test/api/orders/order-attach/attachments"));
-  assert.ok(urls.indexOf("https://api.example.test/api/orders/order-attach/attachments") < urls.indexOf("https://api.example.test/api/orders/order-attach"));
+  assert.ok(urls.indexOf("https://www.clawlabor.com/api/listings/sku-1/purchase") < urls.indexOf("https://www.clawlabor.com/api/orders/order-attach/attachments"));
+  assert.ok(urls.indexOf("https://www.clawlabor.com/api/orders/order-attach/attachments") < urls.indexOf("https://www.clawlabor.com/api/orders/order-attach"));
   assert.equal(calls[2].options.body.get("description"), "Source HTML");
   assert.equal(
     JSON.parse(out[0]).trace.some((step) => step.step === "upload_attachment"),
@@ -2450,8 +2455,7 @@ test("bin adds next guidance for insufficient credits", () => {
     env: {
       ...process.env,
       CLAWLABOR_API_KEY: "test-key",
-      CLAWLABOR_API_BASE: "https://api.example.test/api",
-    },
+        },
     encoding: "utf8",
   });
 
@@ -2640,7 +2644,7 @@ test("installer --project installs all project runtime targets by default", () =
   }
 });
 
-test("installer derives local docs URL from CLAWLABOR_API_BASE", () => {
+test("installer docs URL ignores API-base environment injection", () => {
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-local-docs-"));
   const result = spawnSync(
     process.execPath,
@@ -2649,14 +2653,14 @@ test("installer derives local docs URL from CLAWLABOR_API_BASE", () => {
       env: {
         ...process.env,
         HOME: tempHome,
-        CLAWLABOR_API_BASE: "http://localhost:3000/api",
+        
       },
       encoding: "utf8",
     },
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Docs:\n\s+http:\/\/localhost:3000\/skill\.md/);
+  assert.match(result.stdout, /Docs:\n\s+https:\/\/www\.clawlabor\.com\/skill\.md/);
 });
 
 test("installer auto-detects Hermes when ~/.hermes exists", () => {
@@ -2800,7 +2804,7 @@ test("stageAndUploadFile: calls stage, PUT, confirm, returns signed URL", async 
   };
 
   const deps = {
-    env: { CLAWLABOR_API_KEY: "test-key", CLAWLABOR_API_BASE: "https://api.test/api" },
+    env: { CLAWLABOR_API_KEY: "test-key" },
     fetch: fakeFetch,
   };
 
@@ -2837,7 +2841,7 @@ test("stageAndUploadFile: blocks JavaScript files before upload", async () => {
   await assert.rejects(
     () => stageAndUploadFile(
       {
-        env: { CLAWLABOR_API_KEY: "test-key", CLAWLABOR_API_BASE: "https://api.test/api" },
+        env: { CLAWLABOR_API_KEY: "test-key" },
         fetch: async () => {
           throw new Error("fetch should not be called");
         },
@@ -2897,7 +2901,7 @@ test("solve with --file stages and injects URL into requirement", async () => {
 
   await runCli(
     ["solve", "--goal", "convert to png", "--file", `image_url=${tmpFile}`, "--input", "format=png", "--auto-confirm"],
-    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: () => {} },
+    { env: { CLAWLABOR_API_KEY: "k" }, fetch: fakeFetch, stdout: () => {} },
   );
 
   const matchIdx = calls.findIndex((c) => c.url.endsWith("/listings/match"));
@@ -2928,7 +2932,7 @@ test("solve rejects legacy file field when selected listing has non-uri schema f
   await assert.rejects(
     () => runCli(
       ["solve", "--goal", "convert to png", "--file", `file_path=${tmpFile}`],
-      { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: () => {} },
+      { env: { CLAWLABOR_API_KEY: "k" }, fetch: fakeFetch, stdout: () => {} },
     ),
     /Field "file_path" does not look like a URL field/,
   );
@@ -2971,7 +2975,7 @@ test("buy with --file stages and injects URL into purchase", async () => {
 
   await runCli(
     ["buy", "--listing", "sku_buy_1", "--file", `image_url=${tmpFile}`, "--input", "format=png"],
-    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: () => {} },
+    { env: { CLAWLABOR_API_KEY: "k" }, fetch: fakeFetch, stdout: () => {} },
   );
 
   assert.ok(calls.find((c) => c.url.endsWith("/purchase")), "purchase was called");
@@ -3010,7 +3014,7 @@ test("solve with --auto-confirm fires confirm and reports auto_confirm.fired=tru
   const out = [];
   await runCli(
     ["solve", "--goal", "do thing", "--requirement-json", '{"input":"x"}', "--auto-confirm"],
-    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
+    { env: { CLAWLABOR_API_KEY: "k" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
   );
 
   const result = JSON.parse(out.join(""));
@@ -3049,7 +3053,7 @@ test("solve with --auto-confirm but low score reports skip_reason and next_actio
   const out = [];
   await runCli(
     ["solve", "--goal", "do thing", "--requirement-json", '{"input":"x"}', "--auto-confirm"],
-    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
+    { env: { CLAWLABOR_API_KEY: "k" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
   );
 
   const result = JSON.parse(out.join(""));
@@ -3095,7 +3099,7 @@ test("solve without --auto-confirm reports auto_confirm.requested=false", async 
   const out = [];
   await runCli(
     ["solve", "--goal", "do thing", "--requirement-json", '{"input":"x"}'],
-    { env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
+    { env: { CLAWLABOR_API_KEY: "k" }, fetch: fakeFetch, stdout: (t) => out.push(t) },
   );
 
   const result = JSON.parse(out.join(""));
@@ -3138,7 +3142,7 @@ test("orders --as seller --status pending_accept sends correct query and compact
     };
   };
   const deps = {
-    env: { CLAWLABOR_API_KEY: "test-key", CLAWLABOR_API_BASE: "https://api.test/api" },
+    env: { CLAWLABOR_API_KEY: "test-key" },
     fetch: fakeFetch,
   };
 
@@ -3172,7 +3176,7 @@ test("orders --raw returns full payload without compacting", async () => {
       }),
   });
   const deps = {
-    env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" },
+    env: { CLAWLABOR_API_KEY: "k" },
     fetch: fakeFetch,
   };
   const parsed = JSON.parse(await commandOrders({ raw: true }, deps));
@@ -3195,7 +3199,7 @@ test("orders --since filters by updated_at cutoff", async () => {
       }),
   });
   const deps = {
-    env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" },
+    env: { CLAWLABOR_API_KEY: "k" },
     fetch: fakeFetch,
   };
   const parsed = JSON.parse(await commandOrders({ since: "30m" }, deps));
@@ -3323,7 +3327,7 @@ test("status --self returns agent profile, balance, online state, and session co
     };
   };
   const deps = {
-    env: { CLAWLABOR_API_KEY: "k", CLAWLABOR_API_BASE: "https://api.test/api" },
+    env: { CLAWLABOR_API_KEY: "k" },
     fetch: fakeFetch,
   };
   const flags = new Set(["self"]);
@@ -3361,4 +3365,3 @@ test("status without --self still requires --order or --task", async () => {
     /Missing required --order or --task/,
   );
 });
-
