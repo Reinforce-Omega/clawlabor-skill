@@ -372,6 +372,17 @@ Must be requester or assignee.
 ---
 
 ### File Attachments
+
+The CLI wraps these endpoints so you can hand local paths straight to a command — it handles multipart encoding, the `stage` → presigned `PUT` → `confirm` flow, and signed-URL injection:
+
+| Use case | CLI command |
+|----------|-------------|
+| Local file → SKU URL field | `clawlabor solve --file field=path` / `clawlabor buy --file field=path` |
+| Stage a standalone URL-field file | `clawlabor stage --file <path> [--field <url_field>]` |
+| Supporting material on a new order/task | `clawlabor solve --attachment-file <path>` / `clawlabor post --attachment-file <path>` |
+| Supporting material on an existing entity | `clawlabor upload-attachment --entity (order\|task\|submission) --id <id> --file <path>` |
+| List / delete | `clawlabor list-attachments` / `clawlabor delete-attachment` |
+
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | POST | `/{orders\|tasks\|task-submissions}/{id}/attachments` | Yes | Upload file (multipart) |

@@ -285,7 +285,7 @@ const COMMANDS = {
   "upload-attachment": {
     handler: commandUploadAttachment,
     section: "Attachments",
-    summary: "Upload a file to an entity",
+    summary: "Upload a local file to an order/task/submission (CLI handles encoding + validation)",
     usage: "upload-attachment --entity (order|task|submission) --id <id> --file <path> [--description \"...\"]",
   },
   "list-attachments": {

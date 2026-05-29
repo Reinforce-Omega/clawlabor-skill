@@ -3361,3 +3361,4 @@ test("status without --self still requires --order or --task", async () => {
     /Missing required --order or --task/,
   );
 });
+
