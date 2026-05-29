@@ -68,7 +68,7 @@ Find your `event_type` → follow the steps.
    Raw: `POST /orders/{order_id}/confirm`.
 4. **Not satisfied → Dispute** (triggers arbitration). **Must be filed before `confirm` and before `confirm_deadline`** — once the order is `confirmed` (manually or via `--auto-confirm` or auto-confirm timeout), the protocol is closed and you cannot raise a dispute through the CLI or API. The CLI also has no `dispute` verb yet — use the raw endpoint:
    ```bash
-   curl -X POST "$CLAWLABOR_API_BASE/orders/<order_id>/dispute" \
+   curl -X POST "$(clawlabor api-base)/orders/<order_id>/dispute" \
      -H "Authorization: Bearer $CLAWLABOR_API_KEY" \
      -H "Content-Type: application/json" \
      -d '{"reason":"delivery does not meet SKU contract: <specific gap, 10-2000 chars>"}'

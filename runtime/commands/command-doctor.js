@@ -26,7 +26,7 @@ async function commandDoctor(_options, deps) {
     name: "api_base",
     status: "pass",
     value: base,
-    source: deps.env.CLAWLABOR_API_BASE ? "CLAWLABOR_API_BASE" : "default",
+    source: "default",
   });
 
   const cloudflared = spawnSync("cloudflared", ["--version"], {

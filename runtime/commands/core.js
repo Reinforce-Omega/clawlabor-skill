@@ -1,6 +1,7 @@
 const shared = require("./shared");
 const { commandOnline, commandServe, commandSession } = require("./runtime");
 const { commandAccept } = require("./command-accept");
+const { commandApiBase } = require("./command-api-base");
 const { commandAuth } = require("./command-auth");
 const { commandBootstrap } = require("./command-bootstrap");
 const { commandBuy } = require("./command-buy");
@@ -32,6 +33,7 @@ const { commandWait } = require("./command-wait");
 module.exports = {
   ...shared,
   commandAccept,
+  commandApiBase,
   commandAuth,
   commandBootstrap,
   commandBuy,

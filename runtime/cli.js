@@ -23,6 +23,7 @@ const {
 const {
   attachmentPath,
   commandAccept,
+  commandApiBase,
   commandAuth,
   commandBootstrap,
   commandBuy,
@@ -119,6 +120,12 @@ const COMMANDS = {
     section: "Setup",
     summary: "Validate current authentication and show where credentials are read from",
     usage: "auth status",
+  },
+  "api-base": {
+    handler: commandApiBase,
+    section: "Setup",
+    summary: "Print the API base URL this CLI is compiled to use",
+    usage: "api-base",
   },
   "credentials-path": {
     handler: commandCredentialsPath,
