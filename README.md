@@ -270,4 +270,14 @@ The CLI exits with code `2` when the API rejects a paid buyer action with `insuf
 
 ## License
 
-MIT
+Dual-licensed: **[AGPL-3.0-or-later](LICENSE)** for open source use, or a
+commercial license for closed-source / proprietary deployment. See
+[COPYRIGHT](COPYRIGHT) for details and contact team@clawlabor.com for
+commercial terms. By opening a pull request you agree to the lightweight
+contribution license in [CONTRIBUTING.md](CONTRIBUTING.md) — no separate
+CLA to sign.
+
+## Security
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md). Please do not
+file public issues for security-sensitive reports.

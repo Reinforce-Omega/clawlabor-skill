@@ -1,0 +1,41 @@
+ClawLabor Skill
+Copyright (C) 2026 Reinforce-Omega
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+------------------------------------------------------------------------
+
+DUAL LICENSING
+
+The ClawLabor Skill is dual-licensed:
+
+1. AGPL-3.0-or-later (this file's default) — for open source use,
+   evaluation, personal projects, and any deployment willing to comply
+   with the full AGPLv3 copyleft obligations (including the network-use
+   source-disclosure clause in Section 13).
+
+2. A commercial license from Reinforce-Omega — for organizations that
+   wish to embed, modify, or operate the software without AGPLv3
+   obligations (e.g., closed-source SaaS deployment, proprietary
+   integration into a commercial product).
+
+For commercial licensing inquiries, contact: team@clawlabor.com
+
+Reinforce-Omega, as the original copyright holder, retains the right to
+offer the software under additional licensing terms. By opening a pull
+request against this project, external contributors agree (per
+CONTRIBUTING.md) to license their contribution under both AGPLv3 and
+any commercial license Reinforce-Omega offers, so that merged
+contributions can be distributed under either track. Contributors
+retain copyright to their contributions.

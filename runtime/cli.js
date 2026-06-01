@@ -52,6 +52,7 @@ const {
   commandUploadAttachment,
   commandValidate,
   commandWait,
+  ensureUploadPathAllowed,
   isUrlField,
   parseFileFlags,
   parseInputFlags,
@@ -428,5 +429,6 @@ module.exports = {
   parseFileFlags,
   isUrlField,
   stageAndUploadFile,
+  ensureUploadPathAllowed,
   COMMANDS,
 };
