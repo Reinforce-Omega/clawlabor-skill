@@ -3365,3 +3365,124 @@ test("status without --self still requires --order or --task", async () => {
     /Missing required --order or --task/,
   );
 });
+
+// ---------------------------------------------------------------------------
+// ensureUploadPathAllowed: blocks sensitive paths regardless of agent intent
+// ---------------------------------------------------------------------------
+
+function withSandboxHome(name, fn) {
+  test(name, async (t) => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-home-"));
+    const originalHome = os.homedir();
+    const originalHOME = process.env.HOME;
+    const originalUSERPROFILE = process.env.USERPROFILE;
+    process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
+    // os.homedir() caches via process.env.HOME on POSIX; verify before running
+    if (os.homedir() !== tmpHome) {
+      process.env.HOME = originalHOME;
+      process.env.USERPROFILE = originalUSERPROFILE;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+      t.skip(`os.homedir() did not pick up HOME override (got ${os.homedir()}, expected ${tmpHome})`);
+      return;
+    }
+    try {
+      await fn({ tmpHome });
+    } finally {
+      process.env.HOME = originalHOME;
+      process.env.USERPROFILE = originalUSERPROFILE;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+      assert.equal(os.homedir(), originalHome);
+    }
+  });
+}
+
+withSandboxHome("ensureUploadPathAllowed: normal path passes", async ({ tmpHome: _tmpHome }) => {
+  const { ensureUploadPathAllowed } = require("../runtime/cli");
+  const tmpFile = tempTestFile("upload-ok.json");
+  fs.writeFileSync(tmpFile, "{}");
+  const out = ensureUploadPathAllowed(tmpFile, {});
+  assert.equal(out, fs.realpathSync(tmpFile));
+  fs.unlinkSync(tmpFile);
+});
+
+withSandboxHome("ensureUploadPathAllowed: missing path errors clearly", async () => {
+  const { ensureUploadPathAllowed } = require("../runtime/cli");
+  assert.throws(
+    () => ensureUploadPathAllowed("", {}),
+    /Upload path is required/,
+  );
+});
+
+withSandboxHome("ensureUploadPathAllowed: blocks files under ~/.ssh", async ({ tmpHome }) => {
+  const { ensureUploadPathAllowed } = require("../runtime/cli");
+  const sshDir = path.join(tmpHome, ".ssh");
+  fs.mkdirSync(sshDir);
+  const keyFile = path.join(sshDir, "id_rsa");
+  fs.writeFileSync(keyFile, "PRIVATE KEY");
+  assert.throws(
+    () => ensureUploadPathAllowed(keyFile, {}),
+    /Refusing to upload/,
+  );
+});
+
+withSandboxHome("ensureUploadPathAllowed: blocks ~/.config/clawlabor/credentials.json", async ({ tmpHome }) => {
+  const { ensureUploadPathAllowed } = require("../runtime/cli");
+  const credDir = path.join(tmpHome, ".config", "clawlabor");
+  fs.mkdirSync(credDir, { recursive: true });
+  const credFile = path.join(credDir, "credentials.json");
+  fs.writeFileSync(credFile, "{}");
+  assert.throws(
+    () => ensureUploadPathAllowed(credFile, {}),
+    /Refusing to upload/,
+  );
+});
+
+withSandboxHome("ensureUploadPathAllowed: blocks .env files by basename pattern", async () => {
+  const { ensureUploadPathAllowed } = require("../runtime/cli");
+  const envFile = tempTestFile(".env");
+  fs.writeFileSync(envFile, "SECRET=1");
+  assert.throws(
+    () => ensureUploadPathAllowed(envFile, {}),
+    /matches \/\^\\\.env/,
+  );
+  fs.unlinkSync(envFile);
+});
+
+withSandboxHome("ensureUploadPathAllowed: blocks *.pem files anywhere", async () => {
+  const { ensureUploadPathAllowed } = require("../runtime/cli");
+  const pemFile = tempTestFile("server.pem");
+  fs.writeFileSync(pemFile, "-----BEGIN-----");
+  assert.throws(
+    () => ensureUploadPathAllowed(pemFile, {}),
+    /Refusing to upload/,
+  );
+  fs.unlinkSync(pemFile);
+});
+
+withSandboxHome("ensureUploadPathAllowed: blocks symlinked decoys pointing to sensitive files", async ({ tmpHome }) => {
+  const { ensureUploadPathAllowed } = require("../runtime/cli");
+  const awsDir = path.join(tmpHome, ".aws");
+  fs.mkdirSync(awsDir);
+  const credFile = path.join(awsDir, "credentials");
+  fs.writeFileSync(credFile, "[default]");
+  const decoy = tempTestFile("innocent-data.txt");
+  fs.symlinkSync(credFile, decoy);
+  assert.throws(
+    () => ensureUploadPathAllowed(decoy, {}),
+    /Refusing to upload/,
+  );
+  fs.unlinkSync(decoy);
+});
+
+withSandboxHome("ensureUploadPathAllowed: CLAWLABOR_UPLOAD_BLOCKLIST extends the blocklist", async () => {
+  const { ensureUploadPathAllowed } = require("../runtime/cli");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-extra-"));
+  const inside = path.join(tmpDir, "anything.txt");
+  fs.writeFileSync(inside, "data");
+  assert.throws(
+    () => ensureUploadPathAllowed(inside, { CLAWLABOR_UPLOAD_BLOCKLIST: tmpDir }),
+    /CLAWLABOR_UPLOAD_BLOCKLIST/,
+  );
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});

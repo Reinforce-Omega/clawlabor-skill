@@ -1,4 +1,5 @@
 const fs = require("fs");
+const os = require("os");
 const crypto = require("crypto");
 const path = require("path");
 const {
@@ -29,7 +30,7 @@ const TERMINAL_ORDER_STATES = new Set([
 ]);
 
 function readAttachmentOptions(options, fileOptionName = "file") {
-  const filePath = requiredOption(options, fileOptionName);
+  const filePath = ensureUploadPathAllowed(requiredOption(options, fileOptionName));
   return {
     filePath,
     filename: options.filename || path.basename(filePath),
@@ -97,6 +98,98 @@ const URL_FIELD_SUFFIXES = ["_url", "_uri"];
 const BLOCKED_EXTENSIONS = new Set([".exe", ".bat", ".sh", ".dll", ".ps1", ".cmd", ".vbs", ".js"]);
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100 MB
 
+// Hard blocklist for upload paths: protects against prompt-injected agents
+// being tricked into exfiltrating local secrets. Users extend it via
+// CLAWLABOR_UPLOAD_BLOCKLIST (colon-separated absolute paths).
+const SENSITIVE_HOME_PREFIXES = [
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".kube",
+  ".docker/config.json",
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  ".config/clawlabor",
+  ".config/gcloud",
+  ".config/gh",
+  ".config/op",
+  ".config/anthropic",
+  ".claude",
+  ".codex",
+  ".openclaw",
+  ".hermes",
+];
+const SENSITIVE_BASENAME_PATTERNS = [
+  /^\.env(\..+)?$/i,
+  /(^|[._-])credentials?($|[._-])/i,
+  /(^|[._-])secrets?($|[._-])/i,
+  /^id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$/i,
+  /\.pem$/i,
+  /\.pfx$/i,
+  /\.p12$/i,
+  /\.key$/i,
+];
+
+function expandUser(p) {
+  if (!p) return p;
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+function ensureUploadPathAllowed(localPath, env = process.env) {
+  if (!localPath) {
+    throw new Error("Upload path is required");
+  }
+  const resolved = path.resolve(expandUser(localPath));
+  let realPath = resolved;
+  try {
+    realPath = fs.realpathSync(resolved);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+    // Path does not exist yet; later fs.statSync will surface the error.
+  }
+  const home = os.homedir();
+  const extraRaw = (env.CLAWLABOR_UPLOAD_BLOCKLIST || "")
+    .split(":")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((rawEntry) => path.resolve(expandUser(rawEntry)));
+
+  const candidates = resolved === realPath ? [resolved] : [resolved, realPath];
+
+  for (const candidate of candidates) {
+    const base = path.basename(candidate);
+    for (const pattern of SENSITIVE_BASENAME_PATTERNS) {
+      if (pattern.test(base)) {
+        throw new Error(
+          `Refusing to upload sensitive file: ${candidate} (basename matches ${pattern}). ` +
+          "If this is a deliberate user-authorized upload, copy/rename the file to a non-sensitive path first.",
+        );
+      }
+    }
+    for (const rel of SENSITIVE_HOME_PREFIXES) {
+      const blocked = path.join(home, rel);
+      if (candidate === blocked || candidate.startsWith(`${blocked}${path.sep}`)) {
+        throw new Error(
+          `Refusing to upload from protected location: ${candidate} (under ${blocked}). ` +
+          "Move the file outside this directory before uploading.",
+        );
+      }
+    }
+    for (const entry of extraRaw) {
+      if (candidate === entry || candidate.startsWith(`${entry}${path.sep}`)) {
+        throw new Error(
+          `Refusing to upload: ${candidate} matches CLAWLABOR_UPLOAD_BLOCKLIST entry ${entry}.`,
+        );
+      }
+    }
+  }
+
+  return realPath;
+}
+
 function hasUriSchemaField(fieldName, inputSchema) {
   return inputSchema?.properties?.[fieldName]?.format === "uri";
 }
@@ -150,7 +243,8 @@ function guessMimeType(ext) {
 }
 
 async function stageAndUploadFile(deps, entry) {
-  const { field, localPath } = entry;
+  const { field } = entry;
+  const localPath = ensureUploadPathAllowed(entry.localPath, deps.env);
   const base = apiBase(deps.env);
   const apiKey = resolveApiKey(deps.env);
 
@@ -464,6 +558,7 @@ module.exports = {
   defaultAgentName,
   deriveBountyFromGoal,
   diagnosticStatus,
+  ensureUploadPathAllowed,
   fetchOrderAttachments,
   fetchOrderCancellationContext,
   guessMimeType,

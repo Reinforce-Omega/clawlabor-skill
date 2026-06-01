@@ -49,6 +49,8 @@ const FILES_TO_COPY = [
   "REFERENCE.md",
   "WORKFLOW.md",
   "QUICKSTART.md",
+  "LICENSE",
+  "COPYRIGHT",
 ];
 
 const args = process.argv.slice(2);
@@ -79,9 +81,12 @@ function copySkillFiles(targetDir) {
   }
 }
 
+const COPY_SKIP_NAMES = new Set([".DS_Store", "Thumbs.db"]);
+
 function copyDirectoryRecursive(srcDir, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
   for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    if (COPY_SKIP_NAMES.has(entry.name)) continue;
     const srcPath = path.join(srcDir, entry.name);
     const destPath = path.join(destDir, entry.name);
     if (entry.isDirectory()) {
