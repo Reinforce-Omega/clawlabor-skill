@@ -1,8 +1,10 @@
 const {
   apiBase,
   attachmentPath,
+  buildSampleRequirement,
   candidateListingForPlan,
   compactListingForPlan,
+  describeRequiredFields,
   credentialState,
   credentialsFileMode,
   credentialsFilePath,
@@ -67,7 +69,14 @@ function solveCommand(options, flags, goal, requirementProvided, requirement, id
 }
 
 async function commandPlan(options, deps, flags) {
-  const body = matchBody(options, flags, deps.env);
+  // plan is "buy preview", not discovery: ask the server for top 5 by default.
+  // Users wanting more switching candidates pass --candidates N (forwarded as body.limit).
+  const candidateLimitOpt = numberOption(options, "candidates");
+  const candidateLimit = candidateLimitOpt && candidateLimitOpt > 0 ? candidateLimitOpt : 5;
+  if (options["limit"] === undefined) {
+    options = { ...options, limit: String(candidateLimit) };
+  }
+  const body = matchBody(options, flags, deps.env, { defaultLimit: candidateLimit });
   const matchResult = await requestJson(deps, "POST", "/listings/match", { body });
   const matches = Array.isArray(matchResult.matches) ? matchResult.matches : [];
   const requirementProvided = Boolean(options["requirement-json"] || options["requirement-file"]);
@@ -79,10 +88,19 @@ async function commandPlan(options, deps, flags) {
 
   const idempotencyKey = options["idempotency-key"] || deps.makeIdempotencyKey();
   const schemaCheck = validateRequirementAgainstSchema(requirement, selected.input_schema);
+  const requiredFields = describeRequiredFields(selected.input_schema);
+  const sampleRequirement = buildSampleRequirement(selected.input_schema, requirement);
   const policy = selected.policy || { allowed: true, blocked_reasons: [] };
-  const candidates = matches
-    .filter((item) => item.policy?.allowed !== false)
-    .map((item) => candidateListingForPlan(item, requirement));
+
+  // Server already enforced the limit (body.limit set above). Reorder so selected
+  // is always first; no extra slicing here.
+  const allowedMatches = matches.filter((item) => item.policy?.allowed !== false);
+  const reorderedAllowed = [
+    ...(selected ? [selected] : []),
+    ...allowedMatches.filter((item) => item.id !== selected?.id),
+  ];
+  const candidates = reorderedAllowed.map((item) => candidateListingForPlan(item, requirement));
+  const candidatesTruncated = candidates.length >= candidateLimit;
   const rejectedListings = matches
     .filter((item) => item.policy?.allowed === false)
     .map((item) => ({
@@ -91,26 +109,44 @@ async function commandPlan(options, deps, flags) {
     }));
 
   const goal = requiredOption(options, "goal");
+  const command = solveCommand(options, flags, goal, true, sampleRequirement, idempotencyKey);
+  const blockedBy = schemaCheck.valid
+    ? []
+    : schemaCheck.missing.map(
+        (field) => `Replace <TODO:${field}:...> in sample_requirement before running command`,
+      );
   const plan = {
-    action: "solve",
+    next_action: {
+      type: "execute_solve",
+      terminal: false,
+      decision_required: true,
+      ready: schemaCheck.valid,
+      command,
+      blocked_by: blockedBy,
+    },
     goal,
     listing: compactListingForPlan(selected),
     candidates,
-    decision: {
-      allowed: policy.allowed !== false,
-      blocked_reasons: policy.blocked_reasons || [],
-      why_matched: selected.match_explanation || "",
-      how_to_use: selected.invocation_guidance || [],
+    candidates_meta: {
+      returned: candidates.length,
+      requested_limit: candidateLimit,
+      possibly_truncated: candidatesTruncated,
+      hint: candidatesTruncated
+        ? `Showing ${candidates.length} candidates (server limit hit). Pass --candidates N (max 50) for more, or --verbose for full debug.`
+        : null,
     },
     idempotency_key: idempotencyKey,
     input: {
-      schema: selected.input_schema || null,
       requirement: requirementProvided ? requirement : null,
       valid: schemaCheck.valid,
       missing_required_fields: schemaCheck.missing,
+      required_fields: requiredFields,
+      sample_requirement: sampleRequirement,
+      sample_requirement_hint:
+        schemaCheck.valid
+          ? "Requirement covers all required fields; sample_requirement equals your input."
+          : "Replace any <TODO:fieldname:type[:format]> placeholders with real values, then pass via --requirement-json.",
     },
-    execute_command: solveCommand(options, flags, goal, requirementProvided, requirement, idempotencyKey),
-    legacy_buy_command: `clawlabor buy --listing ${selected.id} --idempotency-key ${idempotencyKey}`,
   };
   if (flags.has("verbose")) {
     plan.debug = {

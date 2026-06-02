@@ -1264,17 +1264,28 @@ test("plan emits a compact agent-facing purchase plan", async () => {
     status: "active",
     inventory: 1,
   });
-  assert.deepEqual(plan.input.schema.required, ["url", "question"]);
+  // next_action replaces top-level action/execute_command/decision.
+  assert.equal(plan.next_action.type, "execute_solve");
+  assert.equal(plan.next_action.terminal, false);
+  assert.equal(plan.next_action.ready, false); // missing "question" field
+  assert.deepEqual(plan.next_action.blocked_by, [
+    "Replace <TODO:question:...> in sample_requirement before running command",
+  ]);
+  // This mock's input_schema declares `required` but no `properties`, so
+  // buildSampleRequirement can't infer a placeholder value for "question" —
+  // it stays absent from sample_requirement. blocked_by still flags it via
+  // schemaCheck.missing so the agent knows to add it.
+  assert.equal(
+    plan.next_action.command,
+    "clawlabor solve --goal 'Analyze' --requirement-json '{\"url\":\"https://x.com\"}' --idempotency-key 'fixed-key'",
+  );
+
+  // input.* (no input.schema anymore — selected schema lives on candidates[0])
   assert.deepEqual(plan.input.requirement, { url: "https://x.com" });
   assert.equal(plan.input.valid, false);
   assert.deepEqual(plan.input.missing_required_fields, ["question"]);
-  assert.equal(
-    plan.execute_command,
-    "clawlabor solve --goal 'Analyze' --requirement-json '{\"url\":\"https://x.com\"}' --idempotency-key 'fixed-key'",
-  );
-  assert.equal(plan.legacy_buy_command, "clawlabor buy --listing sku-123 --idempotency-key fixed-key");
-  assert.equal(plan.decision.why_matched, "Matched because the task needs public evidence.");
-  assert.deepEqual(plan.decision.how_to_use, ["Expected outcome: sourced research brief"]);
+
+  // candidates[0] is the single authoritative selected listing view.
   assert.equal(plan.candidates.length, 1);
   assert.equal(plan.candidates[0].id, "sku-123");
   assert.equal(plan.candidates[0].description, "Long listing text that should not be duplicated in the default plan.");
@@ -1283,12 +1294,31 @@ test("plan emits a compact agent-facing purchase plan", async () => {
   assert.equal(plan.candidates[0].schema_compatibility.valid, false);
   assert.deepEqual(plan.candidates[0].schema_compatibility.missing_required_fields, ["question"]);
   assert.equal(plan.candidates[0].decision.why_matched, "Matched because the task needs public evidence.");
+  assert.deepEqual(plan.candidates[0].decision.how_to_use, ["Expected outcome: sourced research brief"]);
+
+  // Redundant views removed.
+  assert.equal(plan.action, undefined, "top-level action replaced by next_action.type");
+  assert.equal(plan.decision, undefined, "top-level decision is a duplicate of candidates[0].decision");
+  assert.equal(plan.execute_command, undefined, "execute_command replaced by next_action.command");
+  assert.equal(plan.raw_execute_command, undefined);
+  assert.equal(plan.legacy_buy_command, undefined);
+  assert.equal(plan.input.schema, undefined, "input.schema is a duplicate of candidates[0].input_schema");
   assert.equal(plan.selected_listing, undefined);
   assert.equal(plan.match_explanation, undefined);
   assert.equal(plan.invocation_guidance, undefined);
   assert.equal(plan.rejected_listings, undefined);
-  assert.equal(plan.input_schema, undefined);
   assert.equal(plan.debug, undefined);
+
+  // listing summary kept for "what did plan pick" at-a-glance.
+  assert.deepEqual(plan.listing, {
+    id: "sku-123",
+    title: "Research",
+    price: 20,
+    category: "research_analysis",
+    trust_score: 92,
+    status: "active",
+    inventory: 1,
+  });
 });
 
 test("plan --verbose includes raw match debug data", async () => {
@@ -1365,14 +1395,16 @@ test("plan chooses a schema-compatible allowed listing", async () => {
   const plan = JSON.parse(out[0]);
   assert.equal(plan.listing.id, "sku-url");
   assert.equal(plan.input.valid, true);
-  assert.match(plan.execute_command, /^clawlabor solve --goal 'Analyze site'/);
-  assert.equal(plan.execute_command.includes("clawlabor buy"), false);
-  assert.deepEqual(plan.candidates.map((candidate) => candidate.id), ["sku-repo", "sku-url"]);
+  assert.match(plan.next_action.command, /^clawlabor solve --goal 'Analyze site'/);
+  assert.equal(plan.next_action.command.includes("clawlabor buy"), false);
+  assert.equal(plan.next_action.type, "execute_solve");
+  // selected listing is prepended so agents see the chosen one first.
+  assert.deepEqual(plan.candidates.map((candidate) => candidate.id), ["sku-url", "sku-repo"]);
   assert.deepEqual(
     plan.candidates.map((candidate) => candidate.schema_compatibility),
     [
-      { valid: false, missing_required_fields: ["repo_url"] },
       { valid: true, missing_required_fields: [] },
+      { valid: false, missing_required_fields: ["repo_url"] },
     ],
   );
 });
@@ -2330,9 +2362,21 @@ test("solve fails fast when requirement misses required schema fields", async ()
         matches: [
           {
             id: "sku-1",
+            title: "Deep Researcher",
             price: 20,
             trust_score: 90,
-            input_schema: { type: "object", required: ["url", "question"] },
+            input_schema: {
+              type: "object",
+              required: ["url", "question"],
+              properties: {
+                url: { type: "string", format: "uri", description: "Page to analyze" },
+                question: {
+                  type: "string",
+                  description: "What you want to know",
+                  example: "What is the company's pricing model?",
+                },
+              },
+            },
             policy: { allowed: true, blocked_reasons: [] },
           },
         ],
@@ -2350,8 +2394,124 @@ test("solve fails fast when requirement misses required schema fields", async ()
       ],
       { env: BASE_ENV, fetch, stdout: () => {} },
     ),
-    (err) => err.errorCode === "requirement_invalid" && err.missing.includes("question"),
+    (err) => {
+      if (err.errorCode !== "requirement_invalid") return false;
+      if (!err.missing.includes("question")) return false;
+      if (err.listingId !== "sku-1") return false;
+      if (err.listingTitle !== "Deep Researcher") return false;
+      if (!Array.isArray(err.missingFieldHints)) return false;
+      const questionHint = err.missingFieldHints.find((f) => f.name === "question");
+      if (!questionHint || questionHint.description !== "What you want to know") return false;
+      if (questionHint.example !== "What is the company's pricing model?") return false;
+      if (!err.sampleRequirement || err.sampleRequirement.url !== "https://x.com") return false;
+      if (err.sampleRequirement.question !== "What is the company's pricing model?") return false;
+      if (!err.planCommand || !err.planCommand.startsWith("clawlabor plan --goal")) return false;
+      if (!err.rerunCommand || !err.rerunCommand.includes("--requirement-json")) return false;
+      return true;
+    },
   );
+});
+
+test("plan defaults body.limit to 5 and forwards --candidates N", async () => {
+  const stubMatches = (limit) => ({
+    matches: Array.from({ length: limit }, (_, i) => ({
+      id: `sku-${i}`,
+      title: `Stub ${i}`,
+      price: 5,
+      trust_score: 80,
+      input_schema: { type: "object", required: [] },
+      policy: { allowed: true, blocked_reasons: [] },
+    })),
+  });
+  const captureRequests = [];
+  const stdout = () => {};
+  const recordingFetchWithCapture = (responses) => ({
+    fetch: async (url, init) => {
+      captureRequests.push({ url, body: init?.body ? JSON.parse(init.body) : null });
+      return responses.shift();
+    },
+  });
+
+  // default: --candidates not passed → body.limit=5
+  {
+    captureRequests.length = 0;
+    const { fetch } = recordingFetchWithCapture([
+      { ok: true, status: 200, text: async () => JSON.stringify(stubMatches(5)) },
+    ]);
+    await runCli(["plan", "--goal", "anything"], { env: BASE_ENV, fetch, stdout });
+    assert.equal(captureRequests[0].body.limit, 5, "default plan limit should be 5");
+  }
+
+  // --candidates 20 → body.limit=20
+  {
+    captureRequests.length = 0;
+    const { fetch } = recordingFetchWithCapture([
+      { ok: true, status: 200, text: async () => JSON.stringify(stubMatches(20)) },
+    ]);
+    await runCli(["plan", "--goal", "anything", "--candidates", "20"], {
+      env: BASE_ENV,
+      fetch,
+      stdout,
+    });
+    assert.equal(captureRequests[0].body.limit, 20, "--candidates N should forward to body.limit");
+  }
+
+  // explicit --limit always wins over --candidates
+  {
+    captureRequests.length = 0;
+    const { fetch } = recordingFetchWithCapture([
+      { ok: true, status: 200, text: async () => JSON.stringify(stubMatches(3)) },
+    ]);
+    await runCli(
+      ["plan", "--goal", "anything", "--candidates", "20", "--limit", "3"],
+      { env: BASE_ENV, fetch, stdout },
+    );
+    assert.equal(captureRequests[0].body.limit, 3, "explicit --limit overrides --candidates");
+  }
+});
+
+test("plan returns required_fields with metadata and a pre-filled sample_requirement", async () => {
+  const captured = [];
+  const stdout = (line) => captured.push(line);
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/listings/match", {
+      status: 200,
+      body: JSON.stringify({
+        matches: [
+          {
+            id: "sku-1",
+            title: "Web Search",
+            price: 5,
+            trust_score: 80,
+            input_schema: {
+              type: "object",
+              required: ["question", "language"],
+              properties: {
+                question: { type: "string", description: "The query" },
+                language: { type: "string", enum: ["en", "zh"], default: "en" },
+              },
+            },
+            policy: { allowed: true, blocked_reasons: [] },
+          },
+        ],
+      }),
+    }),
+  ]);
+  await runCli(["plan", "--goal", "search for deepseek news"], {
+    env: BASE_ENV,
+    fetch,
+    stdout,
+  });
+  const plan = JSON.parse(captured.join(""));
+  assert.ok(Array.isArray(plan.input.required_fields));
+  assert.equal(plan.input.required_fields.length, 2);
+  const questionField = plan.input.required_fields.find((f) => f.name === "question");
+  assert.equal(questionField.description, "The query");
+  assert.equal(plan.input.sample_requirement.language, "en"); // from default
+  assert.equal(plan.input.sample_requirement.question, "<TODO:question:string>");
+  assert.ok(plan.next_action.command.includes("--requirement-json"));
+  assert.ok(plan.next_action.command.includes("<TODO:question:string>"));
+  assert.equal(plan.next_action.ready, false);
 });
 
 test("ApiError surfaces insufficient_credits classification", async () => {
@@ -2689,7 +2849,23 @@ test("skill contract tells agents to discover marketplace capabilities before lo
   assert.match(skill, /marketplace is the source of truth/);
   assert.match(skill, /do not rely on this skill file to enumerate/);
   assert.match(skill, /clawlabor plan --goal "<requested deliverable>"/);
-  assert.match(skill, /omit `--category`/);
+  // No `clawlabor plan` or `clawlabor solve` invocation in the doc should mention
+  // --category or --max-completion-seconds. Both flags rely on unreliable SKU
+  // metadata (mis-tagged categories, noisy avg_completion_seconds) and risk
+  // filtering out the right listing. Lower-level `clawlabor match` may still use them.
+  const invocationRegex = /clawlabor\s+(plan|solve)[^\n`]*/g;
+  let m;
+  while ((m = invocationRegex.exec(skill)) !== null) {
+    const snippet = m[0];
+    assert.ok(
+      !/--category\b/.test(snippet),
+      `plan/solve invocation must not surface --category: "${snippet}"`,
+    );
+    assert.ok(
+      !/--max-completion-seconds\b/.test(snippet),
+      `plan/solve invocation must not surface --max-completion-seconds: "${snippet}"`,
+    );
+  }
 });
 
 test("skill contract gives buyer guidance for insufficient credits", () => {
