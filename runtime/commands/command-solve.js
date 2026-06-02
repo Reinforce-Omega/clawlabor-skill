@@ -1,7 +1,9 @@
 const {
   apiBase,
   attachmentPath,
+  buildSampleRequirement,
   compactListingForPlan,
+  describeRequiredFields,
   credentialState,
   credentialsFileMode,
   credentialsFilePath,
@@ -32,6 +34,7 @@ const {
   requestMultipart,
   resolveApiKey,
   requiredOption,
+  shellQuote,
   stageAndUploadFile,
   stringOptionFromFile,
   summarizeOrderMessages,
@@ -353,11 +356,25 @@ async function commandSolve(options, deps, flags) {
   // 2. local schema validation (skip required-field check for file-input fields already injected above)
   const schemaCheck = validateRequirementAgainstSchema(requirement, selected.input_schema);
   if (!schemaCheck.valid) {
+    const listingLabel = selected.title || selected.name || selected.id;
+    const fieldHints = describeRequiredFields(selected.input_schema)
+      .filter((field) => schemaCheck.missing.includes(field.name));
+    const sample = buildSampleRequirement(selected.input_schema, requirement);
+    const planCmd = `clawlabor plan --goal ${shellQuote(goal)}`;
+    const rerunCmd = `clawlabor solve --goal ${shellQuote(goal)} --requirement-json ${shellQuote(JSON.stringify(sample))}`;
     const err = new Error(
-      `Requirement missing required fields for selected listing: ${schemaCheck.missing.join(", ")}`,
+      `Requirement missing required fields for listing "${listingLabel}": ${schemaCheck.missing.join(", ")}. ` +
+      `Run \`${planCmd}\` to preview the schema and a pre-filled sample requirement, ` +
+      `or rerun solve after replacing the <TODO:...> placeholders in sample_requirement.`,
     );
     err.errorCode = "requirement_invalid";
     err.missing = schemaCheck.missing;
+    err.listingId = selected.id;
+    err.listingTitle = listingLabel;
+    err.missingFieldHints = fieldHints;
+    err.sampleRequirement = sample;
+    err.planCommand = planCmd;
+    err.rerunCommand = rerunCmd;
     throw err;
   }
 

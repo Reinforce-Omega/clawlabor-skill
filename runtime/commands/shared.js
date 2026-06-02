@@ -353,7 +353,7 @@ function loadPolicy(options, env) {
   return JSON.parse(fs.readFileSync(policyFile, "utf8"));
 }
 
-function matchBody(options, flags, env) {
+function matchBody(options, flags, env, { defaultLimit } = {}) {
   const policy = loadPolicy(options, env);
   const body = {
     goal: requiredOption(options, "goal"),
@@ -378,8 +378,12 @@ function matchBody(options, flags, env) {
     body.min_trust_score = Number(policy.min_trust_score);
   }
 
-  const limit = numberOption(options, "limit");
-  if (limit !== undefined) body.limit = limit;
+  const explicitLimit = numberOption(options, "limit");
+  if (explicitLimit !== undefined) {
+    body.limit = explicitLimit;
+  } else if (defaultLimit !== undefined) {
+    body.limit = defaultLimit;
+  }
 
   const requireSchema = flags && flags.has("require-schema");
   if (requireSchema) {
@@ -406,6 +410,55 @@ function validateRequirementAgainstSchema(requirement, schema) {
     return value === undefined || value === null || value === "";
   });
   return { valid: missing.length === 0, missing };
+}
+
+function describeRequiredFields(schema) {
+  if (!schema || typeof schema !== "object" || !schema.properties) return [];
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  return required.map((name) => {
+    const prop = schema.properties[name] || {};
+    const exampleFromProp = prop.example !== undefined
+      ? prop.example
+      : (Array.isArray(prop.examples) && prop.examples.length > 0 ? prop.examples[0] : null);
+    return {
+      name,
+      type: prop.type || "string",
+      format: prop.format || null,
+      description: prop.description || null,
+      enum: Array.isArray(prop.enum) ? prop.enum : null,
+      default: prop.default !== undefined ? prop.default : null,
+      example: exampleFromProp,
+    };
+  });
+}
+
+function buildSampleRequirement(schema, providedRequirement) {
+  const sample = providedRequirement ? { ...providedRequirement } : {};
+  if (!schema || typeof schema !== "object" || !schema.properties) return sample;
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  for (const name of required) {
+    const current = sample[name];
+    if (current !== undefined && current !== null && current !== "") continue;
+    const prop = schema.properties[name] || {};
+    if (prop.example !== undefined) {
+      sample[name] = prop.example;
+    } else if (Array.isArray(prop.examples) && prop.examples.length > 0) {
+      sample[name] = prop.examples[0];
+    } else if (prop.default !== undefined) {
+      sample[name] = prop.default;
+    } else if (Array.isArray(prop.enum) && prop.enum.length > 0) {
+      sample[name] = prop.enum[0];
+    } else {
+      const typeTag = prop.type || "string";
+      const formatTag = prop.format ? `:${prop.format}` : "";
+      sample[name] = `<TODO:${name}:${typeTag}${formatTag}>`;
+    }
+  }
+  return sample;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 function pickCompatibleListing(matches, requirement) {
@@ -435,6 +488,15 @@ function compactListingForPlan(listing) {
   };
 }
 
+function summarizeOutputSchema(schema) {
+  if (!schema || typeof schema !== "object") return null;
+  const props = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+  return {
+    type: schema.type || null,
+    fields: Object.keys(props),
+  };
+}
+
 function candidateListingForPlan(listing, requirement) {
   const schemaCheck = validateRequirementAgainstSchema(requirement || {}, listing?.input_schema);
   return {
@@ -444,7 +506,7 @@ function candidateListingForPlan(listing, requirement) {
     score: listing?.score ?? null,
     reasons: Array.isArray(listing?.reasons) ? listing.reasons : [],
     input_schema: listing?.input_schema || null,
-    output_schema: listing?.output_schema || null,
+    output_schema_summary: summarizeOutputSchema(listing?.output_schema),
     schema_compatibility: {
       valid: schemaCheck.valid,
       missing_required_fields: schemaCheck.missing,
@@ -452,6 +514,7 @@ function candidateListingForPlan(listing, requirement) {
     decision: {
       allowed: listing?.policy?.allowed !== false,
       blocked_reasons: listing?.policy?.blocked_reasons || [],
+      // Source of truth for verbosity is the server; client never truncates.
       why_matched: listing?.match_explanation || "",
       how_to_use: listing?.invocation_guidance || [],
     },
@@ -550,8 +613,10 @@ module.exports = {
   ApiError,
   attachmentPath,
   apiBase,
+  buildSampleRequirement,
   candidateListingForPlan,
   compactListingForPlan,
+  describeRequiredFields,
   credentialState,
   credentialsFileMode,
   credentialsFilePath,
@@ -584,6 +649,7 @@ module.exports = {
   requestMultipart,
   resolveApiKey,
   requiredOption,
+  shellQuote,
   stageAndUploadFile,
   stringOptionFromFile,
   summarizeOrderMessages,
