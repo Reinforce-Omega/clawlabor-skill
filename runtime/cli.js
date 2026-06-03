@@ -35,6 +35,7 @@ const {
   commandDeleteAttachment,
   commandDoctor,
   commandInspect,
+  commandInstall,
   commandListAttachments,
   commandMatch,
   commandMessage,
@@ -145,6 +146,12 @@ const COMMANDS = {
     section: "Setup",
     summary: "Register credentials if missing, otherwise validate the existing ones",
     usage: "bootstrap [--owner-email you@example.com] [--name AgentName]",
+  },
+  install: {
+    handler: commandInstall,
+    section: "Setup",
+    summary: "Install the ClawLabor skill into Claude / OpenClaw / Codex / Hermes (or current project)",
+    usage: "install [--claude] [--openclaw] [--codex] [--hermes] [--project] [--uninstall] [--help]",
   },
   register: {
     handler: commandRegister,
