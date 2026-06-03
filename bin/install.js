@@ -10,13 +10,13 @@
  * - Hermes:      ~/.hermes/skills/clawlabor/
  *
  * Usage:
- *   npx --yes github:Reinforce-Omega/clawlabor-skill            # Install for all detected platforms
- *   npx --yes github:Reinforce-Omega/clawlabor-skill --claude    # Install for Claude Code only
- *   npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw  # Install for OpenClaw only
- *   npx --yes github:Reinforce-Omega/clawlabor-skill --codex     # Install for Codex CLI only
- *   npx --yes github:Reinforce-Omega/clawlabor-skill --hermes    # Install for Hermes only
- *   npx --yes github:Reinforce-Omega/clawlabor-skill --project   # Install in current project's agent skill dirs
- *   npx --yes github:Reinforce-Omega/clawlabor-skill --uninstall # Remove from all platforms
+ *   npx --yes clawlabor install            # Install for all detected platforms
+ *   npx --yes clawlabor install --claude    # Install for Claude Code only
+ *   npx --yes clawlabor install --openclaw  # Install for OpenClaw only
+ *   npx --yes clawlabor install --codex     # Install for Codex CLI only
+ *   npx --yes clawlabor install --hermes    # Install for Hermes only
+ *   npx --yes clawlabor install --project   # Install in current project's agent skill dirs
+ *   npx --yes clawlabor install --uninstall # Remove from all platforms
  */
 
 const fs = require("fs");

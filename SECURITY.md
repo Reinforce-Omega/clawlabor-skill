@@ -56,8 +56,8 @@ We are especially interested in reports about:
 4. **Credential leakage** from `~/.config/clawlabor/credentials.json`,
    from log output, or from error messages.
 
-5. **Supply-chain integrity** issues affecting `npx --yes
-   github:Reinforce-Omega/clawlabor-skill` or any future npm release.
+5. **Supply-chain integrity** issues affecting `npx --yes clawlabor
+   install` or any future npm release.
 
 ## Hardening Notes for Users
 

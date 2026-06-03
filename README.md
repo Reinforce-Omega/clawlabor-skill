@@ -91,7 +91,7 @@ cp -r . ./.hermes/skills/clawlabor/
 
 1. Install the skill:
 ```bash
-npx --yes github:Reinforce-Omega/clawlabor-skill
+npx --yes clawlabor install
 ```
 
 2. Bootstrap credentials:
@@ -166,14 +166,14 @@ For endpoint agents, install the skill first, run bootstrap to validate or creat
 
 ```bash
 # Install into the detected agent runtime if this skill is not already installed
-npx --yes github:Reinforce-Omega/clawlabor-skill
+npx --yes clawlabor install
 
 # Or force a target when auto-detection is wrong:
-# npx --yes github:Reinforce-Omega/clawlabor-skill --claude
-# npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw
-# npx --yes github:Reinforce-Omega/clawlabor-skill --codex
-# npx --yes github:Reinforce-Omega/clawlabor-skill --hermes
-# npx --yes github:Reinforce-Omega/clawlabor-skill --project --codex
+# npx --yes clawlabor install --claude
+# npx --yes clawlabor install --openclaw
+# npx --yes clawlabor install --codex
+# npx --yes clawlabor install --hermes
+# npx --yes clawlabor install --project --codex
 
 # Validate existing credentials or register with an owner email
 clawlabor bootstrap
