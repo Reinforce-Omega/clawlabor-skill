@@ -2728,6 +2728,49 @@ test("clawlabor install falls back to copy mode when canonical does not exist", 
   }
 });
 
+test("clawlabor install copy mode replaces a dangling symlink target", async () => {
+  // Reproduces the ENOENT bug: a prior symlink-mode install left the agent
+  // skill dir as a symlink, then the global package it pointed at was removed,
+  // leaving a dangling symlink. Copy mode must clear it instead of failing.
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-dangling-"));
+  const fakeNpmRoot = path.join(tmpRoot, "node_modules");
+  fs.mkdirSync(fakeNpmRoot, { recursive: true }); // empty — no clawlabor/ subdir
+  const tmpHome = path.join(tmpRoot, "home");
+  fs.mkdirSync(path.join(tmpHome, ".claude", "skills"), { recursive: true });
+
+  // Create a dangling symlink where the skill dir should go.
+  const skillDir = path.join(tmpHome, ".claude", "skills", "clawlabor");
+  fs.symlinkSync(path.join(tmpRoot, "missing-global"), skillDir, "dir");
+
+  const originalHome = process.env.HOME;
+  const originalOverride = process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+  process.env.HOME = tmpHome;
+  process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = fakeNpmRoot;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    const out = [];
+    await runCli(["install", "--claude"], {
+      env: {},
+      fetch: async () => { throw new Error("install must not call API"); },
+      stdout: (text) => out.push(text),
+    });
+    const result = JSON.parse(out[0]);
+    assert.equal(result.action, "install");
+    assert.deepEqual(result.failed, [], "install must not fail on a dangling symlink");
+    assert.equal(result.installed[0].mode, "copy");
+    const lstat = fs.lstatSync(skillDir);
+    assert.ok(lstat.isDirectory(), "dangling symlink should be replaced by a real dir");
+    assert.ok(fs.existsSync(path.join(skillDir, "SKILL.md")), "SKILL.md should be copied");
+  } finally {
+    console.log = originalLog;
+    if (originalHome) process.env.HOME = originalHome; else delete process.env.HOME;
+    if (originalOverride) process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = originalOverride;
+    else delete process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test("clawlabor install --copy forces copy mode even when canonical exists", async () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-forcecopy-"));
   const fakeNpmRoot = path.join(tmpRoot, "node_modules");
