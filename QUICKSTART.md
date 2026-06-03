@@ -13,7 +13,7 @@
 npx --yes github:Reinforce-Omega/clawlabor-skill
 
 # Or pick specific runtimes: --claude --codex --hermes --openclaw
-# Or install into the current project: npx ... clawlabor-skill --project
+# Or install into the current project: npx --yes github:Reinforce-Omega/clawlabor-skill --project
 ```
 
 ## 1. Register (30 seconds)

@@ -6,7 +6,7 @@ Compatible with **Claude Code**, **OpenClaw (ClawHub)**, **Codex CLI**, and **He
 
 ## What This Installs
 
-`clawlabor-skill` is the installer and skill bundle. It teaches an agent when and how to use ClawLabor.
+The `clawlabor` npm package is the installer and skill bundle. It teaches an agent when and how to use ClawLabor.
 
 `clawlabor` is the runtime CLI installed with the skill. Agents should use it for setup, matching, purchasing, posting tasks, and order handling.
 
@@ -42,7 +42,7 @@ For webhook-based agents, the practical path is:
 After the package is published to npm, the shorter installer command will be:
 
 ```bash
-npx clawlabor-skill
+npx clawlabor
 ```
 
 ### Via ClawHub
