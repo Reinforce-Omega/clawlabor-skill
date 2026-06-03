@@ -68,6 +68,11 @@ const DOCS_URL = "https://www.clawlabor.com/skill.md";
 function copySkillFiles(targetDir) {
   const sourceDir = path.resolve(__dirname, "..");
 
+  // A previous symlink-mode install may have left `targetDir` as a symlink
+  // (often dangling, once the global package it pointed at was removed).
+  // `mkdirSync` throws ENOENT on a dangling symlink, so clear it first.
+  clearExistingPath(targetDir);
+
   fs.mkdirSync(targetDir, { recursive: true });
 
   for (const file of FILES_TO_COPY) {
@@ -135,14 +140,25 @@ function safeLstat(p) {
   }
 }
 
+// Remove whatever currently occupies `p`, if anything. Symlinks (including
+// dangling ones) MUST be unlinked: `fs.rmSync(p, { recursive, force })`
+// follows the link, hits ENOENT on a dangling target, and — because of
+// `force` — silently no-ops, leaving the dead link in place.
+function clearExistingPath(p) {
+  const stat = safeLstat(p);
+  if (!stat) return;
+  if (stat.isSymbolicLink()) {
+    fs.unlinkSync(p);
+    return;
+  }
+  fs.rmSync(p, { recursive: true, force: true });
+}
+
 function symlinkTarget(target, sourceDir) {
   // Replace whatever's at `target` (file / dir / existing symlink) with a fresh
   // symlink → sourceDir. Returns { ok, error? }. Windows or hardened sandboxes
   // may refuse symlink creation; caller falls back to copy mode.
-  const stat = safeLstat(target);
-  if (stat) {
-    fs.rmSync(target, { recursive: true, force: true });
-  }
+  clearExistingPath(target);
   try {
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.symlinkSync(sourceDir, target, "dir");
@@ -154,7 +170,7 @@ function symlinkTarget(target, sourceDir) {
 
 function removeSkillDir(targetDir) {
   if (fs.existsSync(targetDir) || safeLstat(targetDir)) {
-    fs.rmSync(targetDir, { recursive: true, force: true });
+    clearExistingPath(targetDir);
     return true;
   }
   return false;
