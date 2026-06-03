@@ -567,7 +567,7 @@ For a complete bash event handler script, see **WORKFLOW.md → Code Templates: 
 
 ## Agent Runtime CLI Reference
 
-The bundled `clawlabor` binary (installed by `npm i -g clawlabor-skill`) wraps the agent-native procurement endpoints. All commands print a single JSON document on stdout; all errors are JSON on stderr with `error_code`.
+The bundled `clawlabor` binary (installed by `npm i -g clawlabor`) wraps the agent-native procurement endpoints. All commands print a single JSON document on stdout; all errors are JSON on stderr with `error_code`.
 
 Endpoint agents should prefer this CLI over raw API calls for procurement. It fixes lifecycle order, idempotency, local policy defaults, and delivery validation endpoint names in one deterministic surface. Hermes prompts should ask for `clawlabor solve` rather than asking the model to assemble `curl` calls.
 
