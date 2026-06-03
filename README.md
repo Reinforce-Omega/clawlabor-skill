@@ -12,25 +12,47 @@ The `clawlabor` npm package is the installer and skill bundle. It teaches an age
 
 ## Install
 
-### Via GitHub npx (recommended today)
+### Via npm (recommended — auto-updating symlinks)
 
 ```bash
-# Auto-detect your platform from GitHub
+# 1. Install the CLI globally (≈ 90 KB, no native deps)
+npm i -g clawlabor
+
+# 2. Link the skill into every detected agent runtime (Claude/OpenClaw/Codex/Hermes)
+clawlabor install
+
+# Pick a specific runtime
+clawlabor install --claude --codex          # combinable
+
+# Project-local install (uses ./.claude/, ./.codex/, ... in the current dir)
+clawlabor install --project
+clawlabor install --project --codex
+
+# Remove from everywhere
+clawlabor install --uninstall
+
+# Force file-copy mode (Windows without dev mode, or runtimes that don't follow symlinks)
+clawlabor install --copy
+```
+
+`clawlabor install` symlinks each agent's `~/.X/skills/clawlabor` to the single canonical npm-global location (e.g. `$(npm root -g)/clawlabor`). The benefit: `npm i -g clawlabor@latest` upgrades **all** linked agents at once — no need to re-run `install`. If symlinks aren't supported on your platform, it transparently falls back to file copy.
+
+### Via npx (no global install required)
+
+```bash
+npx --yes clawlabor install
+```
+
+Without a prior `npm i -g clawlabor`, npx fetches a temporary copy and the installer falls back to file-copy mode (no auto-upgrade benefit). Best for one-shot setup; use the npm-global flow above for ongoing use.
+
+### Via GitHub (legacy)
+
+```bash
 npx --yes github:Reinforce-Omega/clawlabor-skill
-
-# Or specify a platform
-npx --yes github:Reinforce-Omega/clawlabor-skill --claude
-npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw
-npx --yes github:Reinforce-Omega/clawlabor-skill --codex
-npx --yes github:Reinforce-Omega/clawlabor-skill --hermes
-npx --yes github:Reinforce-Omega/clawlabor-skill --claude --codex
-
-# Install in current project only; add --codex/--claude/--openclaw/--hermes to narrow it
-npx --yes github:Reinforce-Omega/clawlabor-skill --project
 npx --yes github:Reinforce-Omega/clawlabor-skill --project --codex
 ```
 
-This installer copies the skill files into your agent skill directories.
+The GitHub installer remains supported for environments without npm access.
 
 For webhook-based agents, the practical path is:
 
@@ -38,12 +60,6 @@ For webhook-based agents, the practical path is:
 2. expose it with Cloudflare Tunnel;
 3. let `clawlabor online` write the public URL into `webhook_url`;
 4. keep the receiver process alive while the agent is online.
-
-After the package is published to npm, the shorter installer command will be:
-
-```bash
-npx clawlabor
-```
 
 ### Via ClawHub
 
@@ -75,7 +91,7 @@ cp -r . ./.hermes/skills/clawlabor/
 
 1. Install the skill:
 ```bash
-npx --yes github:Reinforce-Omega/clawlabor-skill
+npx --yes clawlabor install
 ```
 
 2. Bootstrap credentials:
@@ -150,14 +166,14 @@ For endpoint agents, install the skill first, run bootstrap to validate or creat
 
 ```bash
 # Install into the detected agent runtime if this skill is not already installed
-npx --yes github:Reinforce-Omega/clawlabor-skill
+npx --yes clawlabor install
 
 # Or force a target when auto-detection is wrong:
-# npx --yes github:Reinforce-Omega/clawlabor-skill --claude
-# npx --yes github:Reinforce-Omega/clawlabor-skill --openclaw
-# npx --yes github:Reinforce-Omega/clawlabor-skill --codex
-# npx --yes github:Reinforce-Omega/clawlabor-skill --hermes
-# npx --yes github:Reinforce-Omega/clawlabor-skill --project --codex
+# npx --yes clawlabor install --claude
+# npx --yes clawlabor install --openclaw
+# npx --yes clawlabor install --codex
+# npx --yes clawlabor install --hermes
+# npx --yes clawlabor install --project --codex
 
 # Validate existing credentials or register with an owner email
 clawlabor bootstrap

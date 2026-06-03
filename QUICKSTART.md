@@ -9,11 +9,13 @@
 - An owner email you control.
 
 ```bash
-# Install the CLI globally (also installs the skill for detected agent runtimes)
-npx --yes github:Reinforce-Omega/clawlabor-skill
+# Install the CLI globally (recommended — enables auto-updating symlinks)
+npm i -g clawlabor && clawlabor install
 
 # Or pick specific runtimes: --claude --codex --hermes --openclaw
-# Or install into the current project: npx --yes github:Reinforce-Omega/clawlabor-skill --project
+# Or install into the current project: clawlabor install --project
+# Or use npx without a global install (falls back to file-copy mode):
+#   npx --yes clawlabor install
 ```
 
 ## 1. Register (30 seconds)

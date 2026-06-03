@@ -2626,6 +2626,169 @@ test("bin adds next guidance for insufficient credits", () => {
   assert.match(err.next, /lower --max-price/);
 });
 
+test("clawlabor install --help returns help action without copying files", async () => {
+  // Silence the installer's console.log to keep test output clean.
+  const originalLog = console.log;
+  const originalErr = console.error;
+  console.log = () => {};
+  console.error = () => {};
+  try {
+    const out = [];
+    await runCli(["install", "--help"], {
+      env: {},
+      fetch: async () => {
+        throw new Error("install must not call the marketplace API");
+      },
+      stdout: (text) => out.push(text),
+    });
+    const result = JSON.parse(out[0]);
+    assert.equal(result.action, "help");
+    assert.deepEqual(result.installed, []);
+    assert.deepEqual(result.failed, []);
+  } finally {
+    console.log = originalLog;
+    console.error = originalErr;
+  }
+});
+
+test("clawlabor install links agent dirs to the npm-global canonical when present", async () => {
+  // Build a fake npm-global root containing a clawlabor package, plus a fresh
+  // HOME so we never touch the real ~/.claude etc.
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-link-"));
+  const fakeNpmRoot = path.join(tmpRoot, "node_modules");
+  const canonical = path.join(fakeNpmRoot, "clawlabor");
+  fs.mkdirSync(canonical, { recursive: true });
+  fs.writeFileSync(path.join(canonical, "SKILL.md"), "stub\n");
+  const tmpHome = path.join(tmpRoot, "home");
+  fs.mkdirSync(path.join(tmpHome, ".claude"), { recursive: true }); // detection picks claude
+
+  const originalHome = process.env.HOME;
+  const originalOverride = process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+  process.env.HOME = tmpHome;
+  process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = fakeNpmRoot;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    const out = [];
+    await runCli(["install", "--claude"], {
+      env: {},
+      fetch: async () => { throw new Error("install must not call API"); },
+      stdout: (text) => out.push(text),
+    });
+    const result = JSON.parse(out[0]);
+    assert.equal(result.action, "install");
+    assert.equal(result.installed.length, 1);
+    assert.equal(result.installed[0].mode, "link");
+    assert.equal(result.installed[0].target, canonical);
+    // Verify the symlink actually exists and points where we expect.
+    const linkPath = path.join(tmpHome, ".claude", "skills", "clawlabor");
+    const lstat = fs.lstatSync(linkPath);
+    assert.ok(lstat.isSymbolicLink(), "claude skill dir should be a symlink");
+    assert.equal(fs.readlinkSync(linkPath), canonical);
+  } finally {
+    console.log = originalLog;
+    if (originalHome) process.env.HOME = originalHome; else delete process.env.HOME;
+    if (originalOverride) process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = originalOverride;
+    else delete process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("clawlabor install falls back to copy mode when canonical does not exist", async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-copy-"));
+  const fakeNpmRoot = path.join(tmpRoot, "node_modules");
+  fs.mkdirSync(fakeNpmRoot, { recursive: true });   // empty — no clawlabor/ subdir
+  const tmpHome = path.join(tmpRoot, "home");
+  fs.mkdirSync(path.join(tmpHome, ".claude"), { recursive: true });
+
+  const originalHome = process.env.HOME;
+  const originalOverride = process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+  process.env.HOME = tmpHome;
+  process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = fakeNpmRoot;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    const out = [];
+    await runCli(["install", "--claude"], {
+      env: {},
+      fetch: async () => { throw new Error("install must not call API"); },
+      stdout: (text) => out.push(text),
+    });
+    const result = JSON.parse(out[0]);
+    assert.equal(result.action, "install");
+    assert.equal(result.installed[0].mode, "copy", "should fall back to copy when canonical missing");
+    const installedPath = path.join(tmpHome, ".claude", "skills", "clawlabor", "SKILL.md");
+    assert.ok(fs.existsSync(installedPath), "SKILL.md should be copied to target");
+  } finally {
+    console.log = originalLog;
+    if (originalHome) process.env.HOME = originalHome; else delete process.env.HOME;
+    if (originalOverride) process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = originalOverride;
+    else delete process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("clawlabor install --copy forces copy mode even when canonical exists", async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-forcecopy-"));
+  const fakeNpmRoot = path.join(tmpRoot, "node_modules");
+  const canonical = path.join(fakeNpmRoot, "clawlabor");
+  fs.mkdirSync(canonical, { recursive: true });
+  fs.writeFileSync(path.join(canonical, "SKILL.md"), "stub\n");
+  const tmpHome = path.join(tmpRoot, "home");
+  fs.mkdirSync(path.join(tmpHome, ".claude"), { recursive: true });
+
+  const originalHome = process.env.HOME;
+  const originalOverride = process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+  process.env.HOME = tmpHome;
+  process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = fakeNpmRoot;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    const out = [];
+    await runCli(["install", "--claude", "--copy"], {
+      env: {},
+      fetch: async () => { throw new Error("install must not call API"); },
+      stdout: (text) => out.push(text),
+    });
+    const result = JSON.parse(out[0]);
+    assert.equal(result.installed[0].mode, "copy", "--copy should override symlink preference");
+  } finally {
+    console.log = originalLog;
+    if (originalHome) process.env.HOME = originalHome; else delete process.env.HOME;
+    if (originalOverride) process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = originalOverride;
+    else delete process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("clawlabor install --uninstall reports an uninstall action", async () => {
+  // Point HOME at an empty temp dir so we never touch the real ~/.claude etc.
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-install-test-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    const out = [];
+    await runCli(["install", "--uninstall"], {
+      env: {},
+      fetch: async () => {
+        throw new Error("install must not call the marketplace API");
+      },
+      stdout: (text) => out.push(text),
+    });
+    const result = JSON.parse(out[0]);
+    assert.equal(result.action, "uninstall");
+    // Empty HOME → nothing to remove; not a failure.
+    assert.deepEqual(result.removed, []);
+  } finally {
+    console.log = originalLog;
+    if (originalHome) process.env.HOME = originalHome;
+    else delete process.env.HOME;
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
 test("every COMMANDS entry has handler, summary, usage, and section metadata", () => {
   for (const [name, meta] of Object.entries(COMMANDS)) {
     assert.equal(typeof meta.handler, "function", `${name} missing handler`);
