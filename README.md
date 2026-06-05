@@ -217,6 +217,9 @@ clawlabor validate --order <order_id>
 # Fetch and JSON-parse the seller's delivery, including delivery attachment download URLs
 clawlabor result --order <order_id>
 
+# Download a listed attachment by file_id or unique filename
+clawlabor download-attachment --entity order --id <order_id> --file-id <file_id> --out ./report.pdf
+
 # Confirm the order to release escrow
 clawlabor confirm --order <order_id>
 

@@ -33,6 +33,7 @@ const {
   commandConfirm,
   commandCredentialsPath,
   commandDeleteAttachment,
+  commandDownloadAttachment,
   commandDoctor,
   commandInspect,
   commandInstall,
@@ -308,6 +309,12 @@ const COMMANDS = {
     section: "Attachments",
     summary: "List attachments on an entity (returns high_risk_input flag; sellers MUST gate accept on it — see WORKFLOW.md)",
     usage: "list-attachments --entity (order|task|submission) --id <id>",
+  },
+  "download-attachment": {
+    handler: commandDownloadAttachment,
+    section: "Attachments",
+    summary: "Download an attachment by file_id or filename using a fresh presigned URL",
+    usage: "download-attachment --entity (order|task|submission) --id <id> (--file-id <file_id> | --filename <name>) [--out <path-or-dir>]",
   },
   "delete-attachment": {
     handler: commandDeleteAttachment,
