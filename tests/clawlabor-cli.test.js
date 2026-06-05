@@ -39,7 +39,12 @@ function recordingFetch(routes) {
     return {
       ok: result.ok ?? (result.status >= 200 && result.status < 300),
       status: result.status ?? 200,
-      text: async () => result.body ?? "",
+      text: async () => Buffer.isBuffer(result.body) ? result.body.toString("utf8") : (result.body ?? ""),
+      arrayBuffer: async () => {
+        const body = result.body ?? "";
+        const buffer = Buffer.isBuffer(body) ? body : Buffer.from(String(body));
+        return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+      },
     };
   };
   return { calls, fetch: fetchImpl };
@@ -1699,6 +1704,64 @@ test("result includes delivery attachments with download URLs", async () => {
   assert.equal(data.attachments.file_count, 2);
   assert.equal(data.attachments.delivery_file_count, 1);
   assert.equal(data.attachments.delivery_files[0].download_url, "https://storage.example.test/report.pdf?sig=abc");
+});
+
+test("download-attachment downloads by file_id to output path", async () => {
+  const outPath = tempTestFile("report.pdf");
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/orders/order-1/attachments", {
+      status: 200,
+      body: JSON.stringify({
+        files: [
+          {
+            file_id: "file-delivery",
+            filename: "report.pdf",
+            download_url: "https://storage.example.test/report.pdf?sig=abc",
+          },
+        ],
+      }),
+    }),
+    {
+      match: ({ url, options }) =>
+        (options.method || "GET") === "GET" && url === "https://storage.example.test/report.pdf?sig=abc",
+      respond: { status: 200, body: Buffer.from("pdf bytes") },
+    },
+  ]);
+  const out = [];
+
+  await runCli(
+    ["download-attachment", "--entity", "order", "--id", "order-1", "--file-id", "file-delivery", "--out", outPath],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+
+  const result = JSON.parse(out[0]);
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/orders/order-1/attachments");
+  assert.equal(calls[1].url, "https://storage.example.test/report.pdf?sig=abc");
+  assert.equal(result.path, outPath);
+  assert.equal(result.bytes, 9);
+  assert.equal(fs.readFileSync(outPath, "utf8"), "pdf bytes");
+});
+
+test("download-attachment rejects duplicate filenames", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/orders/order-1/attachments", {
+      status: 200,
+      body: JSON.stringify({
+        files: [
+          { file_id: "file-1", filename: "report.pdf", download_url: "https://storage.example.test/1" },
+          { file_id: "file-2", filename: "report.pdf", download_url: "https://storage.example.test/2" },
+        ],
+      }),
+    }),
+  ]);
+
+  await assert.rejects(
+    runCli(
+      ["download-attachment", "--entity", "order", "--id", "order-1", "--filename", "report.pdf"],
+      { env: BASE_ENV, fetch, stdout: () => {} },
+    ),
+    /Multiple attachments named report\.pdf; use --file-id instead/,
+  );
 });
 
 test("confirm posts to confirm endpoint", async () => {

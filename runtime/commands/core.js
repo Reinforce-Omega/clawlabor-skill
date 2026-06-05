@@ -10,6 +10,7 @@ const { commandComplete } = require("./command-complete");
 const { commandConfirm } = require("./command-confirm");
 const { commandCredentialsPath } = require("./command-credentials-path");
 const { commandDeleteAttachment } = require("./command-delete-attachment");
+const { commandDownloadAttachment } = require("./command-download-attachment");
 const { commandDoctor } = require("./command-doctor");
 const { commandInspect } = require("./command-inspect");
 const { commandInstall } = require("./command-install");
@@ -43,6 +44,7 @@ module.exports = {
   commandConfirm,
   commandCredentialsPath,
   commandDeleteAttachment,
+  commandDownloadAttachment,
   commandDoctor,
   commandInspect,
   commandInstall,
