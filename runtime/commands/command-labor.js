@@ -31,6 +31,43 @@ async function commandHire(options, deps) {
 }
 
 // ---------------------------------------------------------------------------
+// labor-publish — create a labor resource and publish it (available)
+// ---------------------------------------------------------------------------
+async function commandLaborPublish(options, deps) {
+  const name = requiredOption(options, "name");
+  const description = requiredOption(options, "description");
+  const rate = positiveNumberOption(options, "rate");
+  if (rate === undefined) {
+    throw new Error("Missing required --rate");
+  }
+  const body = {
+    name,
+    description,
+    hourly_rate_uat: rate,
+    min_duration_hours: numberOption(options, "min-hours") || 1,
+    max_duration_hours: numberOption(options, "max-hours") || 24,
+    tier: options.tier || "tier_1",
+  };
+  if (options.gatekeeper) {
+    body.gatekeeper_prompt = options.gatekeeper;
+  }
+  const created = await requestJson(deps, "POST", "/labor", { body });
+  const published = await requestJson(deps, "PUT", `/labor/${created.id}`, {
+    body: { status: "available" },
+  });
+  return JSON.stringify(
+    {
+      action: "labor-publish",
+      labor_resource_id: created.id,
+      status: published.status,
+      name: published.name,
+    },
+    null,
+    2,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // labor-chat — send one message to a hire and print the streamed reply
 // ---------------------------------------------------------------------------
 function parseSseChunks(sse) {
@@ -129,11 +166,36 @@ async function commandLaborServe(options, deps) {
     }
   }
 
-  await heartbeatOnce();
+  // While serving, auto-accept incoming hires for this resource (the worker is on
+  // the job, so it takes the work). A pending hire otherwise auto-rejects at 24h.
+  async function acceptPendingHires() {
+    try {
+      const result = await requestJson(
+        deps, "GET", `/labor/${laborId}/hires?status=pending_accept`, {},
+      );
+      for (const hire of result.items || []) {
+        try {
+          await requestJson(deps, "POST", `/labor/${hire.id}/accept`, {});
+          stdout(`accepted hire ${hire.id}\n`);
+        } catch (_e) {
+          /* skip this hire; try again next tick */
+        }
+      }
+    } catch (_e) {
+      /* best effort */
+    }
+  }
+
+  async function tick() {
+    await acceptPendingHires();
+    await heartbeatOnce();
+  }
+
+  await tick();
   while (running) {
     await sleep(60000);
     if (!running) break;
-    await heartbeatOnce();
+    await tick();
   }
 
   try { container.kill && container.kill(); } catch (_e) { /* noop */ }
@@ -147,4 +209,10 @@ async function commandLaborServe(options, deps) {
   );
 }
 
-module.exports = { commandHire, commandLaborChat, commandLaborServe, parseSseChunks };
+module.exports = {
+  commandHire,
+  commandLaborChat,
+  commandLaborPublish,
+  commandLaborServe,
+  parseSseChunks,
+};

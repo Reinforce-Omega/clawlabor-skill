@@ -4010,6 +4010,8 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
       }),
     }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: { status: 200, body: '{"items":[]}' } },
     matchRoute("POST", "/labor/labor-9/heartbeat", { status: 204, body: "" }),
     matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
   ]);
@@ -4037,4 +4039,51 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(spawned[1].args.includes("TT")); // tunnel_token
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/heartbeat")));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "DELETE"));
+});
+
+test("labor-publish creates and publishes a labor resource", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-7" }) }),
+    matchRoute("PUT", "/labor/labor-7", {
+      status: 200,
+      body: JSON.stringify({ id: "labor-7", status: "available", name: "Cook bot" }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-publish", "--name", "Cook bot", "--description", "rented cook",
+     "--rate", "10", "--gatekeeper", "only cooking"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  const createBody = JSON.parse(calls[0].options.body);
+  assert.equal(createBody.hourly_rate_uat, 10);
+  assert.equal(createBody.gatekeeper_prompt, "only cooking");
+  assert.equal(JSON.parse(calls[1].options.body).status, "available");
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.labor_resource_id, "labor-7");
+  assert.equal(parsed.status, "available");
+});
+
+test("labor-serve auto-accepts pending hires for the resource", async () => {
+  const accepted = [];
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", {
+      status: 200,
+      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-labor-9.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: { status: 200, body: '{"items":[{"id":"hire-1","status":"pending_accept"}]}' } },
+    { match: ({ url, options }) => options.method === "POST" && url.endsWith("/labor/hire-1/accept"),
+      respond: ({ url }) => { accepted.push(url); return { status: 200, body: '{"id":"hire-1","status":"active"}' }; } },
+    matchRoute("POST", "/labor/labor-9/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    { env: BASE_ENV, fetch, stdout: () => {},
+      spawn: () => ({ kill() {} }), sleep: async () => {}, waitForExit: () => Promise.resolve() },
+  );
+  assert.equal(accepted.length, 1);
+  assert.ok(accepted[0].endsWith("/labor/hire-1/accept"));
 });

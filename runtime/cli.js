@@ -64,6 +64,7 @@ const {
   validateRequirementAgainstSchema,
   commandHire,
   commandLaborChat,
+  commandLaborPublish,
   commandLaborServe,
 } = require("./commands/core");
 
@@ -229,10 +230,16 @@ const COMMANDS = {
     summary: "Send one message to a hire and print the agent's reply",
     usage: "labor-chat --hire <hire_id> --message \"...\"",
   },
+  "labor-publish": {
+    handler: commandLaborPublish,
+    section: "Labor",
+    summary: "Seller: create and publish a labor resource listing (available to hire)",
+    usage: "labor-publish --name \"...\" --description \"...\" --rate <uat_per_hour> [--min-hours N] [--max-hours N] [--tier tier_1] [--gatekeeper \"...\"]",
+  },
   "labor-serve": {
     handler: commandLaborServe,
     section: "Labor",
-    summary: "Seller: provision a platform tunnel, run the sandbox + cloudflared, and heartbeat",
+    summary: "Seller: provision a platform tunnel, run the sandbox + cloudflared, auto-accept hires, and heartbeat",
     usage: "labor-serve --labor <labor_resource_id> [--port 2468] [--image <docker_image>]",
   },
   solve: {
