@@ -16,6 +16,11 @@ const {
   parseDeliveryNote,
   COMMANDS,
 } = require("../runtime/cli");
+const {
+  isExpired,
+  readClaudeOauthToken,
+  resolveClaudeCodeOauthToken,
+} = require("../runtime/claude_auth");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 
@@ -4015,6 +4020,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
       env: BASE_ENV,
       fetch,
       stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
       spawn: (cmd, args) => {
         spawned.push({ cmd, args });
         return { kill() {} };
@@ -4028,10 +4034,62 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "POST"));
   assert.equal(spawned[0].cmd, "docker");
   assert.ok(spawned[0].args.includes("SBX")); // sandbox_token passed as --token
+  assert.ok(spawned[0].args.includes("--name"));
+  assert.ok(spawned[0].args.includes("clawlabor-labor-labor-9"));
+  assert.ok(spawned[0].args.includes("CLAUDE_CODE_OAUTH_TOKEN"));
+  assert.ok(!spawned[0].args.includes("oauth-token-123"));
   assert.equal(spawned[1].cmd, "cloudflared");
   assert.ok(spawned[1].args.includes("TT")); // tunnel_token
+  assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-labor-labor-9"));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/heartbeat")));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "DELETE"));
+});
+
+test("labor-serve keeps the startup seller API key for long-running requests", async () => {
+  const seenAuth = [];
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", {
+      status: 200,
+      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-labor-9.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: ({ options }) => {
+        seenAuth.push(options.headers.Authorization);
+        return { status: 200, body: '{"items":[{"id":"hire-1","status":"pending_accept"}]}' };
+      } },
+    { match: ({ url, options }) => options.method === "POST" && url.endsWith("/labor/hire-1/accept"),
+      respond: ({ options }) => {
+        seenAuth.push(options.headers.Authorization);
+        return { status: 200, body: '{"id":"hire-1","status":"active"}' };
+      } },
+    matchRoute("POST", "/labor/labor-9/heartbeat", {
+      status: 204,
+      body: "",
+    }),
+    matchRoute("DELETE", "/labor/labor-9/serve", {
+      status: 204,
+      body: "",
+    }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: { ...BASE_ENV },
+      fetch: async (url, options) => {
+        if (url.endsWith("/labor/labor-9/heartbeat") || url.endsWith("/labor/labor-9/serve")) {
+          seenAuth.push(options.headers.Authorization);
+        }
+        return fetch(url, options);
+      },
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => Promise.resolve(),
+    },
+  );
+  assert.deepEqual([...new Set(seenAuth)], ["Bearer test-key"]);
 });
 
 test("labor-publish creates and publishes a labor resource", async () => {
@@ -4077,10 +4135,48 @@ test("labor-serve auto-accepts pending hires for the resource", async () => {
   await runCli(
     ["labor-serve", "--labor", "labor-9"],
     { env: BASE_ENV, fetch, stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
       spawn: () => ({ kill() {} }), sleep: async () => {}, waitForExit: () => Promise.resolve() },
   );
   assert.equal(accepted.length, 1);
   assert.ok(accepted[0].endsWith("/labor/hire-1/accept"));
+});
+
+test("readClaudeOauthToken reads valid Claude Code OAuth credentials and skips expired ones", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-claude-oauth-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  const credentialsFile = path.join(credentialsDir, ".credentials.json");
+  fs.writeFileSync(credentialsFile, JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "fresh-oauth-token",
+      expiresAt: Date.now() + 60_000,
+    },
+  }));
+  assert.equal(readClaudeOauthToken({ HOME: home }), "fresh-oauth-token");
+  fs.writeFileSync(credentialsFile, JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "expired-oauth-token",
+      expiresAt: Date.now() - 60_000,
+    },
+  }));
+  assert.equal(readClaudeOauthToken({ HOME: home }), null);
+  assert.equal(isExpired("2000-01-01T00:00:00Z"), true);
+});
+
+test("resolveClaudeCodeOauthToken never runs claude setup-token", async () => {
+  const calls = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-no-setup-token-")) },
+    readClaudeOauthToken: () => null,
+    runClaudeAuthStatus: async () => {
+      calls.push(["auth", "status"]);
+      return { ok: true };
+    },
+  });
+  assert.equal(result.token, null);
+  assert.equal(result.authStatusOk, true);
+  assert.deepEqual(calls, [["auth", "status"]]);
 });
 
 test("labor-unpublish delists a resource (sets it inactive)", async () => {

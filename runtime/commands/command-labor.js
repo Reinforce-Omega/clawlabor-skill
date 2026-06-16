@@ -2,7 +2,8 @@
 //
 // Unit convention: labor is sold BY THE DAY. The API schema is day-facing and
 // converts to seconds at its service/DB boundary. See docs/2026-06-16-labor-technical-solution.md.
-const { request, requestJson } = require("../http");
+const { resolveClaudeCodeOauthToken } = require("../claude_auth");
+const { envWithApiKey, request, requestJson, resolveApiKey } = require("../http");
 const { numberOption, positiveNumberOption, requiredOption } = require("../options");
 
 // ---------------------------------------------------------------------------
@@ -137,19 +138,35 @@ async function commandLaborServe(options, deps) {
   const spawn = deps.spawn || require("child_process").spawn;
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const stdout = deps.stdout || (() => {});
+  const sellerApiKey = resolveApiKey(deps.env);
+  if (!sellerApiKey) {
+    throw new Error("Set CLAWLABOR_API_KEY or store api_key in ~/.config/clawlabor/credentials.json before calling clawlabor");
+  }
+  const sellerDeps = { ...deps, env: envWithApiKey(deps.env, sellerApiKey) };
+  const claudeOauth = await resolveClaudeCodeOauthToken(deps);
+  if (!claudeOauth.token) {
+    const authHint = claudeOauth.authStatusOk
+      ? "Claude Code is logged in, but no fresh local claude.ai OAuth token was available. Open Claude Code once or wait for any Claude session limit to reset, then retry."
+      : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription.";
+    throw new Error(
+      `labor-serve requires a working local Claude Code claude.ai subscription login. ${authHint}`,
+    );
+  }
 
-  const provisioned = await requestJson(deps, "POST", `/labor/${laborId}/serve`, {});
+  const provisioned = await requestJson(sellerDeps, "POST", `/labor/${laborId}/serve`, {});
   const { tunnel_token, sandbox_token, hostname } = provisioned;
+  const containerName = `clawlabor-labor-${laborId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
+  const runtimeEnv = { ...deps.env, CLAUDE_CODE_OAUTH_TOKEN: claudeOauth.token };
 
   // Sandbox runtime: bound to localhost (only cloudflared reaches it), --token enforced.
   const container = spawn(
     "docker",
     [
-      "run", "--rm", "-p", `127.0.0.1:${port}:2468`,
+      "run", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
       "-e", "CLAUDE_CODE_OAUTH_TOKEN",
       image, "server", "--token", sandbox_token, "--host", "0.0.0.0", "--port", "2468",
     ],
-    { stdio: "inherit", env: deps.env },
+    { stdio: "inherit", env: runtimeEnv },
   );
   // cloudflared connects the platform-managed tunnel to the local container.
   const tunnel = spawn("cloudflared", ["tunnel", "run", "--token", tunnel_token], {
@@ -175,7 +192,7 @@ async function commandLaborServe(options, deps) {
       healthy = false;
     }
     try {
-      await requestJson(deps, "POST", `/labor/${laborId}/heartbeat`, { body: { healthy } });
+      await requestJson(sellerDeps, "POST", `/labor/${laborId}/heartbeat`, { body: { healthy } });
     } catch (_e) {
       /* best effort */
     }
@@ -186,11 +203,11 @@ async function commandLaborServe(options, deps) {
   async function acceptPendingHires() {
     try {
       const result = await requestJson(
-        deps, "GET", `/labor/${laborId}/hires?status=pending_accept`, {},
+        sellerDeps, "GET", `/labor/${laborId}/hires?status=pending_accept`, {},
       );
       for (const hire of result.items || []) {
         try {
-          await requestJson(deps, "POST", `/labor/${hire.id}/accept`, {});
+          await requestJson(sellerDeps, "POST", `/labor/${hire.id}/accept`, {});
           stdout(`accepted hire ${hire.id}\n`);
         } catch (_e) {
           /* skip this hire; try again next tick */
@@ -215,7 +232,8 @@ async function commandLaborServe(options, deps) {
 
   try { container.kill && container.kill(); } catch (_e) { /* noop */ }
   try { tunnel.kill && tunnel.kill(); } catch (_e) { /* noop */ }
-  try { await requestJson(deps, "DELETE", `/labor/${laborId}/serve`, {}); } catch (_e) { /* noop */ }
+  try { spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" }); } catch (_e) { /* noop */ }
+  try { await requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}); } catch (_e) { /* noop */ }
 
   return JSON.stringify(
     { action: "labor-serve", labor_id: laborId, hostname, status: "stopped" },

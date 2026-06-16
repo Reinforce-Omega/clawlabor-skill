@@ -420,6 +420,8 @@ async function runCli(argv, injected = {}) {
       injected.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     now: injected.now || (() => Date.now()),
     waitForExit: injected.waitForExit || waitForSignals,
+    readClaudeOauthToken: injected.readClaudeOauthToken,
+    runClaudeAuthStatus: injected.runClaudeAuthStatus,
   };
   if (!deps.fetch) {
     throw new Error("This Node.js runtime does not provide fetch");

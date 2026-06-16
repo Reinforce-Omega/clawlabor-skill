@@ -40,6 +40,10 @@ function resolveApiKey(env) {
   return env.CLAWLABOR_API_KEY || readCredentialsFile(env);
 }
 
+function envWithApiKey(env, apiKey) {
+  return { ...env, CLAWLABOR_API_KEY: apiKey };
+}
+
 function credentialState(env) {
   const credentialsPath = credentialsFilePath(env);
   const fileExists = fs.existsSync(credentialsPath);
@@ -211,5 +215,6 @@ module.exports = {
   requestJsonNoAuth,
   requestMultipart,
   resolveApiKey,
+  envWithApiKey,
   writeCredentialsFile,
 };
