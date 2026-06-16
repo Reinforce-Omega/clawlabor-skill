@@ -1,20 +1,17 @@
 // Labor mode commands: hire a worker, serve a worker, chat with a hire.
 //
-// Unit convention: labor is sold BY THE DAY (user-facing), but the API/DB time and
-// settle BY THE HOUR (1 day = 24 hours). The CLI converts at this boundary — days
-// in, hours to the API. See docs/2026-06-16-labor-technical-solution.md.
+// Unit convention: labor is sold BY THE DAY. The API schema is day-facing and
+// converts to seconds at its service/DB boundary. See docs/2026-06-16-labor-technical-solution.md.
 const { request, requestJson } = require("../http");
 const { numberOption, positiveNumberOption, requiredOption } = require("../options");
 
-const HOURS_PER_DAY = 24;
-
 // ---------------------------------------------------------------------------
-// hire — buy exclusive use of a labor resource for N hours
+// hire — buy exclusive use of a labor resource for one day
 // ---------------------------------------------------------------------------
 async function commandHire(options, deps) {
   const listing = requiredOption(options, "listing");
   // v1: rentals are exactly one day (multi-day not yet supported).
-  const body = { labor_resource_id: listing, duration_hours: HOURS_PER_DAY };
+  const body = { labor_resource_id: listing, duration_days: 1 };
   if (options.message) {
     body.message = options.message;
   }
@@ -25,7 +22,7 @@ async function commandHire(options, deps) {
       hire_id: hire.id,
       status: hire.status,
       labor_resource_id: hire.labor_resource_id,
-      duration_days: hire.duration_hours / HOURS_PER_DAY,
+      duration_days: hire.duration_days,
       frozen_nano: hire.frozen_nano,
     },
     null,
@@ -46,10 +43,9 @@ async function commandLaborPublish(options, deps) {
   const body = {
     name,
     description,
-    // v1: by-day price, fixed one-day rentals -> hourly internals (1 day = 24h)
-    hourly_rate_uat: dailyRate / HOURS_PER_DAY,
-    min_duration_hours: HOURS_PER_DAY,
-    max_duration_hours: HOURS_PER_DAY,
+    hourly_rate_uat: dailyRate,
+    min_duration_days: 1,
+    max_duration_days: 1,
     tier: options.tier || "tier_1",
   };
   if (options.gatekeeper) {

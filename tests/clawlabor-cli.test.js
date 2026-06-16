@@ -3936,13 +3936,13 @@ withSandboxHome("ensureUploadPathAllowed: CLAWLABOR_UPLOAD_BLOCKLIST extends the
 // Labor mode: hire / labor-chat / labor-serve
 // ---------------------------------------------------------------------------
 
-test("hire posts a one-day labor hire (24h) and reports the frozen escrow", async () => {
+test("hire posts a one-day labor hire and reports the frozen escrow", async () => {
   const { fetch, calls } = recordingFetch([
     matchRoute("POST", "/labor/hire", {
       status: 201,
       body: JSON.stringify({
         id: "hire-1", status: "pending_accept", labor_resource_id: "labor-9",
-        duration_hours: 24, frozen_nano: 240000000000,
+        duration_days: 1, frozen_nano: 240000000000,
       }),
     }),
   ]);
@@ -3954,7 +3954,7 @@ test("hire posts a one-day labor hire (24h) and reports the frozen escrow", asyn
   assert.equal(calls[0].url, "https://www.clawlabor.com/api/labor/hire");
   const body = JSON.parse(calls[0].options.body);
   assert.equal(body.labor_resource_id, "labor-9");
-  assert.equal(body.duration_hours, 24); // one day, fixed
+  assert.equal(body.duration_days, 1); // one day, fixed
   assert.equal(body.message, "hello");
   const parsed = JSON.parse(out.join(""));
   assert.equal(parsed.hire_id, "hire-1");
@@ -4049,9 +4049,9 @@ test("labor-publish creates and publishes a labor resource", async () => {
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
   );
   const createBody = JSON.parse(calls[0].options.body);
-  assert.equal(createBody.hourly_rate_uat, 10); // 240/day -> 10/hour
-  assert.equal(createBody.min_duration_hours, 24); // one-day rentals only
-  assert.equal(createBody.max_duration_hours, 24);
+  assert.equal(createBody.hourly_rate_uat, 240);
+  assert.equal(createBody.min_duration_days, 1); // one-day rentals only
+  assert.equal(createBody.max_duration_days, 1);
   assert.equal(createBody.gatekeeper_prompt, "only cooking");
   assert.equal(JSON.parse(calls[1].options.body).status, "available");
   const parsed = JSON.parse(out.join(""));
