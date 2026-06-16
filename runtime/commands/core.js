@@ -16,6 +16,7 @@ const {
   commandHire,
   commandLaborChat,
   commandLaborPublish,
+  commandLaborUnpublish,
   commandLaborServe,
 } = require("./command-labor");
 const { commandInspect } = require("./command-inspect");
@@ -77,5 +78,6 @@ module.exports = {
   commandHire,
   commandLaborChat,
   commandLaborPublish,
+  commandLaborUnpublish,
   commandLaborServe,
 };

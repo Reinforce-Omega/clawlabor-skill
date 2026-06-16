@@ -68,6 +68,21 @@ async function commandLaborPublish(options, deps) {
 }
 
 // ---------------------------------------------------------------------------
+// labor-unpublish — delist a resource (set it inactive; reversible via republish)
+// ---------------------------------------------------------------------------
+async function commandLaborUnpublish(options, deps) {
+  const laborId = requiredOption(options, "labor");
+  const updated = await requestJson(deps, "PUT", `/labor/${laborId}`, {
+    body: { status: "inactive" },
+  });
+  return JSON.stringify(
+    { action: "labor-unpublish", labor_resource_id: laborId, status: updated.status },
+    null,
+    2,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // labor-chat — send one message to a hire and print the streamed reply
 // ---------------------------------------------------------------------------
 function parseSseChunks(sse) {
@@ -213,6 +228,7 @@ module.exports = {
   commandHire,
   commandLaborChat,
   commandLaborPublish,
+  commandLaborUnpublish,
   commandLaborServe,
   parseSseChunks,
 };

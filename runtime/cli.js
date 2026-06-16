@@ -65,6 +65,7 @@ const {
   commandHire,
   commandLaborChat,
   commandLaborPublish,
+  commandLaborUnpublish,
   commandLaborServe,
 } = require("./commands/core");
 
@@ -235,6 +236,12 @@ const COMMANDS = {
     section: "Labor",
     summary: "Seller: create and publish a labor resource listing (available to hire)",
     usage: "labor-publish --name \"...\" --description \"...\" --rate <uat_per_hour> [--min-hours N] [--max-hours N] [--tier tier_1] [--gatekeeper \"...\"]",
+  },
+  "labor-unpublish": {
+    handler: commandLaborUnpublish,
+    section: "Labor",
+    summary: "Seller: delist a labor resource (set inactive; republish to re-list)",
+    usage: "labor-unpublish --labor <labor_resource_id>",
   },
   "labor-serve": {
     handler: commandLaborServe,

@@ -4087,3 +4087,21 @@ test("labor-serve auto-accepts pending hires for the resource", async () => {
   assert.equal(accepted.length, 1);
   assert.ok(accepted[0].endsWith("/labor/hire-1/accept"));
 });
+
+test("labor-unpublish delists a resource (sets it inactive)", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("PUT", "/labor/labor-7", {
+      status: 200,
+      body: JSON.stringify({ id: "labor-7", status: "inactive", name: "Cook bot" }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-unpublish", "--labor", "labor-7"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(JSON.parse(calls[0].options.body).status, "inactive");
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.labor_resource_id, "labor-7");
+  assert.equal(parsed.status, "inactive");
+});
