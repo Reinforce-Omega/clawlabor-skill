@@ -2763,6 +2763,60 @@ test("clawlabor install links agent dirs to the npm-global canonical when presen
   }
 });
 
+test("clawlabor install falls back to copy mode when canonical is a symlink", async () => {
+  // npm i -g . or npm link creates a symlink at the global package path.
+  // If we symlink agent skill dirs to that, writes go straight to the source repo.
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-symlink-canonical-"));
+  const fakeNpmRoot = path.join(tmpRoot, "node_modules");
+  const realSourceDir = path.join(tmpRoot, "real-source");
+  const fakeCanonical = path.join(fakeNpmRoot, "clawlabor");
+
+  // Create a "source repo" with enough files to be copyable.
+  fs.mkdirSync(realSourceDir, { recursive: true });
+  fs.writeFileSync(path.join(realSourceDir, "package.json"), "{}\n");
+  fs.writeFileSync(path.join(realSourceDir, "SKILL.md"), "stub\n");
+  fs.mkdirSync(path.join(realSourceDir, "runtime"), { recursive: true });
+  fs.writeFileSync(path.join(realSourceDir, "runtime", "http.js"), "// stub\n");
+
+  // npm global "package" is a symlink pointing to the real source dir.
+  fs.mkdirSync(fakeNpmRoot, { recursive: true });
+  fs.symlinkSync(realSourceDir, fakeCanonical, "dir");
+
+  const tmpHome = path.join(tmpRoot, "home");
+  fs.mkdirSync(path.join(tmpHome, ".claude"), { recursive: true });
+
+  const originalHome = process.env.HOME;
+  const originalOverride = process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+  process.env.HOME = tmpHome;
+  process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = fakeNpmRoot;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    const out = [];
+    await runCli(["install", "--claude"], {
+      env: {},
+      fetch: async () => { throw new Error("install must not call API"); },
+      stdout: (text) => out.push(text),
+    });
+    const result = JSON.parse(out.join(""));
+    assert.equal(result.action, "install");
+    assert.equal(result.installed.length, 1, "should install for exactly one platform");
+    assert.equal(result.installed[0].mode, "copy", "must fall back to copy when canonical is a symlink");
+    assert.ok(!result.installed[0].target, "should not have a symlink target");
+
+    const skillDir = result.installed[0].dir;
+    const lstat = fs.lstatSync(skillDir);
+    assert.ok(lstat.isDirectory(), "skill dir should be a real directory, not a symlink");
+    assert.ok(fs.existsSync(path.join(skillDir, "SKILL.md")), "copied files must exist");
+  } finally {
+    console.log = originalLog;
+    if (originalHome) process.env.HOME = originalHome; else delete process.env.HOME;
+    if (originalOverride) process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = originalOverride;
+    else delete process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test("clawlabor install falls back to copy mode when canonical does not exist", async () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-copy-"));
   const fakeNpmRoot = path.join(tmpRoot, "node_modules");
