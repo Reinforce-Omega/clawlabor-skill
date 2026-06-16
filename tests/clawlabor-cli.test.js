@@ -3936,37 +3936,30 @@ withSandboxHome("ensureUploadPathAllowed: CLAWLABOR_UPLOAD_BLOCKLIST extends the
 // Labor mode: hire / labor-chat / labor-serve
 // ---------------------------------------------------------------------------
 
-test("hire posts a labor hire and reports the frozen escrow", async () => {
+test("hire posts a one-day labor hire (24h) and reports the frozen escrow", async () => {
   const { fetch, calls } = recordingFetch([
     matchRoute("POST", "/labor/hire", {
       status: 201,
       body: JSON.stringify({
         id: "hire-1", status: "pending_accept", labor_resource_id: "labor-9",
-        duration_hours: 4, frozen_nano: 40000000000,
+        duration_hours: 24, frozen_nano: 240000000000,
       }),
     }),
   ]);
   const out = [];
   await runCli(
-    ["hire", "--listing", "labor-9", "--hours", "4", "--message", "hello"],
+    ["hire", "--listing", "labor-9", "--message", "hello"],
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
   );
   assert.equal(calls[0].url, "https://www.clawlabor.com/api/labor/hire");
   const body = JSON.parse(calls[0].options.body);
   assert.equal(body.labor_resource_id, "labor-9");
-  assert.equal(body.duration_hours, 4);
+  assert.equal(body.duration_hours, 24); // one day, fixed
   assert.equal(body.message, "hello");
   const parsed = JSON.parse(out.join(""));
   assert.equal(parsed.hire_id, "hire-1");
+  assert.equal(parsed.duration_days, 1);
   assert.equal(parsed.status, "pending_accept");
-});
-
-test("hire requires --hours", async () => {
-  const { fetch } = recordingFetch([]);
-  await assert.rejects(
-    runCli(["hire", "--listing", "labor-9"], { env: BASE_ENV, fetch, stdout: () => {} }),
-    /Missing required --hours/,
-  );
 });
 
 test("labor-chat streams the SSE reply as plain text", async () => {
@@ -4052,11 +4045,13 @@ test("labor-publish creates and publishes a labor resource", async () => {
   const out = [];
   await runCli(
     ["labor-publish", "--name", "Cook bot", "--description", "rented cook",
-     "--rate", "10", "--gatekeeper", "only cooking"],
+     "--daily-rate", "240", "--gatekeeper", "only cooking"],
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
   );
   const createBody = JSON.parse(calls[0].options.body);
-  assert.equal(createBody.hourly_rate_uat, 10);
+  assert.equal(createBody.hourly_rate_uat, 10); // 240/day -> 10/hour
+  assert.equal(createBody.min_duration_hours, 24); // one-day rentals only
+  assert.equal(createBody.max_duration_hours, 24);
   assert.equal(createBody.gatekeeper_prompt, "only cooking");
   assert.equal(JSON.parse(calls[1].options.body).status, "available");
   const parsed = JSON.parse(out.join(""));

@@ -1,17 +1,20 @@
 // Labor mode commands: hire a worker, serve a worker, chat with a hire.
+//
+// Unit convention: labor is sold BY THE DAY (user-facing), but the API/DB time and
+// settle BY THE HOUR (1 day = 24 hours). The CLI converts at this boundary — days
+// in, hours to the API. See docs/2026-06-16-labor-technical-solution.md.
 const { request, requestJson } = require("../http");
 const { numberOption, positiveNumberOption, requiredOption } = require("../options");
+
+const HOURS_PER_DAY = 24;
 
 // ---------------------------------------------------------------------------
 // hire — buy exclusive use of a labor resource for N hours
 // ---------------------------------------------------------------------------
 async function commandHire(options, deps) {
   const listing = requiredOption(options, "listing");
-  const hours = positiveNumberOption(options, "hours");
-  if (hours === undefined) {
-    throw new Error("Missing required --hours");
-  }
-  const body = { labor_resource_id: listing, duration_hours: hours };
+  // v1: rentals are exactly one day (multi-day not yet supported).
+  const body = { labor_resource_id: listing, duration_hours: HOURS_PER_DAY };
   if (options.message) {
     body.message = options.message;
   }
@@ -22,7 +25,7 @@ async function commandHire(options, deps) {
       hire_id: hire.id,
       status: hire.status,
       labor_resource_id: hire.labor_resource_id,
-      duration_hours: hire.duration_hours,
+      duration_days: hire.duration_hours / HOURS_PER_DAY,
       frozen_nano: hire.frozen_nano,
     },
     null,
@@ -36,16 +39,17 @@ async function commandHire(options, deps) {
 async function commandLaborPublish(options, deps) {
   const name = requiredOption(options, "name");
   const description = requiredOption(options, "description");
-  const rate = positiveNumberOption(options, "rate");
-  if (rate === undefined) {
-    throw new Error("Missing required --rate");
+  const dailyRate = positiveNumberOption(options, "daily-rate");
+  if (dailyRate === undefined) {
+    throw new Error("Missing required --daily-rate");
   }
   const body = {
     name,
     description,
-    hourly_rate_uat: rate,
-    min_duration_hours: numberOption(options, "min-hours") || 1,
-    max_duration_hours: numberOption(options, "max-hours") || 24,
+    // v1: by-day price, fixed one-day rentals -> hourly internals (1 day = 24h)
+    hourly_rate_uat: dailyRate / HOURS_PER_DAY,
+    min_duration_hours: HOURS_PER_DAY,
+    max_duration_hours: HOURS_PER_DAY,
     tier: options.tier || "tier_1",
   };
   if (options.gatekeeper) {

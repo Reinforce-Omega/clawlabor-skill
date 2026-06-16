@@ -222,8 +222,8 @@ const COMMANDS = {
   hire: {
     handler: commandHire,
     section: "Labor",
-    summary: "Hire a labor resource for exclusive use for N hours (freezes escrow)",
-    usage: "hire --listing <labor_resource_id> --hours <N> [--message \"...\"]",
+    summary: "Hire a labor resource for exclusive use for one day (freezes escrow)",
+    usage: "hire --listing <labor_resource_id> [--message \"...\"]",
   },
   "labor-chat": {
     handler: commandLaborChat,
@@ -234,8 +234,8 @@ const COMMANDS = {
   "labor-publish": {
     handler: commandLaborPublish,
     section: "Labor",
-    summary: "Seller: create and publish a labor resource listing (available to hire)",
-    usage: "labor-publish --name \"...\" --description \"...\" --rate <uat_per_hour> [--min-hours N] [--max-hours N] [--tier tier_1] [--gatekeeper \"...\"]",
+    summary: "Seller: create and publish a labor resource listing (priced per day, one-day rentals)",
+    usage: "labor-publish --name \"...\" --description \"...\" --daily-rate <uat_per_day> [--tier tier_1] [--gatekeeper \"...\"]",
   },
   "labor-unpublish": {
     handler: commandLaborUnpublish,
