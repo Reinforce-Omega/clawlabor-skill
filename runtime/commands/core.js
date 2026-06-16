@@ -12,6 +12,7 @@ const { commandCredentialsPath } = require("./command-credentials-path");
 const { commandDeleteAttachment } = require("./command-delete-attachment");
 const { commandDownloadAttachment } = require("./command-download-attachment");
 const { commandDoctor } = require("./command-doctor");
+const { commandHire, commandLaborChat, commandLaborServe } = require("./command-labor");
 const { commandInspect } = require("./command-inspect");
 const { commandInstall } = require("./command-install");
 const { commandListAttachments } = require("./command-list-attachments");
@@ -68,4 +69,7 @@ module.exports = {
   commandUploadAttachment,
   commandValidate,
   commandWait,
+  commandHire,
+  commandLaborChat,
+  commandLaborServe,
 };

@@ -3931,3 +3931,110 @@ withSandboxHome("ensureUploadPathAllowed: CLAWLABOR_UPLOAD_BLOCKLIST extends the
   );
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Labor mode: hire / labor-chat / labor-serve
+// ---------------------------------------------------------------------------
+
+test("hire posts a labor hire and reports the frozen escrow", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/hire", {
+      status: 201,
+      body: JSON.stringify({
+        id: "hire-1", status: "pending_accept", labor_resource_id: "labor-9",
+        duration_hours: 4, frozen_nano: 40000000000,
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["hire", "--listing", "labor-9", "--hours", "4", "--message", "hello"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/labor/hire");
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.labor_resource_id, "labor-9");
+  assert.equal(body.duration_hours, 4);
+  assert.equal(body.message, "hello");
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.hire_id, "hire-1");
+  assert.equal(parsed.status, "pending_accept");
+});
+
+test("hire requires --hours", async () => {
+  const { fetch } = recordingFetch([]);
+  await assert.rejects(
+    runCli(["hire", "--listing", "labor-9"], { env: BASE_ENV, fetch, stdout: () => {} }),
+    /Missing required --hours/,
+  );
+});
+
+test("labor-chat streams the SSE reply as plain text", async () => {
+  const sse =
+    'event: chunk\ndata: {"text": "Boil "}\n\n' +
+    'event: chunk\ndata: {"text": "the egg 7 min."}\n\n' +
+    'event: done\ndata: {"session_id": "s1"}\n\n';
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/hire-1/messages/stream", { status: 200, body: sse }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-chat", "--hire", "hire-1", "--message", "how long to boil an egg?"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(JSON.parse(calls[0].options.body).content, "how long to boil an egg?");
+  assert.equal(out.join(""), "Boil the egg 7 min.");
+});
+
+test("labor-chat surfaces an SSE error event", async () => {
+  const sse = 'event: error\ndata: {"code": "seller_unreachable", "detail": "down"}\n\n';
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/hire-1/messages/stream", { status: 200, body: sse }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-chat", "--hire", "hire-1", "--message", "hi"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.error.code, "seller_unreachable");
+});
+
+test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats, and tears down", async () => {
+  const spawned = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", {
+      status: 200,
+      body: JSON.stringify({
+        tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-labor-9.clawlabor.com",
+      }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/labor-9/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      spawn: (cmd, args) => {
+        spawned.push({ cmd, args });
+        return { kill() {} };
+      },
+      sleep: async () => {},
+      waitForExit: () => Promise.resolve(),
+    },
+  );
+
+  // provisioned, started docker + cloudflared, heartbeat at least once, torn down
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "POST"));
+  assert.equal(spawned[0].cmd, "docker");
+  assert.ok(spawned[0].args.includes("SBX")); // sandbox_token passed as --token
+  assert.equal(spawned[1].cmd, "cloudflared");
+  assert.ok(spawned[1].args.includes("TT")); // tunnel_token
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/heartbeat")));
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "DELETE"));
+});

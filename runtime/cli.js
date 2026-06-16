@@ -62,6 +62,9 @@ const {
   pickCompatibleListing,
   stageAndUploadFile,
   validateRequirementAgainstSchema,
+  commandHire,
+  commandLaborChat,
+  commandLaborServe,
 } = require("./commands/core");
 
 const PKG_VERSION = require("../package.json").version;
@@ -213,6 +216,24 @@ const COMMANDS = {
     section: "Procurement",
     summary: "Purchase a specific listing",
     usage: "buy --listing <listing_id> [--requirement-json '...'] [--input field=value]... [--file field=path]... [--idempotency-key KEY]",
+  },
+  hire: {
+    handler: commandHire,
+    section: "Labor",
+    summary: "Hire a labor resource for exclusive use for N hours (freezes escrow)",
+    usage: "hire --listing <labor_resource_id> --hours <N> [--message \"...\"]",
+  },
+  "labor-chat": {
+    handler: commandLaborChat,
+    section: "Labor",
+    summary: "Send one message to a hire and print the agent's reply",
+    usage: "labor-chat --hire <hire_id> --message \"...\"",
+  },
+  "labor-serve": {
+    handler: commandLaborServe,
+    section: "Labor",
+    summary: "Seller: provision a platform tunnel, run the sandbox + cloudflared, and heartbeat",
+    usage: "labor-serve --labor <labor_resource_id> [--port 2468] [--image <docker_image>]",
   },
   solve: {
     handler: commandSolve,
