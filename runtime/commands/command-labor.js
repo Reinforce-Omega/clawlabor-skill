@@ -158,6 +158,22 @@ async function commandLaborServe(options, deps) {
   const containerName = `clawlabor-labor-${laborId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
   const runtimeEnv = { ...deps.env, CLAUDE_CODE_OAUTH_TOKEN: claudeOauth.token };
 
+  // If another container is already bound to this port, stop it first.
+  // docker run will fail with a bind-mount conflict otherwise.
+  try {
+    const { execSync } = require("child_process");
+    const occupied = execSync(
+      `docker ps --filter "publish=${port}" --format '{{.Names}}'`,
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    if (occupied) {
+      execSync(`docker rm -f ${occupied}`, { stdio: "ignore" });
+      stdout(`Stopped existing container ${occupied} occupying port ${port}\n`);
+    }
+  } catch (_e) {
+    /* best effort — if the command fails, let docker run surface the real error */
+  }
+
   // Sandbox runtime: bound to localhost (only cloudflared reaches it), --token enforced.
   const container = spawn(
     "docker",
