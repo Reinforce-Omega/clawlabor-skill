@@ -1,7 +1,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 function claudeCredentialsPaths(env = process.env) {
   const home = env.HOME || os.homedir();
@@ -19,6 +19,14 @@ function readJsonFile(file) {
   }
 }
 
+function accessTokenFromCredentials(data, now = Date.now()) {
+  const oauth = data && data.claudeAiOauth;
+  const token = oauth && oauth.accessToken;
+  if (typeof token !== "string" || token.length === 0) return null;
+  if (isExpired(oauth.expiresAt, now)) return null;
+  return token;
+}
+
 function isExpired(value, now = Date.now()) {
   if (value === undefined || value === null) return false;
   if (typeof value === "number") return value < now;
@@ -29,14 +37,33 @@ function isExpired(value, now = Date.now()) {
   return false;
 }
 
-function readClaudeOauthToken(env = process.env, now = Date.now()) {
+function readClaudeCodeKeychainCredentials(env = process.env) {
+  if (process.platform !== "darwin") return null;
+  const securityBin = env.CLAWLABOR_SECURITY_BIN || "security";
+  const result = spawnSync(
+    securityBin,
+    ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+    { env, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+  );
+  if (result.status !== 0 || !result.stdout) return null;
+  return result.stdout;
+}
+
+function readClaudeOauthToken(env = process.env, now = Date.now(), deps = {}) {
   for (const file of claudeCredentialsPaths(env)) {
     const data = readJsonFile(file);
-    const oauth = data && data.claudeAiOauth;
-    const token = oauth && oauth.accessToken;
-    if (typeof token !== "string" || token.length === 0) continue;
-    if (isExpired(oauth.expiresAt, now)) continue;
-    return token;
+    const token = accessTokenFromCredentials(data, now);
+    if (token) return token;
+  }
+  const readKeychainCredentials = deps.readClaudeCodeKeychainCredentials || readClaudeCodeKeychainCredentials;
+  const keychainRaw = readKeychainCredentials(env);
+  if (keychainRaw) {
+    try {
+      const token = accessTokenFromCredentials(JSON.parse(keychainRaw), now);
+      if (token) return token;
+    } catch (_err) {
+      // Ignore malformed keychain payloads; callers will surface a normal auth hint.
+    }
   }
   return null;
 }
@@ -72,7 +99,7 @@ async function resolveClaudeCodeOauthToken(deps = {}) {
     const token = deps.readClaudeOauthToken(env);
     if (token) return { token, source: "credentials" };
   } else {
-    const token = readClaudeOauthToken(env);
+    const token = readClaudeOauthToken(env, Date.now(), deps);
     if (token) return { token, source: "credentials" };
   }
 
@@ -83,7 +110,7 @@ async function resolveClaudeCodeOauthToken(deps = {}) {
     const token = deps.readClaudeOauthToken(env);
     if (token) return { token, source: "credentials_after_status" };
   } else {
-    const token = readClaudeOauthToken(env);
+    const token = readClaudeOauthToken(env, Date.now(), deps);
     if (token) return { token, source: "credentials_after_status" };
   }
 
@@ -97,6 +124,7 @@ async function resolveClaudeCodeOauthToken(deps = {}) {
 module.exports = {
   claudeCredentialsPaths,
   isExpired,
+  readClaudeCodeKeychainCredentials,
   readClaudeOauthToken,
   resolveClaudeCodeOauthToken,
   runClaudeAuthStatus,

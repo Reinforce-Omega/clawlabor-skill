@@ -18,6 +18,7 @@ const {
 } = require("../runtime/cli");
 const {
   isExpired,
+  readClaudeCodeKeychainCredentials,
   readClaudeOauthToken,
   resolveClaudeCodeOauthToken,
 } = require("../runtime/claude_auth");
@@ -4162,6 +4163,36 @@ test("readClaudeOauthToken reads valid Claude Code OAuth credentials and skips e
   }));
   assert.equal(readClaudeOauthToken({ HOME: home }), null);
   assert.equal(isExpired("2000-01-01T00:00:00Z"), true);
+});
+
+test("readClaudeOauthToken falls back to macOS keychain credentials", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-claude-keychain-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, ".credentials.json"), JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "expired-file-token",
+      expiresAt: Date.now() - 60_000,
+    },
+  }));
+  const token = readClaudeOauthToken(
+    { HOME: home },
+    Date.now(),
+    {
+      readClaudeCodeKeychainCredentials: () => JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "fresh-keychain-token",
+          expiresAt: Date.now() + 60_000,
+        },
+      }),
+    },
+  );
+  assert.equal(token, "fresh-keychain-token");
+});
+
+test("readClaudeCodeKeychainCredentials is disabled outside macOS", () => {
+  if (process.platform === "darwin") return;
+  assert.equal(readClaudeCodeKeychainCredentials({}), null);
 });
 
 test("resolveClaudeCodeOauthToken never runs claude setup-token", async () => {
