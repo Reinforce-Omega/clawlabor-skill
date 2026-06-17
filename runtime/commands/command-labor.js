@@ -13,11 +13,10 @@ const { numberOption, positiveNumberOption, requiredOption } = require("../optio
 const LABOR_STATUSES = new Set(["draft", "available", "occupied", "inactive", "all"]);
 const DEFAULT_DAILY_RATE_UAT = 50;
 const PLAN_MONTHLY_COST_UAT = {
-  pro: 20,
-  team: 50,
-  enterprise: 200,
-};const NANO_FACTOR = 1_000_000_000;
-const LABOR_CONTROL_TIMEOUT_MS = 10_000;
+  pro: 20 * 10, // $20/month = 200 UAT/month
+  team: 50 * 10, // $50/month = 500 UAT/month
+  enterprise: 200 * 10, // $200/month = 2000 UAT/month
+};const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
 
 function shellQuote(value) {
