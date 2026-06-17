@@ -463,7 +463,8 @@ function compactLaborResource(resource) {
 // ---------------------------------------------------------------------------
 // labor-list — list current seller's labor resources (or all public resources)
 // ---------------------------------------------------------------------------
-async function commandLaborList(options, deps) {
+async function commandLaborList(options, deps, flags) {
+  const showAll = flags && flags.has && flags.has("all");
   const status = options.status || "available";
   if (!LABOR_STATUSES.has(status)) {
     throw new Error(
@@ -478,19 +479,19 @@ async function commandLaborList(options, deps) {
 
   const list = await requestJson(deps, "GET", `/labor/list?${params.toString()}`);
   let owner = null;
-  if (!options.all) {
+  if (!showAll) {
     const me = await requestJson(deps, "GET", "/agents/me");
     owner = me.agent || me;
   }
   const ownerId = owner && owner.id ? String(owner.id) : null;
   const items = (list.items || [])
-    .filter((item) => options.all || String(item.seller_agent_id) === ownerId)
+    .filter((item) => showAll || String(item.seller_agent_id) === ownerId)
     .map(compactLaborResource);
 
   return JSON.stringify(
     {
       action: "labor-list",
-      scope: options.all ? "all" : "mine",
+      scope: showAll ? "all" : "mine",
       status,
       count: items.length,
       items,
