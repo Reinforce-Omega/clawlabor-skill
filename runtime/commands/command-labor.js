@@ -706,10 +706,13 @@ async function commandLaborServe(options, deps) {
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const stdout = deps.stdout || (() => {});
   const sellerApiKey = resolveApiKey(deps.env);
+
+  stdout(`[1/7] Preparing to serve labor ${laborId}...`);
   if (!sellerApiKey) {
     throw new Error("Set CLAWLABOR_API_KEY or store api_key in ~/.config/clawlabor/credentials.json before calling clawlabor");
   }
   const sellerDeps = { ...deps, env: envWithApiKey(deps.env, sellerApiKey) };
+  stdout("[2/7] Checking Claude Code authentication...");
   const claudeOauth = await resolveClaudeCodeOauthToken(deps);
   if (!claudeOauth.token) {
     const authHint = claudeOauth.authStatusOk
@@ -720,8 +723,10 @@ async function commandLaborServe(options, deps) {
     );
   }
 
+  stdout("[3/7] Provisioning tunnel from ClawLabor platform...");
   const provisioned = await requestJson(sellerDeps, "POST", `/labor/${laborId}/serve`, {});
   const { tunnel_token, sandbox_token, hostname } = provisioned;
+  stdout("[4/7] Tunnel provisioned, initializing local runtime...");
   const containerName = `clawlabor-labor-${laborId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
   const runtimeEnv = {
     ...deps.env,
@@ -739,7 +744,7 @@ async function commandLaborServe(options, deps) {
     ).trim();
     if (occupied) {
       execSync(`docker rm -f ${occupied}`, { stdio: "ignore" });
-      stdout(`Stopped existing container ${occupied} occupying port ${port}\n`);
+      stdout(`[4/7] Stopped existing container ${occupied} occupying port ${port}`);
     }
   } catch (_err) {
     /* best effort — if the command fails, let docker run surface the real error */
@@ -750,6 +755,7 @@ async function commandLaborServe(options, deps) {
   // it is torn down explicitly via `docker rm -f <name>` on exit. (Foreground docker
   // run coupled to a backgrounded parent is fragile — the container can die with the
   // parent's stdio.)
+  stdout(`[5/7] Starting sandbox container (${image})...`);
   const container = spawn(
     "docker",
     [
@@ -769,29 +775,71 @@ async function commandLaborServe(options, deps) {
   // cloudflared connects the platform-managed tunnel to the local container.
   // --grace-period=3s caps cloudflared's SIGTERM drain (default 30s) so Ctrl+C
   // returns control to the user quickly when no requests are in flight.
+  stdout("[6/7] Starting Cloudflare tunnel...");
   const tunnel = spawn(
     "cloudflared",
     ["tunnel", "--grace-period=3s", "run", "--token", tunnel_token],
     { stdio: "inherit" },
   );
 
-  stdout(`labor ${laborId} serving at https://${hostname}\n`);
+  stdout(`[7/7] Labor ${laborId} is now serving at https://${hostname}`);
+  stdout("Waiting for health check and accepting incoming hires...");
 
   let running = true;
   let cleanedUp = false;
-  function cleanupRuntime() {
+
+  // Force kill a child process after a timeout if it doesn't exit gracefully
+  function forceKill(process, name, timeoutMs = 5000) {
+    if (!process || process.exitCode !== null) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try {
+          process.kill("SIGKILL");
+        } catch (_err) { /* noop */ }
+      }, timeoutMs);
+      process.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  async function cleanupRuntime() {
     if (cleanedUp) return;
     cleanedUp = true;
+    stdout("Shutting down labor service...");
+
+    // Graceful shutdown with timeout, then force kill
+    stdout("Stopping Cloudflare tunnel...");
     try { tunnel && tunnel.kill && tunnel.kill("SIGTERM"); } catch (_err) { /* noop */ }
+    await forceKill(tunnel, "tunnel", 3000);
+
+    stdout("Stopping sandbox container...");
     try { container && container.kill && container.kill(); } catch (_err) { /* noop */ }
-    try { spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" }); } catch (_err) { /* noop */ }
+    await forceKill(container, "container", 2000);
+
+    // Force remove docker container
+    stdout("Removing docker container...");
+    try {
+      await new Promise((resolve) => {
+        const dockerRm = spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" });
+        dockerRm.once("exit", () => resolve());
+        setTimeout(resolve, 1500);
+      });
+    } catch (_err) { /* noop */ }
+    stdout("Shutdown complete.");
   }
   const stop = deps.waitForExit ? deps.waitForExit() : new Promise(() => {});
+  let stopResolve = null;
+  const stopCompleted = new Promise((resolve) => { stopResolve = resolve; });
+
   // Tear the local runtime down the instant a stop signal arrives — don't wait
   // for the heartbeat loop's sleep to wake up.
-  stop.then(() => {
+  stop.then(async () => {
     running = false;
-    cleanupRuntime();
+    stdout("\nReceived shutdown signal, stopping services...");
+    await cleanupRuntime();
+    stopResolve();
   });
 
   async function heartbeatOnce() {
@@ -853,12 +901,16 @@ async function commandLaborServe(options, deps) {
 
   // Wait for the container to accept requests before the first heartbeat, so the
   // resource isn't briefly flagged as offline during the ~10s container startup.
+  stdout("Waiting for sandbox to be ready...");
   for (let i = 0; i < 30 && running; i += 1) {
     try {
       const r = await deps.fetch(`http://127.0.0.1:${port}/v1/health`, {
         headers: { Authorization: `Bearer ${sandbox_token}` },
       });
-      if (r.ok) break;
+      if (r.ok) {
+        stdout("Sandbox is healthy and ready for work.");
+        break;
+      }
     } catch (_err) {
       /* not up yet */
     }
@@ -872,15 +924,23 @@ async function commandLaborServe(options, deps) {
     await tick();
   }
 
-  cleanupRuntime();
+  // Wait for signal-triggered cleanup to complete (if cleanup was triggered by signal)
+  await stopCompleted;
+
+  if (!cleanedUp) {
+    stdout("Cleaning up remaining resources...");
+    await cleanupRuntime();
+  }
+  stdout("Notifying platform of shutdown...");
   try {
     await withTimeout(
       requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}),
-      LABOR_CONTROL_TIMEOUT_MS,
+      3000,
       "labor teardown",
     );
+    stdout("Platform notified.");
   } catch (_err) {
-    /* best effort */
+    stdout("Platform notification timed out (best effort).");
   }
 
   return JSON.stringify(

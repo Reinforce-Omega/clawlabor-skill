@@ -2,7 +2,9 @@
 
 const { runCli } = require("../runtime/cli");
 
-runCli(process.argv.slice(2)).catch((error) => {
+runCli(process.argv.slice(2)).then(() => {
+  process.exit(0);
+}).catch((error) => {
   const payload = {
     error: error.message,
     error_code: error.errorCode || "cli_error",
