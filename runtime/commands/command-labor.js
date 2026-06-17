@@ -11,12 +11,27 @@ const { apiBase, envWithApiKey, request, requestJson, resolveApiKey } = require(
 const { numberOption, positiveNumberOption, requiredOption } = require("../options");
 
 const LABOR_STATUSES = new Set(["draft", "available", "occupied", "inactive", "all"]);
-const DEFAULT_DAILY_RATE_UAT = 100;
+const DEFAULT_DAILY_RATE_UAT = 1;
 const NANO_FACTOR = 1_000_000_000;
+const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+async function withTimeout(promise, ms, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function commandProbe(deps, command, args = ["--version"]) {
@@ -763,7 +778,11 @@ async function commandLaborServe(options, deps) {
       healthy = false;
     }
     try {
-      await requestJson(sellerDeps, "POST", `/labor/${laborId}/heartbeat`, { body: { healthy } });
+      await withTimeout(
+        requestJson(sellerDeps, "POST", `/labor/${laborId}/heartbeat`, { body: { healthy } }),
+        LABOR_CONTROL_TIMEOUT_MS,
+        "labor heartbeat",
+      );
     } catch (_e) {
       /* best effort */
     }
@@ -773,12 +792,18 @@ async function commandLaborServe(options, deps) {
   // the job, so it takes the work). A pending hire otherwise auto-rejects at 24h.
   async function acceptPendingHires() {
     try {
-      const result = await requestJson(
-        sellerDeps, "GET", `/labor/${laborId}/hires?status=pending_accept`, {},
+      const result = await withTimeout(
+        requestJson(sellerDeps, "GET", `/labor/${laborId}/hires?status=pending_accept`, {}),
+        LABOR_CONTROL_TIMEOUT_MS,
+        "labor pending hire poll",
       );
       for (const hire of result.items || []) {
         try {
-          await requestJson(sellerDeps, "POST", `/labor/${hire.id}/accept`, {});
+          await withTimeout(
+            requestJson(sellerDeps, "POST", `/labor/${hire.id}/accept`, {}),
+            LABOR_CONTROL_TIMEOUT_MS,
+            "labor hire accept",
+          );
           stdout(`accepted hire ${hire.id}\n`);
         } catch (_e) {
           /* skip this hire; try again next tick */
@@ -790,8 +815,8 @@ async function commandLaborServe(options, deps) {
   }
 
   async function tick() {
-    await acceptPendingHires();
     await heartbeatOnce();
+    await acceptPendingHires();
   }
 
   // Wait for the container to accept requests before the first heartbeat, so the

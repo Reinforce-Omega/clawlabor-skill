@@ -4222,7 +4222,7 @@ test("labor-agents gives a complete publish command before a labor exists", asyn
   const parsed = JSON.parse(out.join(""));
   const claude = parsed.agents[0];
   assert.match(claude.publish_command, /--name 'Claude Code Labor'/);
-  assert.match(claude.publish_command, /--daily-rate 100/);
+  assert.match(claude.publish_command, /--daily-rate 1/);
   assert.equal(claude.publish_command.includes("<"), false);
   assert.equal(claude.publish_command.includes("--gatekeeper"), false);
   assert.equal(claude.serve_command, undefined);
@@ -4375,6 +4375,34 @@ test("labor-serve keeps the startup seller API key for long-running requests", a
     },
   );
   assert.deepEqual([...new Set(seenAuth)], ["Bearer test-key"]);
+});
+
+test("labor-serve heartbeat is not blocked by a stuck pending-hire poll", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", {
+      status: 200,
+      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-labor-9.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/labor-9/heartbeat", { status: 204, body: "" }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => new Promise(() => {}) },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => Promise.resolve(),
+    },
+  );
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/heartbeat")));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
 });
 
 test("labor-start publishes missing Claude labor then serves it", async () => {
