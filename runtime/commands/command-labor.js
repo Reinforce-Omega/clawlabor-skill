@@ -16,8 +16,10 @@ const PLAN_MONTHLY_COST_UAT = {
   pro: 20 * 10, // $20/month = 200 UAT/month
   team: 50 * 10, // $50/month = 500 UAT/month
   enterprise: 200 * 10, // $200/month = 2000 UAT/month
-};const LABOR_CONTROL_TIMEOUT_MS = 10_000;
+};
+const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
+const NANO_FACTOR = 1e9;
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
@@ -64,6 +66,7 @@ function commandProbe(deps, command, args = ["--version"]) {
 
 function runtimeAgent({
   hostPlan = null,
+  hostAccount = null,
   id,
   name,
   runtime,
@@ -71,10 +74,13 @@ function runtimeAgent({
   probe,
   readyToServe,
   serveStatus,
+  requirements,
+  publishName,
 }) {
   const suggestedDailyRate = hostPlan && PLAN_MONTHLY_COST_UAT[hostPlan?.toLowerCase()]
     ? Math.ceil(PLAN_MONTHLY_COST_UAT[hostPlan.toLowerCase()] / 30)
-    : DEFAULT_DAILY_RATE_UAT;  const installed = probe.status === "pass";
+    : DEFAULT_DAILY_RATE_UAT;
+  const installed = probe.status === "pass";
   return {
     id,
     name,
@@ -89,12 +95,14 @@ function runtimeAgent({
     ready_to_serve: readyToServe,
     serve_status: serveStatus,
     host_account: hostAccount || null,
-    suggested_daily_rate_uat: suggestedDailyRate,    requirements,
+    suggested_daily_rate_uat: suggestedDailyRate,
+    requirements,
     publish_command_template: [
       "clawlabor labor-publish",
       `--name ${shellQuote(publishName)}`,
       `--description ${shellQuote(`${publishName} backed by the local ${name} runtime.`)}`,
-      `--daily-rate ${suggestedDailyRate}`,    ].join(" "),
+      `--daily-rate ${suggestedDailyRate}`,
+    ].join(" "),
     serve_command_template: readyToServe
       ? "clawlabor labor-serve --labor <labor_resource_id>"
       : null,
@@ -145,7 +153,8 @@ function summarizeLaborAgent(agent, existingLaborByRuntime) {
     name: agent.name,
     status: shortRuntimeStatus(agent),
     can_publish: agent.ready_to_publish,
-    suggested_daily_rate_uat: agent.suggested_daily_rate_uat,    can_serve: agent.ready_to_serve,
+    suggested_daily_rate_uat: agent.suggested_daily_rate_uat,
+    can_serve: agent.ready_to_serve,
   };
   if (missing.length > 0) {
     summary.needs = missing;
@@ -192,7 +201,7 @@ async function currentMarketplaceAgent(deps) {
       is_online: false,
       api_base: apiBase(deps.env),
       error: err.message,
-      error_code: err.errorCode || "api_error",
+      error_code: err.errorCode || "cli_error",
     };
   }
 }
@@ -209,11 +218,11 @@ function compactMarketplaceAgent(agent) {
   const compact = {
     status: "authenticated",
     name: agent.name,
-    balance: agent.balance,
+    balance: nanoToUatDisplay(agent.balance),
     online: agent.is_online,
   };
   if (agent.frozen !== null && agent.frozen !== undefined) {
-    compact.frozen = agent.frozen;
+    compact.frozen = nanoToUatDisplay(agent.frozen);
   }
   return compact;
 }
@@ -306,7 +315,7 @@ async function claudeRuntimeAgent(deps) {
         ? "Claude Code claude.ai OAuth token is available"
         : claudeOauth.authStatusOk
           ? "Claude Code auth status passed, but no fresh local claude.ai OAuth token was available"
-          : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription",
+          : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription.",
     },
     ...sharedServeRequirements,
   ];
@@ -324,7 +333,8 @@ async function claudeRuntimeAgent(deps) {
     requirements: claudeRequirements,
     publishName: "Claude Code Labor",
     hostAccount: claudeAccount,
-    hostPlan: claudeAccount.plan,  });
+    hostPlan: claudeAccount.plan,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +367,7 @@ async function commandLaborAgents(_options, deps, flags) {
           command: "codex --version",
           version: codex.version,
           detail: codex.status === "pass"
-            ? "Codex CLI is installed locally; ClawLabor labor-serve is not wired to start Codex-backed sandbox sessions yet"
+            ? "Codex CLI is installed locally; Clawlabor labor-serve is not wired to start Codex-backed sandbox sessions yet"
             : codex.on_path
               ? "Codex CLI is on PATH but failed to run; repair the local Codex install before publishing a Codex-backed labor runtime"
               : "Install Codex CLI before publishing a Codex-backed labor runtime",
@@ -383,7 +393,7 @@ async function commandLaborAgents(_options, deps, flags) {
           command: "opencode --version",
           version: opencode.version,
           detail: opencode.status === "pass"
-            ? "OpenCode CLI is installed locally; ClawLabor labor-serve is not wired to start OpenCode-backed sandbox sessions yet"
+            ? "OpenCode CLI is installed locally; Clawlabor labor-serve is not wired to start OpenCode-backed sandbox sessions yet"
             : opencode.on_path
               ? "OpenCode CLI is on PATH but failed to run; repair the local OpenCode install before publishing an OpenCode-backed labor runtime"
               : "Install OpenCode CLI before publishing an OpenCode-backed labor runtime",
@@ -545,7 +555,7 @@ async function commandLaborPublish(options, deps) {
   const body = {
     name,
     description,
-    daily_rate_uat: dailyRate,
+    daily_rate_nano: BigInt(dailyRate) * BigInt(NANO_FACTOR),
     min_duration_days: 1,
     max_duration_days: 1,
     tier: options.tier || "tier_1",
@@ -731,7 +741,7 @@ async function commandLaborServe(options, deps) {
       execSync(`docker rm -f ${occupied}`, { stdio: "ignore" });
       stdout(`Stopped existing container ${occupied} occupying port ${port}\n`);
     }
-  } catch (_e) {
+  } catch (_err) {
     /* best effort — if the command fails, let docker run surface the real error */
   }
 
@@ -776,7 +786,7 @@ async function commandLaborServe(options, deps) {
         headers: { Authorization: `Bearer ${sandbox_token}` },
       });
       healthy = !!resp.ok;
-    } catch (_e) {
+    } catch (_err) {
       healthy = false;
     }
     try {
@@ -785,7 +795,7 @@ async function commandLaborServe(options, deps) {
         LABOR_CONTROL_TIMEOUT_MS,
         "labor heartbeat",
       );
-    } catch (_e) {
+    } catch (_err) {
       /* best effort */
     }
   }
@@ -807,11 +817,11 @@ async function commandLaborServe(options, deps) {
             "labor hire accept",
           );
           stdout(`accepted hire ${hire.id}\n`);
-        } catch (_e) {
+        } catch (_err) {
           /* skip this hire; try again next tick */
         }
       }
-    } catch (_e) {
+    } catch (_err) {
       /* best effort */
     }
   }
@@ -822,14 +832,14 @@ async function commandLaborServe(options, deps) {
   }
 
   // Wait for the container to accept requests before the first heartbeat, so the
-  // resource isn't briefly flagged offline during the ~10s container startup.
+  // resource isn't briefly flagged as offline during the ~10s container startup.
   for (let i = 0; i < 30; i += 1) {
     try {
       const r = await deps.fetch(`http://127.0.0.1:${port}/v1/health`, {
         headers: { Authorization: `Bearer ${sandbox_token}` },
       });
       if (r.ok) break;
-    } catch (_e) {
+    } catch (_err) {
       /* not up yet */
     }
     await sleep(1000);
@@ -842,10 +852,10 @@ async function commandLaborServe(options, deps) {
     await tick();
   }
 
-  try { container.kill && container.kill(); } catch (_e) { /* noop */ }
-  try { tunnel && tunnel.kill && tunnel.kill(); } catch (_e) { /* noop */ }
-  try { spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" }); } catch (_e) { /* noop */ }
-  try { await requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}); } catch (_e) { /* noop */ }
+  try { container.kill && container.kill(); } catch (_err) { /* noop */ }
+  try { tunnel && tunnel.kill && tunnel.kill(); } catch (_err) { /* noop */ }
+  try { spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" }); } catch (_err) { /* noop */ }
+  try { await requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}); } catch (_err) { /* noop */ }
 
   return JSON.stringify(
     { action: "labor-serve", labor_id: laborId, hostname, status: "stopped" },

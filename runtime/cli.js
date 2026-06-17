@@ -419,10 +419,11 @@ function usageText() {
   for (const section of sectionOrder) {
     lines.push(`${section}:`);
     for (const entry of grouped.get(section)) {
+    for (const entry of grouped.get(section)) {
       lines.push(`  clawlabor ${entry.usage}`);
-    }
-    lines.push("");
-  }
+      lines.push(`    ${entry.summary}`);
+      lines.push("");
+    }  }
   while (lines.length > 0 && lines[lines.length - 1] === "") {
     lines.pop();
   }
