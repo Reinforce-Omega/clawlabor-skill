@@ -100,12 +100,9 @@ function runtimeAgent({
     publish_command_template: [
       "clawlabor labor-publish",
       `--name ${shellQuote(publishName)}`,
-      `--description ${shellQuote(`${publishName} backed by the local ${name} runtime.`)}`,
+      `--description ${shellQuote(`${publishName}${hostPlan ? ` (${hostPlan} plan)` : ""} backed by the local ${name} runtime.`)}`,
       `--daily-rate ${suggestedDailyRate}`,
     ].join(" "),
-    serve_command_template: readyToServe
-      ? "clawlabor labor-serve --labor <labor_resource_id>"
-      : null,
   };
 }
 
@@ -166,10 +163,7 @@ function summarizeLaborAgent(agent, existingLaborByRuntime) {
     summary.labor_id = existing.id;
     summary.labor_status = existing.status;
   }
-  if (agent.ready_to_serve && existing) {
-    summary.serve_command = `clawlabor labor-serve --labor ${existing.id}`;
-    summary.start_command = summary.serve_command;
-  } else if (agent.ready_to_serve) {
+  if (agent.ready_to_serve) {
     summary.start_command = `clawlabor labor-start --runtime ${agent.runtime}`;
   }
   return summary;
