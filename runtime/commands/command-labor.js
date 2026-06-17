@@ -767,16 +767,31 @@ async function commandLaborServe(options, deps) {
     { stdio: "ignore", env: runtimeEnv },
   );
   // cloudflared connects the platform-managed tunnel to the local container.
-  const tunnel = spawn("cloudflared", ["tunnel", "run", "--token", tunnel_token], {
-    stdio: "inherit",
-  });
+  // --grace-period=3s caps cloudflared's SIGTERM drain (default 30s) so Ctrl+C
+  // returns control to the user quickly when no requests are in flight.
+  const tunnel = spawn(
+    "cloudflared",
+    ["tunnel", "--grace-period=3s", "run", "--token", tunnel_token],
+    { stdio: "inherit" },
+  );
 
   stdout(`labor ${laborId} serving at https://${hostname}\n`);
 
   let running = true;
+  let cleanedUp = false;
+  function cleanupRuntime() {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    try { tunnel && tunnel.kill && tunnel.kill("SIGTERM"); } catch (_err) { /* noop */ }
+    try { container && container.kill && container.kill(); } catch (_err) { /* noop */ }
+    try { spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" }); } catch (_err) { /* noop */ }
+  }
   const stop = deps.waitForExit ? deps.waitForExit() : new Promise(() => {});
+  // Tear the local runtime down the instant a stop signal arrives — don't wait
+  // for the heartbeat loop's sleep to wake up.
   stop.then(() => {
     running = false;
+    cleanupRuntime();
   });
 
   async function heartbeatOnce() {
@@ -831,9 +846,14 @@ async function commandLaborServe(options, deps) {
     await acceptPendingHires();
   }
 
+  // Sleep that wakes up immediately when a stop signal arrives.
+  function interruptibleSleep(ms) {
+    return Promise.race([sleep(ms), stop]);
+  }
+
   // Wait for the container to accept requests before the first heartbeat, so the
   // resource isn't briefly flagged as offline during the ~10s container startup.
-  for (let i = 0; i < 30; i += 1) {
+  for (let i = 0; i < 30 && running; i += 1) {
     try {
       const r = await deps.fetch(`http://127.0.0.1:${port}/v1/health`, {
         headers: { Authorization: `Bearer ${sandbox_token}` },
@@ -842,20 +862,26 @@ async function commandLaborServe(options, deps) {
     } catch (_err) {
       /* not up yet */
     }
-    await sleep(1000);
+    await interruptibleSleep(1000);
   }
 
   await tick();
   while (running) {
-    await sleep(60000);
+    await interruptibleSleep(60000);
     if (!running) break;
     await tick();
   }
 
-  try { container.kill && container.kill(); } catch (_err) { /* noop */ }
-  try { tunnel && tunnel.kill && tunnel.kill(); } catch (_err) { /* noop */ }
-  try { spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" }); } catch (_err) { /* noop */ }
-  try { await requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}); } catch (_err) { /* noop */ }
+  cleanupRuntime();
+  try {
+    await withTimeout(
+      requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}),
+      LABOR_CONTROL_TIMEOUT_MS,
+      "labor teardown",
+    );
+  } catch (_err) {
+    /* best effort */
+  }
 
   return JSON.stringify(
     { action: "labor-serve", labor_id: laborId, hostname, status: "stopped" },
