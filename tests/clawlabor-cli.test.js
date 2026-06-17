@@ -4053,6 +4053,230 @@ test("labor-chat surfaces an SSE error event", async () => {
   assert.equal(parsed.error.code, "seller_unreachable");
 });
 
+function laborAgentsFetch() {
+  return recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        id: "seller-1",
+        agent_id: "agent_seller",
+        name: "Seller",
+        owner_email: "seller@example.com",
+        balance: 500,
+        frozen: 10,
+        is_online: true,
+      }),
+    }),
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{
+          id: "labor-claude",
+          seller_agent_id: "seller-1",
+          name: "Claude Labor",
+          status: "available",
+          host_account_provider: "claude",
+          host_account_id: "org:org-123",
+        }],
+        next_cursor: null,
+      }),
+    }),
+  ]);
+}
+
+function laborAgentsDeps(fetch, out) {
+  return {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+    readClaudeOauthToken: () => "oauth-token-123",
+    runClaudeAuthStatus: async () => ({
+      ok: true,
+      account: {
+        loggedIn: true,
+        authMethod: "claude.ai",
+        apiProvider: "firstParty",
+        email: "seller@example.com",
+        orgId: "org-123",
+        orgName: "Seller Team",
+        subscriptionType: "team",
+      },
+    }),
+    spawnSync: (cmd, args) => {
+      const tool = cmd === "sh" ? args[3] : cmd;
+      const status = ["claude", "codex", "opencode", "docker", "cloudflared"].includes(tool) ? 0 : 1;
+      return {
+        status,
+        stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} version ok`,
+        stderr: "",
+      };
+    },
+  };
+}
+
+test("labor-agents reports concise local runtime inventory by default", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(["labor-agents"], laborAgentsDeps(fetch, out));
+
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.action, "labor-agents");
+  assert.deepEqual(parsed.account, {
+    status: "authenticated",
+    name: "Seller",
+    balance: 500,
+    frozen: 10,
+    online: true,
+  });
+  assert.deepEqual(parsed.host.claude, {
+    provider: "claude",
+    label: "Seller Team (team)",
+    plan: "team",
+  });
+  assert.deepEqual(parsed.agents.map((agent) => agent.runtime), ["claude", "codex", "opencode"]);
+  const claude = parsed.agents[0];
+  assert.equal(claude.status, "ready_to_serve");
+  assert.equal(claude.can_publish, true);
+  assert.equal(claude.can_serve, true);
+  assert.match(claude.publish_command, /labor-publish/);
+  assert.equal(claude.publish_command.includes("<"), false);
+  assert.equal(claude.publish_command.includes("--gatekeeper"), false);
+  assert.equal(claude.labor_id, "labor-claude");
+  assert.equal(claude.serve_command, "clawlabor labor-serve --labor labor-claude");
+  assert.equal(claude.start_command, "clawlabor labor-serve --labor labor-claude");
+  assert.equal(claude.path, undefined);
+  assert.equal(claude.requirements, undefined);
+  const codex = parsed.agents[1];
+  assert.equal(codex.status, "publish_only");
+  assert.equal(codex.can_publish, true);
+  assert.equal(codex.can_serve, false);
+});
+
+test("labor-agents shows auth failure instead of null account fields", async () => {
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    laborAgentsDeps(
+      async (url) => {
+        if (url.endsWith("/agents/me")) {
+          return {
+            ok: false,
+            status: 401,
+            text: async () => JSON.stringify({ detail: "Invalid or expired token" }),
+          };
+        }
+        if (url.endsWith("/labor/list?limit=100")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ items: [], next_cursor: null }),
+          };
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      out,
+    ),
+  );
+  const parsed = JSON.parse(out.join(""));
+  assert.deepEqual(parsed.account, {
+    status: "unavailable",
+    api_base: DEFAULT_API_BASE,
+    reason: "unauthenticated",
+    next: "Run clawlabor auth status.",
+  });
+  assert.equal(parsed.account.name, undefined);
+  assert.equal(parsed.account.balance, undefined);
+});
+
+test("labor-agents gives a complete publish command before a labor exists", async () => {
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    laborAgentsDeps(
+      async (url) => {
+        if (url.endsWith("/agents/me")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({
+              id: "seller-1",
+              agent_id: "agent_seller",
+              name: "Seller",
+              balance: 500,
+              frozen: 0,
+            }),
+          };
+        }
+        if (url.endsWith("/labor/list?limit=100")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ items: [], next_cursor: null }),
+          };
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      out,
+    ),
+  );
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents[0];
+  assert.match(claude.publish_command, /--name 'Claude Code Labor'/);
+  assert.match(claude.publish_command, /--daily-rate 100/);
+  assert.equal(claude.publish_command.includes("<"), false);
+  assert.equal(claude.publish_command.includes("--gatekeeper"), false);
+  assert.equal(claude.serve_command, undefined);
+  assert.equal(claude.start_command, "clawlabor labor-start --runtime claude");
+  assert.equal(claude.start_command.includes("<"), false);
+});
+
+test("labor-agents --verbose keeps diagnostic detail", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        id: "seller-1",
+        agent_id: "agent_seller",
+        name: "Seller",
+        owner_email: "seller@example.com",
+        balance: 500,
+        frozen: 10,
+        is_online: true,
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-agents", "--verbose"],
+    laborAgentsDeps(fetch, out),
+  );
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.action, "labor-agents");
+  assert.deepEqual(parsed.agents.map((agent) => agent.id), [
+    "claude-code-sandbox",
+    "codex-sandbox",
+    "opencode-sandbox",
+  ]);
+  const claude = parsed.agents[0];
+  assert.equal(claude.ready_to_publish, true);
+  assert.equal(claude.ready_to_serve, true);
+  assert.equal(claude.host_account.id, "org:org-123");
+  assert.equal(claude.host_account.plan, "team");
+  assert.match(claude.publish_command_template, /labor-publish/);
+  assert.match(claude.serve_command_template, /labor-serve/);
+  assert.equal(parsed.marketplace_agent.agent_id, "agent_seller");
+  assert.equal(parsed.marketplace_agent.balance, 500);
+  const codex = parsed.agents[1];
+  assert.equal(codex.present_on_path, true);
+  assert.equal(codex.ready_to_publish, true);
+  assert.equal(codex.ready_to_serve, false);
+  assert.equal(codex.serve_status, "candidate_not_wired_to_labor_serve");
+  const opencode = parsed.agents[2];
+  assert.equal(opencode.ready_to_publish, true);
+  assert.equal(opencode.ready_to_serve, false);
+  assert.equal(opencode.serve_status, "candidate_not_wired_to_labor_serve");
+});
+
 test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats, and tears down", async () => {
   const spawned = [];
   const { fetch, calls } = recordingFetch([
@@ -4076,8 +4300,8 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
       fetch,
       stdout: (t) => out.push(t),
       readClaudeOauthToken: () => "oauth-token-123",
-      spawn: (cmd, args) => {
-        spawned.push({ cmd, args });
+      spawn: (cmd, args, opts) => {
+        spawned.push({ cmd, args, opts });
         return { kill() {} };
       },
       sleep: async () => {},
@@ -4088,10 +4312,16 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   // provisioned, started docker + cloudflared, heartbeat at least once, torn down
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "POST"));
   assert.equal(spawned[0].cmd, "docker");
-  assert.ok(spawned[0].args.includes("SBX")); // sandbox_token passed as --token
+  assert.match(spawned[0].args.join(" "), /--token 'SBX'/); // sandbox_token passed to server
   assert.ok(spawned[0].args.includes("--name"));
   assert.ok(spawned[0].args.includes("clawlabor-labor-labor-9"));
+  assert.ok(spawned[0].args.includes("CLAWLABOR_AGENT_RUNTIME"));
   assert.ok(spawned[0].args.includes("CLAUDE_CODE_OAUTH_TOKEN"));
+  assert.equal(spawned[0].opts.env.CLAWLABOR_AGENT_RUNTIME, "claude");
+  assert.ok(spawned[0].args.includes("--entrypoint"));
+  assert.ok(spawned[0].args.includes("sh"));
+  assert.match(spawned[0].args.join(" "), /sandbox-agent install-agent 'claude'/);
+  assert.match(spawned[0].args.join(" "), /sandbox-agent server --token 'SBX'/);
   assert.ok(!spawned[0].args.includes("oauth-token-123"));
   assert.equal(spawned[1].cmd, "cloudflared");
   assert.ok(spawned[1].args.includes("TT")); // tunnel_token
@@ -4147,8 +4377,96 @@ test("labor-serve keeps the startup seller API key for long-running requests", a
   assert.deepEqual([...new Set(seenAuth)], ["Bearer test-key"]);
 });
 
+test("labor-start publishes missing Claude labor then serves it", async () => {
+  const spawned = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", name: "Seller" }),
+    }),
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    }),
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", name: "Seller" }),
+    }),
+    matchRoute("POST", "/labor", {
+      status: 201,
+      body: JSON.stringify({ id: "labor-new", status: "draft" }),
+    }),
+    matchRoute("PUT", "/labor/labor-new", {
+      status: 200,
+      body: JSON.stringify({ id: "labor-new", name: "Claude Code Labor", status: "available" }),
+    }),
+    matchRoute("POST", "/labor/labor-new/serve", {
+      status: 200,
+      body: JSON.stringify({
+        tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-new.clawlabor.com",
+      }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-new/hires"),
+      respond: { status: 200, body: '{"items":[]}' } },
+    matchRoute("POST", "/labor/labor-new/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/labor-new/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-start", "--runtime", "claude"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          authMethod: "claude.ai",
+          apiProvider: "firstParty",
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+      spawnSync: (cmd, args) => {
+        const tool = cmd === "sh" ? args[3] : cmd;
+        return {
+          status: 0,
+          stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} version ok`,
+          stderr: "",
+        };
+      },
+      spawn: (cmd, args) => {
+        spawned.push({ cmd, args });
+        return { kill() {} };
+      },
+      sleep: async () => {},
+      waitForExit: () => Promise.resolve(),
+    },
+  );
+  assert.equal(calls.some((call) => call.url.endsWith("/labor") && call.options.method === "POST"), true);
+  assert.equal(calls.some((call) => call.url.endsWith("/labor/labor-new/serve")), true);
+  assert.equal(spawned.some((item) => item.cmd === "docker"), true);
+  assert.match(out.join(""), /labor labor-new serving at https:\/\/labor-new\.clawlabor\.com/);
+});
+
 test("labor-publish creates and publishes a labor resource", async () => {
   const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", agent_id: "agent_seller" }),
+    }),
     matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-7" }) }),
     matchRoute("PUT", "/labor/labor-7", {
       status: 200,
@@ -4159,17 +4477,218 @@ test("labor-publish creates and publishes a labor resource", async () => {
   await runCli(
     ["labor-publish", "--name", "Cook bot", "--description", "rented cook",
      "--daily-rate", "240", "--gatekeeper", "only cooking"],
-    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          email: "seller@example.com",
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+    },
   );
-  const createBody = JSON.parse(calls[0].options.body);
+  const createBody = JSON.parse(calls[2].options.body);
   assert.equal(createBody.daily_rate_uat, 240);
   assert.equal(createBody.min_duration_days, 1); // one-day rentals only
   assert.equal(createBody.max_duration_days, 1);
   assert.equal(createBody.gatekeeper_prompt, "only cooking");
-  assert.equal(JSON.parse(calls[1].options.body).status, "available");
+  assert.equal(createBody.host_account_provider, "claude");
+  assert.equal(createBody.host_account_id, "org:org-123");
+  assert.equal(createBody.host_account_plan, "team");
+  assert.equal(JSON.parse(calls[3].options.body).status, "available");
   const parsed = JSON.parse(out.join(""));
   assert.equal(parsed.labor_resource_id, "labor-7");
   assert.equal(parsed.status, "available");
+});
+
+test("labor-publish applies the default gatekeeper when omitted", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", agent_id: "agent_seller" }),
+    }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-8" }) }),
+    matchRoute("PUT", "/labor/labor-8", {
+      status: 200,
+      body: JSON.stringify({ id: "labor-8", status: "available", name: "Cook bot" }),
+    }),
+  ]);
+  await runCli(
+    ["labor-publish", "--name", "Cook bot", "--description", "rented cook", "--daily-rate", "240"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+    },
+  );
+  const createBody = JSON.parse(calls[2].options.body);
+  assert.match(createBody.gatekeeper_prompt, /Accept only safe, legal, well-scoped requests/);
+});
+
+test("labor-publish blocks duplicate active host account listings", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{
+          id: "labor-existing",
+          seller_agent_id: "seller-1",
+          name: "Existing",
+          status: "available",
+          host_account_provider: "claude",
+          host_account_id: "org:org-123",
+        }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", agent_id: "agent_seller" }),
+    }),
+  ]);
+  await assert.rejects(
+    () => runCli(
+      ["labor-publish", "--name", "Cook bot", "--description", "rented cook", "--daily-rate", "240"],
+      {
+        env: BASE_ENV,
+        fetch,
+        stdout: () => {},
+        runClaudeAuthStatus: async () => ({
+          ok: true,
+          account: {
+            loggedIn: true,
+            orgId: "org-123",
+            orgName: "Seller Team",
+            subscriptionType: "team",
+          },
+        }),
+      },
+    ),
+    /already listed as labor: labor-existing/,
+  );
+});
+
+test("labor-list defaults to current seller resources", async () => {
+  const mine = "11111111-1111-1111-1111-111111111111";
+  const other = "22222222-2222-2222-2222-222222222222";
+  const laborItems = [
+    {
+      id: "labor-mine",
+      seller_agent_id: mine,
+      name: "Mine",
+      status: "available",
+      serve_status: "online",
+      daily_rate_nano: 100000000000,
+      tier: "tier_1",
+      created_at: "2026-06-17T00:00:00Z",
+      updated_at: "2026-06-17T00:00:00Z",
+    },
+    {
+      id: "labor-other",
+      seller_agent_id: other,
+      name: "Other",
+      status: "available",
+      serve_status: "offline",
+      daily_rate_nano: 200000000000,
+      tier: "tier_1",
+      created_at: "2026-06-17T00:00:00Z",
+      updated_at: "2026-06-17T00:00:00Z",
+    },
+  ];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100&status=available", {
+      status: 200,
+      body: JSON.stringify({ items: laborItems, next_cursor: null }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: mine, agent_id: "agent-mine", name: "Seller" }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-list", "--status", "available"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(calls[0].url, `${DEFAULT_API_BASE}/labor/list?limit=100&status=available`);
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.scope, "mine");
+  assert.equal(parsed.count, 1);
+  assert.equal(parsed.items[0].id, "labor-mine");
+  assert.equal(parsed.items[0].daily_rate_uat, "100.00");
+  assert.equal(Object.hasOwn(parsed.items[0], "daily_rate_nano"), false);
+  assert.equal(
+    parsed.items[0].management_commands.serve_command,
+    "clawlabor labor-serve --labor labor-mine",
+  );
+  assert.equal(
+    parsed.items[0].management_commands.unpublish_command,
+    "clawlabor labor-unpublish --labor labor-mine",
+  );
+  assert.equal(
+    parsed.management_commands.serve_command,
+    "clawlabor labor-serve --labor <labor_resource_id>",
+  );
+  assert.equal(
+    parsed.management_commands.unpublish_command,
+    "clawlabor labor-unpublish --labor <labor_resource_id>",
+  );
+});
+
+test("labor-list defaults to currently published resources", async () => {
+  const mine = "11111111-1111-1111-1111-111111111111";
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100&status=available", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{
+          id: "labor-live",
+          seller_agent_id: mine,
+          name: "Live labor",
+          status: "available",
+          serve_status: "offline",
+          daily_rate_nano: 100000000000,
+          tier: "tier_1",
+          created_at: "2026-06-17T00:00:00Z",
+          updated_at: "2026-06-17T00:00:00Z",
+        }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: mine, name: "Seller" }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-list"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(calls[0].url, `${DEFAULT_API_BASE}/labor/list?limit=100&status=available`);
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.status, "available");
+  assert.equal(parsed.count, 1);
+  assert.equal(parsed.items[0].id, "labor-live");
 });
 
 test("labor-serve auto-accepts pending hires for the resource", async () => {

@@ -1,5 +1,5 @@
 const http = require("node:http");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const {
   ApiError,
   apiBase,
@@ -54,6 +54,8 @@ const {
   commandUploadAttachment,
   commandValidate,
   commandWait,
+  commandLaborAgents,
+  commandLaborList,
   ensureUploadPathAllowed,
   isUrlField,
   parseFileFlags,
@@ -65,6 +67,7 @@ const {
   commandHire,
   commandLaborChat,
   commandLaborPublish,
+  commandLaborStart,
   commandLaborUnpublish,
   commandLaborServe,
 } = require("./commands/core");
@@ -237,17 +240,35 @@ const COMMANDS = {
     summary: "Seller: create and publish a labor resource listing (priced per day, one-day rentals)",
     usage: "labor-publish --name \"...\" --description \"...\" --daily-rate <uat_per_day> [--tier tier_1] [--gatekeeper \"...\"]",
   },
+  "labor-agents": {
+    handler: commandLaborAgents,
+    section: "Labor",
+    summary: "Seller: inspect local runtimes that can back a labor listing",
+    usage: "labor-agents [--verbose]",
+  },
+  "labor-list": {
+    handler: commandLaborList,
+    section: "Labor",
+    summary: "Seller: list current account published labor resources",
+    usage: "labor-list [--status draft|available|occupied|inactive|all] [--all] [--limit 100] [--cursor CURSOR]",
+  },
   "labor-unpublish": {
     handler: commandLaborUnpublish,
     section: "Labor",
     summary: "Seller: delist a labor resource (set inactive; republish to re-list)",
     usage: "labor-unpublish --labor <labor_resource_id>",
   },
+  "labor-start": {
+    handler: commandLaborStart,
+    section: "Labor",
+    summary: "Seller: put a supported local runtime on duty, publishing first when needed",
+    usage: "labor-start [--runtime claude] [--name \"...\"] [--description \"...\"] [--daily-rate <uat_per_day>] [--port 2468] [--image <docker_image>]",
+  },
   "labor-serve": {
     handler: commandLaborServe,
     section: "Labor",
     summary: "Seller: provision a platform tunnel, run the sandbox + cloudflared, auto-accept hires, and heartbeat",
-    usage: "labor-serve --labor <labor_resource_id> [--port 2468] [--image <docker_image>]",
+    usage: "labor-serve --labor <labor_resource_id> [--runtime claude] [--port 2468] [--image <docker_image>]",
   },
   solve: {
     handler: commandSolve,
@@ -416,6 +437,7 @@ async function runCli(argv, injected = {}) {
     makeIdempotencyKey: injected.makeIdempotencyKey || makeIdempotencyKey,
     createServer: injected.createServer || http.createServer,
     spawn: injected.spawn || spawn,
+    spawnSync: injected.spawnSync || spawnSync,
     sleep:
       injected.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     now: injected.now || (() => Date.now()),

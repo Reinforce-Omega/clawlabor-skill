@@ -68,13 +68,27 @@ function readClaudeOauthToken(env = process.env, now = Date.now(), deps = {}) {
   return null;
 }
 
+function parseClaudeAuthStatus(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
 function runClaudeAuthStatus(env = process.env) {
   const claudeBin = env.CLAWLABOR_CLAUDE_BIN || "claude";
   return new Promise((resolve) => {
     const child = spawn(claudeBin, ["auth", "status"], {
       env,
-      stdio: ["ignore", "ignore", "ignore"],
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     const timer = setTimeout(() => {
       try { child.kill("SIGTERM"); } catch (_err) { /* noop */ }
       resolve(false);
@@ -85,7 +99,11 @@ function runClaudeAuthStatus(env = process.env) {
     });
     child.on("exit", (code) => {
       clearTimeout(timer);
-      resolve({ ok: code === 0 });
+      resolve({
+        ok: code === 0,
+        raw: stdout || stderr || "",
+        account: parseClaudeAuthStatus(stdout || stderr || ""),
+      });
     });
   });
 }
@@ -118,14 +136,57 @@ async function resolveClaudeCodeOauthToken(deps = {}) {
     token: null,
     source: null,
     authStatusOk: !!(status && status.ok),
+    authStatus: status || null,
+  };
+}
+
+async function resolveClaudeCodeAccount(deps = {}) {
+  const env = deps.env || process.env;
+  const authStatus = deps.runClaudeAuthStatus || runClaudeAuthStatus;
+  const status = await authStatus(env);
+  const account = status && status.account ? status.account : null;
+  if (!account || !account.loggedIn) {
+    return {
+      provider: "claude",
+      logged_in: false,
+      id: null,
+      label: null,
+      email: null,
+      org_id: null,
+      org_name: null,
+      plan: null,
+      quota: null,
+      status: status && status.ok ? "unknown_account" : "not_logged_in",
+    };
+  }
+  const email = account.email || null;
+  const orgId = account.orgId || null;
+  const plan = account.subscriptionType || null;
+  const id = orgId ? `org:${orgId}` : email ? `email:${email}` : null;
+  return {
+    provider: "claude",
+    logged_in: true,
+    id,
+    label: orgId && account.orgName ? `${account.orgName} (${plan || "unknown"})` : email,
+    email,
+    org_id: orgId,
+    org_name: account.orgName || null,
+    plan,
+    quota: null,
+    quota_status: "not_exposed_by_claude_auth_status",
+    auth_method: account.authMethod || null,
+    api_provider: account.apiProvider || null,
+    status: id ? "identified" : "logged_in_unidentified",
   };
 }
 
 module.exports = {
   claudeCredentialsPaths,
   isExpired,
+  parseClaudeAuthStatus,
   readClaudeCodeKeychainCredentials,
   readClaudeOauthToken,
+  resolveClaudeCodeAccount,
   resolveClaudeCodeOauthToken,
   runClaudeAuthStatus,
 };

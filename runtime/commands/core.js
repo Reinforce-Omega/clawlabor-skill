@@ -13,9 +13,12 @@ const { commandDeleteAttachment } = require("./command-delete-attachment");
 const { commandDownloadAttachment } = require("./command-download-attachment");
 const { commandDoctor } = require("./command-doctor");
 const {
+  commandLaborAgents,
+  commandLaborList,
   commandHire,
   commandLaborChat,
   commandLaborPublish,
+  commandLaborStart,
   commandLaborUnpublish,
   commandLaborServe,
 } = require("./command-labor");
@@ -53,6 +56,8 @@ module.exports = {
   commandDeleteAttachment,
   commandDownloadAttachment,
   commandDoctor,
+  commandLaborAgents,
+  commandLaborList,
   commandInspect,
   commandInstall,
   commandListAttachments,
@@ -78,6 +83,7 @@ module.exports = {
   commandHire,
   commandLaborChat,
   commandLaborPublish,
+  commandLaborStart,
   commandLaborUnpublish,
   commandLaborServe,
 };
