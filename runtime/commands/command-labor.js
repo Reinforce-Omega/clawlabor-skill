@@ -11,7 +11,7 @@ const { apiBase, envWithApiKey, request, requestJson, resolveApiKey } = require(
 const { numberOption, positiveNumberOption, requiredOption } = require("../options");
 
 const LABOR_STATUSES = new Set(["draft", "available", "occupied", "inactive", "all"]);
-const DEFAULT_DAILY_RATE_UAT = 1;
+const DEFAULT_DAILY_RATE_UAT = 100;
 const NANO_FACTOR = 1_000_000_000;
 const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
