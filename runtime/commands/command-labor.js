@@ -11,8 +11,12 @@ const { apiBase, envWithApiKey, request, requestJson, resolveApiKey } = require(
 const { numberOption, positiveNumberOption, requiredOption } = require("../options");
 
 const LABOR_STATUSES = new Set(["draft", "available", "occupied", "inactive", "all"]);
-const DEFAULT_DAILY_RATE_UAT = 100;
-const NANO_FACTOR = 1_000_000_000;
+const DEFAULT_DAILY_RATE_UAT = 50;
+const PLAN_MONTHLY_COST_UAT = {
+  pro: 20,
+  team: 50,
+  enterprise: 200,
+};const NANO_FACTOR = 1_000_000_000;
 const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
 
@@ -60,6 +64,7 @@ function commandProbe(deps, command, args = ["--version"]) {
 }
 
 function runtimeAgent({
+  hostPlan = null,
   id,
   name,
   runtime,
@@ -67,11 +72,10 @@ function runtimeAgent({
   probe,
   readyToServe,
   serveStatus,
-  requirements,
-  publishName,
-  hostAccount,
 }) {
-  const installed = probe.status === "pass";
+  const suggestedDailyRate = hostPlan && PLAN_MONTHLY_COST_UAT[hostPlan?.toLowerCase()]
+    ? Math.ceil(PLAN_MONTHLY_COST_UAT[hostPlan.toLowerCase()] / 30)
+    : DEFAULT_DAILY_RATE_UAT;  const installed = probe.status === "pass";
   return {
     id,
     name,
@@ -86,13 +90,12 @@ function runtimeAgent({
     ready_to_serve: readyToServe,
     serve_status: serveStatus,
     host_account: hostAccount || null,
-    requirements,
+    suggested_daily_rate_uat: suggestedDailyRate,    requirements,
     publish_command_template: [
       "clawlabor labor-publish",
       `--name ${shellQuote(publishName)}`,
       `--description ${shellQuote(`${publishName} backed by the local ${name} runtime.`)}`,
-      `--daily-rate ${DEFAULT_DAILY_RATE_UAT}`,
-    ].join(" "),
+      `--daily-rate ${suggestedDailyRate}`,    ].join(" "),
     serve_command_template: readyToServe
       ? "clawlabor labor-serve --labor <labor_resource_id>"
       : null,
@@ -143,7 +146,7 @@ function summarizeLaborAgent(agent, existingLaborByRuntime) {
     name: agent.name,
     status: shortRuntimeStatus(agent),
     can_publish: agent.ready_to_publish,
-    can_serve: agent.ready_to_serve,
+    suggested_daily_rate_uat: agent.suggested_daily_rate_uat,    can_serve: agent.ready_to_serve,
   };
   if (missing.length > 0) {
     summary.needs = missing;
@@ -322,7 +325,7 @@ async function claudeRuntimeAgent(deps) {
     requirements: claudeRequirements,
     publishName: "Claude Code Labor",
     hostAccount: claudeAccount,
-  });
+    hostPlan: claudeAccount.plan,  });
 }
 
 // ---------------------------------------------------------------------------
