@@ -4162,7 +4162,7 @@ test("labor-publish creates and publishes a labor resource", async () => {
     { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
   );
   const createBody = JSON.parse(calls[0].options.body);
-  assert.equal(createBody.hourly_rate_uat, 240);
+  assert.equal(createBody.daily_rate_uat, 240);
   assert.equal(createBody.min_duration_days, 1); // one-day rentals only
   assert.equal(createBody.max_duration_days, 1);
   assert.equal(createBody.gatekeeper_prompt, "only cooking");

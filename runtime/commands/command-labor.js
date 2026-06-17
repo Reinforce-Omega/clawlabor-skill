@@ -44,7 +44,7 @@ async function commandLaborPublish(options, deps) {
   const body = {
     name,
     description,
-    hourly_rate_uat: dailyRate,
+    daily_rate_uat: dailyRate,
     min_duration_days: 1,
     max_duration_days: 1,
     tier: options.tier || "tier_1",
@@ -175,14 +175,18 @@ async function commandLaborServe(options, deps) {
   }
 
   // Sandbox runtime: bound to localhost (only cloudflared reaches it), --token enforced.
+  // Detached (-d): the container lifecycle is independent of this process's stdio;
+  // it is torn down explicitly via `docker rm -f <name>` on exit. (Foreground docker
+  // run coupled to a backgrounded parent is fragile — the container can die with the
+  // parent's stdio.)
   const container = spawn(
     "docker",
     [
-      "run", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
+      "run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
       "-e", "CLAUDE_CODE_OAUTH_TOKEN",
       image, "server", "--token", sandbox_token, "--host", "0.0.0.0", "--port", "2468",
     ],
-    { stdio: "inherit", env: runtimeEnv },
+    { stdio: "ignore", env: runtimeEnv },
   );
   // cloudflared connects the platform-managed tunnel to the local container.
   const tunnel = spawn("cloudflared", ["tunnel", "run", "--token", tunnel_token], {
@@ -239,6 +243,20 @@ async function commandLaborServe(options, deps) {
     await heartbeatOnce();
   }
 
+  // Wait for the container to accept requests before the first heartbeat, so the
+  // resource isn't briefly flagged offline during the ~10s container startup.
+  for (let i = 0; i < 30; i += 1) {
+    try {
+      const r = await deps.fetch(`http://127.0.0.1:${port}/v1/health`, {
+        headers: { Authorization: `Bearer ${sandbox_token}` },
+      });
+      if (r.ok) break;
+    } catch (_e) {
+      /* not up yet */
+    }
+    await sleep(1000);
+  }
+
   await tick();
   while (running) {
     await sleep(60000);
@@ -247,7 +265,7 @@ async function commandLaborServe(options, deps) {
   }
 
   try { container.kill && container.kill(); } catch (_e) { /* noop */ }
-  try { tunnel.kill && tunnel.kill(); } catch (_e) { /* noop */ }
+  try { tunnel && tunnel.kill && tunnel.kill(); } catch (_e) { /* noop */ }
   try { spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" }); } catch (_e) { /* noop */ }
   try { await requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}); } catch (_e) { /* noop */ }
 

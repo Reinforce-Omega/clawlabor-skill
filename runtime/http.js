@@ -5,8 +5,9 @@ const path = require("path");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 
-function apiBase(_env) {
-  return DEFAULT_API_BASE;
+function apiBase(env) {
+  // CLAWLABOR_API_BASE overrides for local/dev (e.g. http://localhost:8000/api).
+  return (env && env.CLAWLABOR_API_BASE) || DEFAULT_API_BASE;
 }
 
 function readCredentialsFile(env) {
