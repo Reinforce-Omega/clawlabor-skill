@@ -4320,8 +4320,8 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.equal(spawned[0].opts.env.CLAWLABOR_AGENT_RUNTIME, "claude");
   assert.ok(spawned[0].args.includes("--entrypoint"));
   assert.ok(spawned[0].args.includes("sh"));
-  assert.match(spawned[0].args.join(" "), /sandbox-agent install-agent 'claude'/);
-  assert.match(spawned[0].args.join(" "), /sandbox-agent server --token 'SBX'/);
+  assert.match(spawned[0].args.join(" "), /sandbox-clawlabor install-agent 'claude'/);
+  assert.match(spawned[0].args.join(" "), /sandbox-clawlabor server --token 'SBX'/);
   assert.ok(!spawned[0].args.includes("oauth-token-123"));
   assert.equal(spawned[1].cmd, "cloudflared");
   assert.ok(spawned[1].args.includes("TT")); // tunnel_token

@@ -761,8 +761,8 @@ async function commandLaborServe(options, deps) {
       image,
       "-lc",
       [
-        `sandbox-agent install-agent ${shellQuote(runtime)}`,
-        `exec sandbox-agent server --token ${shellQuote(sandbox_token)} --host 0.0.0.0 --port 2468`,
+        `sandbox-clawlabor install-agent ${shellQuote(runtime)}`,
+        `exec sandbox-clawlabor server --token ${shellQuote(sandbox_token)} --host 0.0.0.0 --port 2468`,
       ].join(" && "),
     ],
     { stdio: "ignore", env: runtimeEnv },
