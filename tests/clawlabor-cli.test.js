@@ -4075,6 +4075,7 @@ function laborAgentsFetch() {
           seller_agent_id: "seller-1",
           name: "Claude Labor",
           status: "available",
+          runtime: "claude",
           host_account_provider: "claude",
           host_account_id: "org:org-123",
         }],
@@ -4573,7 +4574,7 @@ test("labor-publish applies the default gatekeeper when omitted", async () => {
   assert.match(createBody.gatekeeper_prompt, /Accept only safe, legal, well-scoped requests/);
 });
 
-test("labor-publish blocks duplicate active host account listings", async () => {
+test("labor-publish blocks a duplicate active listing for the same runtime", async () => {
   const { fetch } = recordingFetch([
     matchRoute("GET", "/labor/list?limit=100", {
       status: 200,
@@ -4583,8 +4584,7 @@ test("labor-publish blocks duplicate active host account listings", async () => 
           seller_agent_id: "seller-1",
           name: "Existing",
           status: "available",
-          host_account_provider: "claude",
-          host_account_id: "org:org-123",
+          runtime: "claude",
         }],
         next_cursor: null,
       }),
@@ -4612,7 +4612,24 @@ test("labor-publish blocks duplicate active host account listings", async () => 
         }),
       },
     ),
-    /already listed as labor: labor-existing/,
+    /Already have an active claude labor: labor-existing/,
+  );
+});
+
+test("labor-publish rejects non-Claude runtimes until serve support exists", async () => {
+  const { fetch } = recordingFetch([]);
+  await assert.rejects(
+    () => runCli(
+      ["labor-publish", "--runtime", "codex", "--name", "Codex bot", "--description", "rented codex",
+       "--daily-rate", "240"],
+      {
+        env: BASE_ENV,
+        fetch,
+        stdout: () => {},
+        runClaudeAuthStatus: async () => ({ ok: false }),
+      },
+    ),
+    /labor-publish currently supports --runtime claude/,
   );
 });
 

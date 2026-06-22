@@ -223,21 +223,14 @@ function compactMarketplaceAgent(agent) {
   return compact;
 }
 
-async function activeLaborResourcesForHostAccount(deps, hostAccount) {
-  if (!hostAccount || !hostAccount.id) return [];
+async function activeLaborResourcesForRuntime(deps, runtime) {
   const list = await requestJson(deps, "GET", "/labor/list?limit=100");
   const me = await requestJson(deps, "GET", "/agents/me");
   const owner = me.agent || me;
   const ownerId = owner && owner.id ? String(owner.id) : null;
   return (list.items || []).filter((item) =>
     String(item.seller_agent_id) === ownerId &&
-    (
-      (
-        item.host_account_provider === hostAccount.provider &&
-        item.host_account_id === hostAccount.id
-      ) ||
-      (!item.host_account_provider && !item.host_account_id)
-    ) &&
+    item.runtime === runtime &&
     ["draft", "available", "occupied"].includes(item.status),
   );
 }
@@ -260,9 +253,8 @@ async function currentSellerLaborResources(deps, marketplaceAgent) {
 function existingLaborByRuntime(resources) {
   const byRuntime = {};
   for (const resource of resources) {
-    const provider = resource.host_account_provider;
-    if (provider === "claude" || (!provider && !byRuntime.claude)) {
-      byRuntime.claude = resource;
+    if (resource.runtime && !byRuntime[resource.runtime]) {
+      byRuntime[resource.runtime] = resource;
     }
   }
   return byRuntime;
@@ -538,26 +530,29 @@ async function commandLaborPublish(options, deps) {
   if (dailyRate === undefined) {
     throw new Error("Missing required --daily-rate");
   }
-  const hostAccount = await resolveClaudeCodeAccount(deps);
-  if (hostAccount.provider === "claude" && hostAccount.logged_in && hostAccount.id) {
-    const existing = await activeLaborResourcesForHostAccount(deps, hostAccount);
-    if (existing.length > 0) {
-      const ids = existing.map((item) => `${item.id}(${item.status})`).join(", ");
-      throw new Error(
-        `This host Claude account is already listed as labor: ${ids}. ` +
-        "Use `clawlabor labor-list` to inspect it or `clawlabor labor-unpublish --labor <id>` before publishing again.",
-      );
-    }
+  const runtime = options.runtime || "claude";
+  if (runtime !== "claude") {
+    throw new Error("labor-publish currently supports --runtime claude");
   }
+  const existing = await activeLaborResourcesForRuntime(deps, runtime);
+  if (existing.length > 0) {
+    const ids = existing.map((item) => `${item.id}(${item.status})`).join(", ");
+    throw new Error(
+      `Already have an active ${runtime} labor: ${ids}. ` +
+      "Use `clawlabor labor-list` to inspect it or `clawlabor labor-unpublish --labor <id>` before publishing again.",
+    );
+  }
+  const hostAccount = await resolveClaudeCodeAccount(deps);
   const body = {
     name,
     description,
+    runtime,
     daily_rate_uat: dailyRate,
     min_duration_days: 1,
     max_duration_days: 1,
     tier: options.tier || "tier_1",
   };
-  if (hostAccount.provider === "claude" && hostAccount.logged_in && hostAccount.id) {
+  if (runtime === "claude" && hostAccount.provider === "claude" && hostAccount.logged_in && hostAccount.id) {
     body.host_account_provider = hostAccount.provider;
     body.host_account_id = hostAccount.id;
     body.host_account_label = hostAccount.label;
