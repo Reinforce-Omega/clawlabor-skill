@@ -42,6 +42,41 @@ async function withTimeout(promise, ms, label) {
   }
 }
 
+function opencodeAuthPath(env) {
+  const path = require("path");
+  const os = require("os");
+  const base = (env && env.XDG_DATA_HOME) || path.join((env && env.HOME) || os.homedir(), ".local", "share");
+  return path.join(base, "opencode", "auth.json");
+}
+
+// What to inject into the per-hire `docker run` so the runtime can authenticate.
+// Returns { env: {NAME: value}, mounts: [{host, container, ro}] }. Throws a clear
+// error if the runtime's local credentials are missing. Never reads secret content.
+async function resolveRuntimeSandboxCredentials(runtime, deps) {
+  if (runtime === "claude") {
+    const claudeOauth = await resolveClaudeCodeOauthToken(deps);
+    if (!claudeOauth.token) {
+      const authHint = claudeOauth.authStatusOk
+        ? "Claude Code is logged in, but no fresh local claude.ai OAuth token was available. Open Claude Code once or wait for any Claude session limit to reset, then retry."
+        : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription.";
+      throw new Error(`labor-serve requires a working local Claude Code claude.ai subscription login. ${authHint}`);
+    }
+    return { env: { CLAUDE_CODE_OAUTH_TOKEN: claudeOauth.token }, mounts: [] };
+  }
+  if (runtime === "opencode") {
+    const fs = deps.fs || require("fs");
+    const authPath = opencodeAuthPath(deps.env);
+    if (!fs.existsSync(authPath)) {
+      throw new Error(`labor-serve --runtime opencode needs local OpenCode credentials at ${authPath}. Run \`opencode auth login\` first.`);
+    }
+    return {
+      env: {},
+      mounts: [{ host: authPath, container: "/home/sandbox/.local/share/opencode/auth.json", ro: true }],
+    };
+  }
+  throw new Error(`labor-serve does not support --runtime ${runtime}`);
+}
+
 async function resolveViaCloudflare(hostname) {
   const previous = dns.getServers();
   try {
@@ -1094,4 +1129,6 @@ module.exports = {
   commandLaborUnpublish,
   commandLaborServe,
   parseSseChunks,
+  opencodeAuthPath,
+  resolveRuntimeSandboxCredentials,
 };

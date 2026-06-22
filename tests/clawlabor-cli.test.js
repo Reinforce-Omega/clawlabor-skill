@@ -5099,3 +5099,41 @@ test("labor-unpublish delists a resource (sets it inactive)", async () => {
   assert.equal(parsed.labor_resource_id, "labor-7");
   assert.equal(parsed.status, "inactive");
 });
+
+// --- opencode runtime: per-runtime sandbox credential seam (Task 1) ---
+const { opencodeAuthPath, resolveRuntimeSandboxCredentials } = require("../runtime/commands/command-labor");
+
+test("opencodeAuthPath honors XDG_DATA_HOME then HOME", () => {
+  assert.equal(opencodeAuthPath({ XDG_DATA_HOME: "/x" }), "/x/opencode/auth.json");
+  assert.equal(opencodeAuthPath({ HOME: "/home/u" }), "/home/u/.local/share/opencode/auth.json");
+});
+
+test("resolveRuntimeSandboxCredentials: claude returns oauth env, no mounts", async () => {
+  const creds = await resolveRuntimeSandboxCredentials("claude", {
+    env: {},
+    readClaudeOauthToken: () => "oauth-token-123",
+    runClaudeAuthStatus: async () => ({ ok: true, account: { loggedIn: true, authMethod: "claude.ai" } }),
+  });
+  assert.equal(creds.env.CLAUDE_CODE_OAUTH_TOKEN, "oauth-token-123");
+  assert.deepEqual(creds.mounts, []);
+});
+
+test("resolveRuntimeSandboxCredentials: opencode mounts auth.json read-only when present", async () => {
+  const creds = await resolveRuntimeSandboxCredentials("opencode", {
+    env: { HOME: "/home/seller" },
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+  });
+  assert.deepEqual(creds.env, {});
+  assert.deepEqual(creds.mounts, [{
+    host: "/home/seller/.local/share/opencode/auth.json",
+    container: "/home/sandbox/.local/share/opencode/auth.json",
+    ro: true,
+  }]);
+});
+
+test("resolveRuntimeSandboxCredentials: opencode missing auth throws actionable error", async () => {
+  await assert.rejects(
+    resolveRuntimeSandboxCredentials("opencode", { env: { HOME: "/home/seller" }, fs: { existsSync: () => false } }),
+    /opencode auth login/,
+  );
+});
