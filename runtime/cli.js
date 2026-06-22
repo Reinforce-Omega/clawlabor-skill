@@ -481,6 +481,7 @@ async function runCli(argv, injected = {}) {
     waitForExit: injected.waitForExit || waitForSignals,
     readClaudeOauthToken: injected.readClaudeOauthToken,
     runClaudeAuthStatus: injected.runClaudeAuthStatus,
+    probePublicHealthWithDnsFallback: injected.probePublicHealthWithDnsFallback,
   };
   if (!deps.fetch) {
     throw new Error("This Node.js runtime does not provide fetch");

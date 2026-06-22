@@ -3,6 +3,8 @@
 // Unit convention: labor is sold BY THE DAY. The API schema is day-facing and
 // converts to seconds at its service/DB boundary. See docs/2026-06-16-labor-technical-solution.md.
 const { spawnSync } = require("node:child_process");
+const dns = require("node:dns").promises;
+const https = require("node:https");
 const {
   resolveClaudeCodeAccount,
   resolveClaudeCodeOauthToken,
@@ -18,6 +20,7 @@ const PLAN_MONTHLY_COST_UAT = {
   enterprise: 200 * 10, // $200/month = 2000 UAT/month
 };
 const LABOR_CONTROL_TIMEOUT_MS = 10_000;
+const CLOUDFLARE_RESOLVERS = ["1.1.1.1", "1.0.0.1"];
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
 const NANO_FACTOR = 1e9;
 
@@ -37,6 +40,67 @@ async function withTimeout(promise, ms, label) {
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+async function resolveViaCloudflare(hostname) {
+  const previous = dns.getServers();
+  try {
+    dns.setServers(CLOUDFLARE_RESOLVERS);
+    const [v4, v6] = await Promise.allSettled([
+      dns.resolve4(hostname),
+      dns.resolve6(hostname),
+    ]);
+    return [
+      ...(v4.status === "fulfilled" ? v4.value : []),
+      ...(v6.status === "fulfilled" ? v6.value : []),
+    ];
+  } finally {
+    try { dns.setServers(previous); } catch (_err) { /* noop */ }
+  }
+}
+
+function httpsGetViaResolvedIp(url, token, ip) {
+  return new Promise((resolve) => {
+    const parsed = new URL(url);
+    const req = https.request(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Host: parsed.hostname,
+        },
+        servername: parsed.hostname,
+        lookup: (_hostname, opts, cb) => {
+          const done = typeof opts === "function" ? opts : cb;
+          const family = ip.includes(":") ? 6 : 4;
+          if (opts && opts.all) {
+            done(null, [{ address: ip, family }]);
+            return;
+          }
+          done(null, ip, family);
+        },
+        timeout: LABOR_CONTROL_TIMEOUT_MS,
+      },
+      (resp) => {
+        resp.resume();
+        resp.once("end", () => resolve(resp.statusCode >= 200 && resp.statusCode < 300));
+      },
+    );
+    req.once("timeout", () => req.destroy(new Error("health probe timeout")));
+    req.once("error", () => resolve(false));
+    req.end();
+  });
+}
+
+async function probePublicHealthWithDnsFallback(url, token) {
+  const ips = await resolveViaCloudflare(new URL(url).hostname);
+  for (const ip of ips) {
+    if (await httpsGetViaResolvedIp(url, token, ip)) return true;
+  }
+  return false;
 }
 
 function commandProbe(deps, command, args = ["--version"]) {
@@ -757,6 +821,24 @@ async function commandLaborServe(options, deps) {
     });
   }
 
+  function terminateChild(process, signal = "SIGTERM") {
+    if (!process || typeof process.kill !== "function") return;
+    try {
+      process.kill(signal);
+    } catch (_err) { /* noop */ }
+  }
+
+  function terminateProcessGroup(process, signal = "SIGTERM") {
+    if (!process) return;
+    if (process.pid) {
+      try {
+        process.kill(-process.pid, signal);
+        return;
+      } catch (_err) { /* fall back to child kill */ }
+    }
+    terminateChild(process, signal);
+  }
+
   function interruptibleSleep(ms) {
     return Promise.race([sleep(ms), stop]);
   }
@@ -777,11 +859,11 @@ async function commandLaborServe(options, deps) {
     stdout(`Shutting down hire ${hireId} runtime...`);
 
     stdout("Stopping Cloudflare tunnel...");
-    try { tunnel && tunnel.kill && tunnel.kill("SIGTERM"); } catch (_err) { /* noop */ }
+    terminateProcessGroup(tunnel, "SIGTERM");
     await forceKill(tunnel, "tunnel", 3000);
 
     stdout("Stopping sandbox container...");
-    try { container && container.kill && container.kill(); } catch (_err) { /* noop */ }
+    terminateChild(container);
     await forceKill(container, "container", 2000);
 
     stdout("Removing docker container...");
@@ -860,7 +942,7 @@ async function commandLaborServe(options, deps) {
     const tunnel = spawn(
       "cloudflared",
       ["tunnel", "--grace-period=3s", "run", "--token", tunnel_token],
-      { stdio: "inherit" },
+      { stdio: "inherit", detached: true },
     );
 
     stdout(`Hire ${hireId} is now serving at https://${hostname}`);
@@ -877,7 +959,7 @@ async function commandLaborServe(options, deps) {
       await cleanupRuntime({ hireId, containerName, container, tunnel, cleanedUpRef });
     }
 
-    async function probeHealth(url) {
+    async function probeHealth(url, { publicTunnel = false } = {}) {
       try {
         const resp = await withTimeout(
           deps.fetch(url, { headers: { Authorization: `Bearer ${sandbox_token}` } }),
@@ -886,16 +968,22 @@ async function commandLaborServe(options, deps) {
         );
         return !!resp.ok;
       } catch (_err) {
-        return false;
+        if (!publicTunnel) return false;
+        const fallbackProbe = deps.probePublicHealthWithDnsFallback || probePublicHealthWithDnsFallback;
+        return fallbackProbe(url, sandbox_token);
       }
     }
 
     async function heartbeatOnce() {
-      const healthy = await probeHealth(publicHealthUrl);
+      const healthy = await probeHealth(publicHealthUrl, { publicTunnel: true });
 
       if (!healthy) {
         const localOk = await probeHealth(localHealthUrl);
         if (localOk) {
+          if (!(await activeHireStillPresent(hireId))) {
+            hireRunning = false;
+            return;
+          }
           if (!warnedTunnelDown) {
             warnedTunnelDown = true;
             stdout(
@@ -927,6 +1015,7 @@ async function commandLaborServe(options, deps) {
 
     async function tick() {
       await heartbeatOnce();
+      if (!hireRunning) return;
       if (!(await activeHireStillPresent(hireId))) {
         hireRunning = false;
       }
@@ -934,7 +1023,7 @@ async function commandLaborServe(options, deps) {
 
     stdout("Waiting for sandbox to be reachable over the tunnel...");
     for (let i = 0; i < 30 && hireRunning; i += 1) {
-      if (await probeHealth(publicHealthUrl)) {
+      if (await probeHealth(publicHealthUrl, { publicTunnel: true })) {
         stdout("Sandbox is healthy and reachable; ready for work.");
         break;
       }

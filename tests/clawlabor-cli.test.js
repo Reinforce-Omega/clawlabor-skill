@@ -4354,6 +4354,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(!spawned[0].args.includes("oauth-token-123"));
   assert.equal(spawned[1].cmd, "cloudflared");
   assert.ok(spawned[1].args.includes("TT")); // tunnel_token
+  assert.equal(spawned[1].opts.detached, true);
   assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/heartbeat")));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"));
@@ -4456,11 +4457,68 @@ test("labor-serve heartbeat is not blocked by a slow active-hire poll", async ()
   assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
 });
 
+test("labor-serve uses Cloudflare DNS fallback before marking a public tunnel offline", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const out = [];
+  const { fetch: apiFetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch: async (url, options) => {
+        if (String(url).startsWith("https://hire-1.clawlabor.com/")) {
+          throw new Error("getaddrinfo ENOTFOUND hire-1.clawlabor.com");
+        }
+        return apiFetch(url, options);
+      },
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async (url, token) => (
+        url === "https://hire-1.clawlabor.com/v1/health" && token === "SBX"
+      ),
+    },
+  );
+
+  const heartbeat = calls.find((call) =>
+    call.options.method === "POST" && call.url.endsWith("/labor/hires/hire-1/heartbeat"),
+  );
+  assert.deepEqual(JSON.parse(heartbeat.options.body), { healthy: true });
+  assert.doesNotMatch(out.join("\n"), /OFFLINE/);
+});
+
 test("labor-serve drains current hire instead of killing it when seller goes offline", async () => {
   const stop = deferred();
   let hirePolls = 0;
   let sawSeatOfflineWhileHireActive = false;
   const sleeps = [];
+  const children = [];
   const { fetch, calls } = recordingFetch([
     matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
     {
@@ -4501,13 +4559,22 @@ test("labor-serve drains current hire instead of killing it when seller goes off
       fetch,
       stdout: () => {},
       readClaudeOauthToken: () => "oauth-token-123",
-      spawn: () => ({ kill() {} }),
+      spawn: (cmd, args, opts) => {
+        const child = { cmd, args, opts, kills: [], kill(signal) { this.kills.push(signal || "SIGTERM"); } };
+        children.push(child);
+        return child;
+      },
       sleep: async (ms) => { sleeps.push(ms); },
       waitForExit: () => stop.promise,
     },
   );
   assert.equal(sawSeatOfflineWhileHireActive, true);
   assert.equal(sleeps.includes(60000), true);
+  const tunnel = children.find((child) => child.cmd === "cloudflared");
+  const container = children.find((child) => child.cmd === "docker" && child.args.includes("run"));
+  assert.equal(tunnel.opts.detached, true);
+  assert.deepEqual(tunnel.kills, ["SIGTERM"]);
+  assert.deepEqual(container.kills, ["SIGTERM"]);
   assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
   assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE"));
 });
