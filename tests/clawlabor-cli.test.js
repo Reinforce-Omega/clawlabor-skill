@@ -74,6 +74,21 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function laborServeStopAfterHireTeardown() {
+  const stop = deferred();
+  return {
+    stop,
+    route: {
+      match: ({ url, options }) =>
+        options.method === "DELETE" && /\/labor\/hires\/[^/]+\/serve$/.test(url),
+      respond: () => {
+        stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+  };
+}
+
 function createMockResponse() {
   return {
     statusCode: null,
@@ -4281,17 +4296,29 @@ test("labor-agents --verbose keeps diagnostic detail", async () => {
 
 test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats, and tears down", async () => {
   const spawned = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
   const { fetch, calls } = recordingFetch([
-    matchRoute("POST", "/labor/labor-9/serve", {
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
       status: 200,
-      body: JSON.stringify({
-        tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-labor-9.clawlabor.com",
-      }),
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
     }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
-    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
-      respond: { status: 200, body: '{"items":[]}' } },
-    matchRoute("POST", "/labor/labor-9/heartbeat", { status: 204, body: "" }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
     matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
   ]);
   const out = [];
@@ -4307,7 +4334,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
         return { kill() {} };
       },
       sleep: async () => {},
-      waitForExit: () => Promise.resolve(),
+      waitForExit: () => stop.promise,
     },
   );
 
@@ -4316,7 +4343,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.equal(spawned[0].cmd, "docker");
   assert.match(spawned[0].args.join(" "), /--token 'SBX'/); // sandbox_token passed to server
   assert.ok(spawned[0].args.includes("--name"));
-  assert.ok(spawned[0].args.includes("clawlabor-labor-labor-9"));
+  assert.ok(spawned[0].args.includes("clawlabor-hire-hire-1"));
   assert.ok(spawned[0].args.includes("CLAWLABOR_AGENT_RUNTIME"));
   assert.ok(spawned[0].args.includes("CLAUDE_CODE_OAUTH_TOKEN"));
   assert.equal(spawned[0].opts.env.CLAWLABOR_AGENT_RUNTIME, "claude");
@@ -4327,33 +4354,37 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(!spawned[0].args.includes("oauth-token-123"));
   assert.equal(spawned[1].cmd, "cloudflared");
   assert.ok(spawned[1].args.includes("TT")); // tunnel_token
-  assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-labor-labor-9"));
-  assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/heartbeat")));
+  assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/heartbeat")));
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "DELETE"));
 });
 
 test("labor-serve keeps the startup seller API key for long-running requests", async () => {
   const seenAuth = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
   const { fetch } = recordingFetch([
-    matchRoute("POST", "/labor/labor-9/serve", {
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
       status: 200,
-      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-labor-9.clawlabor.com" }),
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
     }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
-    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
-      respond: ({ options }) => {
-        seenAuth.push(options.headers.Authorization);
-        return { status: 200, body: '{"items":[{"id":"hire-1","status":"pending_accept"}]}' };
-      } },
-    { match: ({ url, options }) => options.method === "POST" && url.endsWith("/labor/hire-1/accept"),
-      respond: ({ options }) => {
-        seenAuth.push(options.headers.Authorization);
-        return { status: 200, body: '{"id":"hire-1","status":"active"}' };
-      } },
-    matchRoute("POST", "/labor/labor-9/heartbeat", {
-      status: 204,
-      body: "",
-    }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
     matchRoute("DELETE", "/labor/labor-9/serve", {
       status: 204,
       body: "",
@@ -4364,7 +4395,7 @@ test("labor-serve keeps the startup seller API key for long-running requests", a
     {
       env: { ...BASE_ENV },
       fetch: async (url, options) => {
-        if (url.endsWith("/labor/labor-9/heartbeat") || url.endsWith("/labor/labor-9/serve")) {
+        if (url.endsWith("/labor/labor-9/serve") || url.endsWith("/labor/hires/hire-1/heartbeat") || url.endsWith("/labor/hires/hire-1/serve")) {
           seenAuth.push(options.headers.Authorization);
         }
         return fetch(url, options);
@@ -4373,22 +4404,39 @@ test("labor-serve keeps the startup seller API key for long-running requests", a
       readClaudeOauthToken: () => "oauth-token-123",
       spawn: () => ({ kill() {} }),
       sleep: async () => {},
-      waitForExit: () => Promise.resolve(),
+      waitForExit: () => stop.promise,
     },
   );
   assert.deepEqual([...new Set(seenAuth)], ["Bearer test-key"]);
 });
 
-test("labor-serve heartbeat is not blocked by a stuck pending-hire poll", async () => {
+test("labor-serve heartbeat is not blocked by a slow active-hire poll", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
   const { fetch, calls } = recordingFetch([
-    matchRoute("POST", "/labor/labor-9/serve", {
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls === 1) {
+          return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        }
+        if (hirePolls === 2) {
+          return new Promise((resolve) => {
+            setTimeout(() => resolve({ status: 200, body: '{"items":[]}' }), 1);
+          });
+        }
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
       status: 200,
-      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-labor-9.clawlabor.com" }),
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
     }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
-    matchRoute("POST", "/labor/labor-9/heartbeat", { status: 204, body: "" }),
-    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
-      respond: () => new Promise(() => {}) },
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
     matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
   ]);
   await runCli(
@@ -4400,15 +4448,74 @@ test("labor-serve heartbeat is not blocked by a stuck pending-hire poll", async 
       readClaudeOauthToken: () => "oauth-token-123",
       spawn: () => ({ kill() {} }),
       sleep: async () => {},
-      waitForExit: () => Promise.resolve(),
+      waitForExit: () => stop.promise,
     },
   );
-  assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/heartbeat")));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE"));
   assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
+});
+
+test("labor-serve drains current hire instead of killing it when seller goes offline", async () => {
+  const stop = deferred();
+  let hirePolls = 0;
+  let sawSeatOfflineWhileHireActive = false;
+  const sleeps = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls === 1) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        if (hirePolls === 2) {
+          stop.resolve();
+          return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        }
+        if (hirePolls === 3) {
+          const seatOffline = calls.some((call) =>
+            call.options.method === "DELETE" && call.url.endsWith("/labor/labor-9/serve"),
+          );
+          const hireTornDown = calls.some((call) =>
+            call.options.method === "DELETE" && call.url.endsWith("/labor/hires/hire-1/serve"),
+          );
+          sawSeatOfflineWhileHireActive = seatOffline && !hireTornDown;
+          return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        }
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/hires/hire-1/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async (ms) => { sleeps.push(ms); },
+      waitForExit: () => stop.promise,
+    },
+  );
+  assert.equal(sawSeatOfflineWhileHireActive, true);
+  assert.equal(sleeps.includes(60000), true);
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE"));
 });
 
 test("labor-start publishes missing Claude labor then serves it", async () => {
   const spawned = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
   const { fetch, calls } = recordingFetch([
     matchRoute("GET", "/agents/me", {
       status: 200,
@@ -4434,16 +4541,26 @@ test("labor-start publishes missing Claude labor then serves it", async () => {
       status: 200,
       body: JSON.stringify({ id: "labor-new", name: "Claude Code Labor", status: "available" }),
     }),
-    matchRoute("POST", "/labor/labor-new/serve", {
+    matchRoute("POST", "/labor/labor-new/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-new/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-new","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-new/serve", {
       status: 200,
-      body: JSON.stringify({
-        tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-new.clawlabor.com",
-      }),
+      body: JSON.stringify({ hire_id: "hire-new", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-new.clawlabor.com" }),
     }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
-    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-new/hires"),
-      respond: { status: 200, body: '{"items":[]}' } },
-    matchRoute("POST", "/labor/labor-new/heartbeat", { status: 204, body: "" }),
+    matchRoute("POST", "/labor/hires/hire-new/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
     matchRoute("DELETE", "/labor/labor-new/serve", { status: 204, body: "" }),
   ]);
   const out = [];
@@ -4478,13 +4595,13 @@ test("labor-start publishes missing Claude labor then serves it", async () => {
         return { kill() {} };
       },
       sleep: async () => {},
-      waitForExit: () => Promise.resolve(),
+      waitForExit: () => stop.promise,
     },
   );
   assert.equal(calls.some((call) => call.url.endsWith("/labor") && call.options.method === "POST"), true);
   assert.equal(calls.some((call) => call.url.endsWith("/labor/labor-new/serve")), true);
   assert.equal(spawned.some((item) => item.cmd === "docker"), true);
-  assert.match(out.join(""), /Labor labor-new is now serving at https:\/\/labor-new\.clawlabor\.com/);
+  assert.match(out.join(""), /Hire hire-new is now serving at https:\/\/hire-new\.clawlabor\.com/);
 });
 
 test("labor-publish creates and publishes a labor resource", async () => {
@@ -4737,29 +4854,98 @@ test("labor-list defaults to currently published resources", async () => {
   assert.equal(parsed.items[0].id, "labor-live");
 });
 
-test("labor-serve auto-accepts pending hires for the resource", async () => {
-  const accepted = [];
-  const { fetch } = recordingFetch([
-    matchRoute("POST", "/labor/labor-9/serve", {
+test("labor-serve waits for an active hire before provisioning a sandbox", async () => {
+  let polls = 0;
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        polls += 1;
+        if (polls === 1) return { status: 200, body: '{"items":[]}' };
+        if (polls === 2) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
       status: 200,
-      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-labor-9.clawlabor.com" }),
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
     }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
-    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
-      respond: { status: 200, body: '{"items":[{"id":"hire-1","status":"pending_accept"}]}' } },
-    { match: ({ url, options }) => options.method === "POST" && url.endsWith("/labor/hire-1/accept"),
-      respond: ({ url }) => { accepted.push(url); return { status: 200, body: '{"id":"hire-1","status":"active"}' }; } },
-    matchRoute("POST", "/labor/labor-9/heartbeat", { status: 204, body: "" }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
     matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
   ]);
   await runCli(
     ["labor-serve", "--labor", "labor-9"],
     { env: BASE_ENV, fetch, stdout: () => {},
       readClaudeOauthToken: () => "oauth-token-123",
-      spawn: () => ({ kill() {} }), sleep: async () => {}, waitForExit: () => Promise.resolve() },
+      spawn: () => ({ kill() {} }), sleep: async () => {}, waitForExit: () => stop.promise },
   );
-  assert.equal(accepted.length, 1);
-  assert.ok(accepted[0].endsWith("/labor/hire-1/accept"));
+  assert.equal(polls, 3);
+  assert.ok(!calls.some((call) => call.url.endsWith("/labor/hire-1/accept")));
+});
+
+test("labor-serve keeps the labor seat online across sequential hires", async () => {
+  const stop = deferred();
+  let hirePolls = 0;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls === 1) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        if (hirePolls === 2) return { status: 200, body: '{"items":[]}' };
+        if (hirePolls === 3) return { status: 200, body: '{"items":[{"id":"hire-2","status":"active"}]}' };
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT1", sandbox_token: "SBX1", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("POST", "/labor/hires/hire-2/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-2", tunnel_token: "TT2", sandbox_token: "SBX2", hostname: "hire-2.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    matchRoute("POST", "/labor/hires/hire-2/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/hires/hire-1/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => options.method === "DELETE" && url.endsWith("/labor/hires/hire-2/serve"),
+      respond: () => {
+        stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  const laborSeatDeletes = calls.filter((call) =>
+    call.options.method === "DELETE" && call.url.endsWith("/labor/labor-9/serve"),
+  );
+  const hireServeCalls = calls.filter((call) =>
+    call.options.method === "POST" && /\/labor\/hires\/hire-[12]\/serve$/.test(call.url),
+  );
+  assert.deepEqual(hireServeCalls.map((call) => call.url.match(/hire-\d/)[0]), ["hire-1", "hire-2"]);
+  assert.equal(laborSeatDeletes.length, 1);
+  assert.ok(calls.findIndex((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE") <
+    calls.findIndex((call) => call.url.endsWith("/labor/hires/hire-2/serve") && call.options.method === "POST"));
 });
 
 test("readClaudeOauthToken reads valid Claude Code OAuth credentials and skips expired ones", () => {

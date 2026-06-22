@@ -704,6 +704,8 @@ async function commandLaborServe(options, deps) {
     throw new Error("Set CLAWLABOR_API_KEY or store api_key in ~/.config/clawlabor/credentials.json before calling clawlabor");
   }
   const sellerDeps = { ...deps, env: envWithApiKey(deps.env, sellerApiKey) };
+  const stop = deps.waitForExit ? deps.waitForExit() : new Promise(() => {});
+  let stopRequested = false;
   stdout("[2/7] Checking Claude Code authentication...");
   const claudeOauth = await resolveClaudeCodeOauthToken(deps);
   if (!claudeOauth.token) {
@@ -715,74 +717,33 @@ async function commandLaborServe(options, deps) {
     );
   }
 
-  stdout("[3/7] Provisioning tunnel from ClawLabor platform...");
-  const provisioned = await requestJson(sellerDeps, "POST", `/labor/${laborId}/serve`, {});
-  const { tunnel_token, sandbox_token, hostname } = provisioned;
-  stdout("[4/7] Tunnel provisioned, initializing local runtime...");
-  const containerName = `clawlabor-labor-${laborId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
-  const runtimeEnv = {
-    ...deps.env,
-    CLAWLABOR_AGENT_RUNTIME: runtime,
-    CLAUDE_CODE_OAUTH_TOKEN: claudeOauth.token,
-  };
+  stdout("[3/7] Marking labor seat online...");
+  await requestJson(sellerDeps, "POST", `/labor/${laborId}/serve`, {});
+  let laborSeatOfflinePromise = null;
 
-  // If another container is already bound to this port, stop it first.
-  // docker run will fail with a bind-mount conflict otherwise.
-  try {
-    const { execSync } = require("child_process");
-    const occupied = execSync(
-      `docker ps --filter "publish=${port}" --format '{{.Names}}'`,
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).trim();
-    if (occupied) {
-      execSync(`docker rm -f ${occupied}`, { stdio: "ignore" });
-      stdout(`[4/7] Stopped existing container ${occupied} occupying port ${port}`);
+  async function markLaborSeatOffline() {
+    if (!laborSeatOfflinePromise) {
+      laborSeatOfflinePromise = (async () => {
+        stdout("Notifying platform of labor seat shutdown...");
+        try {
+          await withTimeout(
+            requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}),
+            3000,
+            "labor teardown",
+          );
+          stdout("Labor seat marked offline.");
+        } catch (_err) {
+          stdout("Labor seat shutdown notification timed out (best effort).");
+        }
+      })();
     }
-  } catch (_err) {
-    /* best effort — if the command fails, let docker run surface the real error */
+    await laborSeatOfflinePromise;
   }
-
-  // Sandbox runtime: bound to localhost (only cloudflared reaches it), --token enforced.
-  // Detached (-d): the container lifecycle is independent of this process's stdio;
-  // it is torn down explicitly via `docker rm -f <name>` on exit. (Foreground docker
-  // run coupled to a backgrounded parent is fragile — the container can die with the
-  // parent's stdio.)
-  stdout(`[5/7] Starting sandbox container (${image})...`);
-  const container = spawn(
-    "docker",
-    [
-      "run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
-      "-e", "CLAWLABOR_AGENT_RUNTIME",
-      "-e", "CLAUDE_CODE_OAUTH_TOKEN",
-      "--entrypoint", "sh",
-      image,
-      "-lc",
-      [
-        `sandbox-clawlabor install-agent ${shellQuote(runtime)}`,
-        `exec sandbox-clawlabor server --token ${shellQuote(sandbox_token)} --host 0.0.0.0 --port 2468`,
-      ].join(" && "),
-    ],
-    { stdio: "ignore", env: runtimeEnv },
-  );
-  // cloudflared connects the platform-managed tunnel to the local container.
-  // --grace-period=3s caps cloudflared's SIGTERM drain (default 30s) so Ctrl+C
-  // returns control to the user quickly when no requests are in flight.
-  stdout("[6/7] Starting Cloudflare tunnel...");
-  const tunnel = spawn(
-    "cloudflared",
-    ["tunnel", "--grace-period=3s", "run", "--token", tunnel_token],
-    { stdio: "inherit" },
-  );
-
-  stdout(`[7/7] Labor ${laborId} is now serving at https://${hostname}`);
-  stdout("Waiting for health check and accepting incoming hires...");
-
-  let running = true;
-  let cleanedUp = false;
 
   // Force kill a child process after a timeout if it doesn't exit gracefully
   function forceKill(process, name, timeoutMs = 5000) {
     if (!process || process.exitCode !== null) return Promise.resolve();
+    if (typeof process.once !== "function") return Promise.resolve();
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         try {
@@ -796,12 +757,25 @@ async function commandLaborServe(options, deps) {
     });
   }
 
-  async function cleanupRuntime() {
-    if (cleanedUp) return;
-    cleanedUp = true;
-    stdout("Shutting down labor service...");
+  function interruptibleSleep(ms) {
+    return Promise.race([sleep(ms), stop]);
+  }
 
-    // Graceful shutdown with timeout, then force kill
+  async function waitForActiveHire() {
+    while (!stopRequested) {
+      const hires = await requestJson(sellerDeps, "GET", `/labor/${laborId}/hires?status=active`, {});
+      const active = (hires.items || [])[0] || null;
+      if (active) return active;
+      await interruptibleSleep(5000);
+    }
+    return null;
+  }
+
+  async function cleanupRuntime({ hireId, containerName, container, tunnel, cleanedUpRef }) {
+    if (cleanedUpRef.value) return;
+    cleanedUpRef.value = true;
+    stdout(`Shutting down hire ${hireId} runtime...`);
+
     stdout("Stopping Cloudflare tunnel...");
     try { tunnel && tunnel.kill && tunnel.kill("SIGTERM"); } catch (_err) { /* noop */ }
     await forceKill(tunnel, "tunnel", 3000);
@@ -810,165 +784,212 @@ async function commandLaborServe(options, deps) {
     try { container && container.kill && container.kill(); } catch (_err) { /* noop */ }
     await forceKill(container, "container", 2000);
 
-    // Force remove docker container
     stdout("Removing docker container...");
     try {
       await new Promise((resolve) => {
         const dockerRm = spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" });
-        dockerRm.once("exit", () => resolve());
-        setTimeout(resolve, 1500);
+        if (dockerRm && typeof dockerRm.once === "function") {
+          dockerRm.once("exit", () => resolve());
+          setTimeout(resolve, 1500);
+        } else {
+          resolve();
+        }
       });
     } catch (_err) { /* noop */ }
-    stdout("Shutdown complete.");
+    stdout(`Hire ${hireId} runtime stopped.`);
   }
-  const stop = deps.waitForExit ? deps.waitForExit() : new Promise(() => {});
-  let stopResolve = null;
-  const stopCompleted = new Promise((resolve) => { stopResolve = resolve; });
 
-  // Tear the local runtime down the instant a stop signal arrives — don't wait
-  // for the heartbeat loop's sleep to wake up.
-  stop.then(async () => {
-    running = false;
-    stdout("\nReceived shutdown signal, stopping services...");
-    await cleanupRuntime();
-    stopResolve();
-  });
-
-  const publicHealthUrl = `https://${hostname}/v1/health`;
-  const localHealthUrl = `http://127.0.0.1:${port}/v1/health`;
-  let warnedTunnelDown = false;
-
-  // Probe a /v1/health endpoint; true only on a 2xx. Times out so a hung
-  // connection can't stall the heartbeat loop.
-  async function probeHealth(url) {
+  async function activeHireStillPresent(hireId) {
     try {
-      const resp = await withTimeout(
-        deps.fetch(url, { headers: { Authorization: `Bearer ${sandbox_token}` } }),
+      const result = await withTimeout(
+        requestJson(sellerDeps, "GET", `/labor/${laborId}/hires?status=active`, {}),
         LABOR_CONTROL_TIMEOUT_MS,
-        "health probe",
+        "labor active hire poll",
       );
-      return !!resp.ok;
+      return (result.items || []).some((hire) => String(hire.id) === String(hireId));
     } catch (_err) {
-      return false;
+      return true;
     }
   }
 
-  async function heartbeatOnce() {
-    // Health = reachable over the public tunnel — that is the path buyers use.
-    // A locally-healthy container behind a dead tunnel is offline as far as
-    // buyers are concerned, so report it as such.
-    const healthy = await probeHealth(publicHealthUrl);
+  async function runHireSandbox(active) {
+    const hireId = active.id;
+    stdout(`[5/7] Provisioning isolated sandbox for hire ${hireId}...`);
+    const provisioned = await requestJson(sellerDeps, "POST", `/labor/hires/${hireId}/serve`, {});
+    const { tunnel_token, sandbox_token, hostname } = provisioned;
+    stdout("[6/7] Tunnel provisioned, initializing local runtime...");
+    const containerName = `clawlabor-hire-${String(hireId).replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
+    const runtimeEnv = {
+      ...deps.env,
+      CLAWLABOR_AGENT_RUNTIME: runtime,
+      CLAUDE_CODE_OAUTH_TOKEN: claudeOauth.token,
+    };
 
-    if (!healthy) {
-      // Distinguish "tunnel down" from "container down" so the seller knows what
-      // to fix; surface recovery instructions once per outage.
-      const localOk = await probeHealth(localHealthUrl);
-      if (localOk) {
-        if (!warnedTunnelDown) {
-          warnedTunnelDown = true;
-          stdout(
-            `\n⚠️  Sandbox is healthy locally but unreachable over the public tunnel ` +
-              `(${publicHealthUrl}). Buyers can't reach it, so the platform will mark this ` +
-              `labor OFFLINE.\n   The Cloudflare tunnel likely dropped (free-plan tunnels often ` +
-              `exit with error 1033). To recover: stop this process (Ctrl+C) and re-run\n` +
-              `     clawlabor labor-serve --labor ${laborId}\n`,
-          );
+    try {
+      const { execSync } = require("child_process");
+      const occupied = execSync(
+        `docker ps --filter "publish=${port}" --format '{{.Names}}'`,
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      ).trim();
+      if (occupied) {
+        execSync(`docker rm -f ${occupied}`, { stdio: "ignore" });
+        stdout(`[4/7] Stopped existing container ${occupied} occupying port ${port}`);
+      }
+    } catch (_err) {
+      /* best effort — if the command fails, let docker run surface the real error */
+    }
+
+    stdout(`[5/7] Starting sandbox container (${image})...`);
+    const container = spawn(
+      "docker",
+      [
+        "run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
+        "-e", "CLAWLABOR_AGENT_RUNTIME",
+        "-e", "CLAUDE_CODE_OAUTH_TOKEN",
+        "--entrypoint", "sh",
+        image,
+        "-lc",
+        [
+          `sandbox-clawlabor install-agent ${shellQuote(runtime)}`,
+          `exec sandbox-clawlabor server --token ${shellQuote(sandbox_token)} --host 0.0.0.0 --port 2468`,
+        ].join(" && "),
+      ],
+      { stdio: "ignore", env: runtimeEnv },
+    );
+    stdout("[7/7] Starting Cloudflare tunnel...");
+    const tunnel = spawn(
+      "cloudflared",
+      ["tunnel", "--grace-period=3s", "run", "--token", tunnel_token],
+      { stdio: "inherit" },
+    );
+
+    stdout(`Hire ${hireId} is now serving at https://${hostname}`);
+    stdout("Waiting for health check...");
+
+    let hireRunning = true;
+    const cleanedUpRef = { value: false };
+
+    const publicHealthUrl = `https://${hostname}/v1/health`;
+    const localHealthUrl = `http://127.0.0.1:${port}/v1/health`;
+    let warnedTunnelDown = false;
+
+    async function cleanupCurrentHire() {
+      await cleanupRuntime({ hireId, containerName, container, tunnel, cleanedUpRef });
+    }
+
+    async function probeHealth(url) {
+      try {
+        const resp = await withTimeout(
+          deps.fetch(url, { headers: { Authorization: `Bearer ${sandbox_token}` } }),
+          LABOR_CONTROL_TIMEOUT_MS,
+          "health probe",
+        );
+        return !!resp.ok;
+      } catch (_err) {
+        return false;
+      }
+    }
+
+    async function heartbeatOnce() {
+      const healthy = await probeHealth(publicHealthUrl);
+
+      if (!healthy) {
+        const localOk = await probeHealth(localHealthUrl);
+        if (localOk) {
+          if (!warnedTunnelDown) {
+            warnedTunnelDown = true;
+            stdout(
+              `\n⚠️  Sandbox is healthy locally but unreachable over the public tunnel ` +
+                `(${publicHealthUrl}). Buyers can't reach it, so the platform will mark this ` +
+                `hire sandbox OFFLINE.\n   The Cloudflare tunnel likely dropped (free-plan tunnels often ` +
+                `exit with error 1033). To recover: stop this process (Ctrl+C) and re-run\n` +
+                `     clawlabor labor-serve --labor ${laborId}\n`,
+            );
+          }
+        } else {
+          warnedTunnelDown = false;
+          stdout(`\n⚠️  Sandbox container is not responding; reporting OFFLINE to the platform.\n`);
         }
       } else {
         warnedTunnelDown = false;
-        stdout(`\n⚠️  Sandbox container is not responding; reporting OFFLINE to the platform.\n`);
       }
-    } else {
-      warnedTunnelDown = false;
+
+      try {
+        await withTimeout(
+          requestJson(sellerDeps, "POST", `/labor/hires/${hireId}/heartbeat`, { body: { healthy } }),
+          LABOR_CONTROL_TIMEOUT_MS,
+          "hire heartbeat",
+        );
+      } catch (_err) {
+        /* best effort */
+      }
     }
 
+    async function tick() {
+      await heartbeatOnce();
+      if (!(await activeHireStillPresent(hireId))) {
+        hireRunning = false;
+      }
+    }
+
+    stdout("Waiting for sandbox to be reachable over the tunnel...");
+    for (let i = 0; i < 30 && hireRunning; i += 1) {
+      if (await probeHealth(publicHealthUrl)) {
+        stdout("Sandbox is healthy and reachable; ready for work.");
+        break;
+      }
+      await (stopRequested ? sleep(1000) : interruptibleSleep(1000));
+    }
+
+    await tick();
+    while (hireRunning) {
+      await (stopRequested ? sleep(60000) : interruptibleSleep(60000));
+      if (!hireRunning) break;
+      await tick();
+    }
+
+    if (stopRequested) {
+      stdout("Current hire ended after shutdown request; cleaning up isolated runtime.");
+    }
+    if (!cleanedUpRef.value) {
+      stdout("Cleaning up completed hire runtime...");
+      await cleanupCurrentHire();
+    }
+    stdout(`Notifying platform of hire ${hireId} shutdown...`);
     try {
       await withTimeout(
-        requestJson(sellerDeps, "POST", `/labor/${laborId}/heartbeat`, { body: { healthy } }),
-        LABOR_CONTROL_TIMEOUT_MS,
-        "labor heartbeat",
+        requestJson(sellerDeps, "DELETE", `/labor/hires/${hireId}/serve`, {}),
+        3000,
+        "hire teardown",
       );
+      stdout("Hire platform teardown notified.");
     } catch (_err) {
-      /* best effort */
+      stdout("Hire platform notification timed out (best effort).");
+    }
+    return { hireId, hostname };
+  }
+
+  stop.then(() => {
+    stopRequested = true;
+    stdout("\nReceived shutdown signal; stopping new hires after the current hire drains...");
+    markLaborSeatOffline();
+  });
+
+  let lastRun = null;
+  while (!stopRequested) {
+    stdout("[4/7] Waiting for active hire...");
+    const active = await waitForActiveHire();
+    if (!active) break;
+    lastRun = await runHireSandbox(active);
+    if (!stopRequested) {
+      stdout(`Hire ${lastRun.hireId} ended; labor seat remains online for the next hire.`);
     }
   }
 
-  // While serving, auto-accept incoming hires for this resource (the worker is on
-  // the job, so it takes the work). A pending hire otherwise auto-rejects at 24h.
-  async function acceptPendingHires() {
-    try {
-      const result = await withTimeout(
-        requestJson(sellerDeps, "GET", `/labor/${laborId}/hires?status=pending_accept`, {}),
-        LABOR_CONTROL_TIMEOUT_MS,
-        "labor pending hire poll",
-      );
-      for (const hire of result.items || []) {
-        try {
-          await withTimeout(
-            requestJson(sellerDeps, "POST", `/labor/${hire.id}/accept`, {}),
-            LABOR_CONTROL_TIMEOUT_MS,
-            "labor hire accept",
-          );
-          stdout(`accepted hire ${hire.id}\n`);
-        } catch (_err) {
-          /* skip this hire; try again next tick */
-        }
-      }
-    } catch (_err) {
-      /* best effort */
-    }
-  }
-
-  async function tick() {
-    await heartbeatOnce();
-    await acceptPendingHires();
-  }
-
-  // Sleep that wakes up immediately when a stop signal arrives.
-  function interruptibleSleep(ms) {
-    return Promise.race([sleep(ms), stop]);
-  }
-
-  // Wait until publicly reachable (container booted AND tunnel connected) before
-  // the first heartbeat, so the resource isn't briefly flagged offline during the
-  // ~10s container/tunnel startup.
-  stdout("Waiting for sandbox to be reachable over the tunnel...");
-  for (let i = 0; i < 30 && running; i += 1) {
-    if (await probeHealth(publicHealthUrl)) {
-      stdout("Sandbox is healthy and reachable; ready for work.");
-      break;
-    }
-    await interruptibleSleep(1000);
-  }
-
-  await tick();
-  while (running) {
-    await interruptibleSleep(60000);
-    if (!running) break;
-    await tick();
-  }
-
-  // Wait for signal-triggered cleanup to complete (if cleanup was triggered by signal)
-  await stopCompleted;
-
-  if (!cleanedUp) {
-    stdout("Cleaning up remaining resources...");
-    await cleanupRuntime();
-  }
-  stdout("Notifying platform of shutdown...");
-  try {
-    await withTimeout(
-      requestJson(sellerDeps, "DELETE", `/labor/${laborId}/serve`, {}),
-      3000,
-      "labor teardown",
-    );
-    stdout("Platform notified.");
-  } catch (_err) {
-    stdout("Platform notification timed out (best effort).");
-  }
+  await markLaborSeatOffline();
 
   return JSON.stringify(
-    { action: "labor-serve", labor_id: laborId, hostname, status: "stopped" },
+    { action: "labor-serve", labor_id: laborId, hostname: lastRun && lastRun.hostname, status: "stopped" },
     null,
     2,
   );
