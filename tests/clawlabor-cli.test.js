@@ -4062,8 +4062,8 @@ function laborAgentsFetch() {
         agent_id: "agent_seller",
         name: "Seller",
         owner_email: "seller@example.com",
-        balance: 500,
-        frozen: 10,
+        balance: "500.00",
+        frozen: "10.00",
         is_online: true,
       }),
     }),
@@ -4124,8 +4124,8 @@ test("labor-agents reports concise local runtime inventory by default", async ()
   assert.deepEqual(parsed.account, {
     status: "authenticated",
     name: "Seller",
-    balance: 500,
-    frozen: 10,
+    balance: "500.00",
+    frozen: "10.00",
     online: true,
   });
   assert.deepEqual(parsed.host.claude, {
@@ -4142,8 +4142,9 @@ test("labor-agents reports concise local runtime inventory by default", async ()
   assert.equal(claude.publish_command.includes("<"), false);
   assert.equal(claude.publish_command.includes("--gatekeeper"), false);
   assert.equal(claude.labor_id, "labor-claude");
-  assert.equal(claude.serve_command, "clawlabor labor-serve --labor labor-claude");
-  assert.equal(claude.start_command, "clawlabor labor-serve --labor labor-claude");
+  // start_command converges publish+serve into one command (serve_command removed).
+  assert.equal(claude.serve_command, undefined);
+  assert.equal(claude.start_command, "clawlabor labor-start --runtime claude");
   assert.equal(claude.path, undefined);
   assert.equal(claude.requirements, undefined);
   const codex = parsed.agents[1];
@@ -4239,8 +4240,8 @@ test("labor-agents --verbose keeps diagnostic detail", async () => {
         agent_id: "agent_seller",
         name: "Seller",
         owner_email: "seller@example.com",
-        balance: 500,
-        frozen: 10,
+        balance: "500.00",
+        frozen: "10.00",
         is_online: true,
       }),
     }),
@@ -4263,9 +4264,9 @@ test("labor-agents --verbose keeps diagnostic detail", async () => {
   assert.equal(claude.host_account.id, "org:org-123");
   assert.equal(claude.host_account.plan, "team");
   assert.match(claude.publish_command_template, /labor-publish/);
-  assert.match(claude.serve_command_template, /labor-serve/);
   assert.equal(parsed.marketplace_agent.agent_id, "agent_seller");
-  assert.equal(parsed.marketplace_agent.balance, 500);
+  // marketplace_agent is the raw /agents/me payload (balance is a UAT string).
+  assert.equal(parsed.marketplace_agent.balance, "500.00");
   const codex = parsed.agents[1];
   assert.equal(codex.present_on_path, true);
   assert.equal(codex.ready_to_publish, true);
@@ -4482,7 +4483,7 @@ test("labor-start publishes missing Claude labor then serves it", async () => {
   assert.equal(calls.some((call) => call.url.endsWith("/labor") && call.options.method === "POST"), true);
   assert.equal(calls.some((call) => call.url.endsWith("/labor/labor-new/serve")), true);
   assert.equal(spawned.some((item) => item.cmd === "docker"), true);
-  assert.match(out.join(""), /labor labor-new serving at https:\/\/labor-new\.clawlabor\.com/);
+  assert.match(out.join(""), /Labor labor-new is now serving at https:\/\/labor-new\.clawlabor\.com/);
 });
 
 test("labor-publish creates and publishes a labor resource", async () => {

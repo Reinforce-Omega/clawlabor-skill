@@ -212,11 +212,13 @@ function compactMarketplaceAgent(agent) {
   const compact = {
     status: "authenticated",
     name: agent.name,
-    balance: nanoToUatDisplay(agent.balance),
+    // /agents/me already returns balance/frozen as UAT 2-decimal strings
+    // (server-side nano_to_uat_display). Pass through; do NOT convert again.
+    balance: agent.balance,
     online: agent.is_online,
   };
   if (agent.frozen !== null && agent.frozen !== undefined) {
-    compact.frozen = nanoToUatDisplay(agent.frozen);
+    compact.frozen = agent.frozen;
   }
   return compact;
 }
@@ -550,7 +552,7 @@ async function commandLaborPublish(options, deps) {
   const body = {
     name,
     description,
-    daily_rate_nano: BigInt(dailyRate) * BigInt(NANO_FACTOR),
+    daily_rate_uat: dailyRate,
     min_duration_days: 1,
     max_duration_days: 1,
     tier: options.tier || "tier_1",
@@ -837,16 +839,54 @@ async function commandLaborServe(options, deps) {
     stopResolve();
   });
 
-  async function heartbeatOnce() {
-    let healthy = false;
+  const publicHealthUrl = `https://${hostname}/v1/health`;
+  const localHealthUrl = `http://127.0.0.1:${port}/v1/health`;
+  let warnedTunnelDown = false;
+
+  // Probe a /v1/health endpoint; true only on a 2xx. Times out so a hung
+  // connection can't stall the heartbeat loop.
+  async function probeHealth(url) {
     try {
-      const resp = await deps.fetch(`http://127.0.0.1:${port}/v1/health`, {
-        headers: { Authorization: `Bearer ${sandbox_token}` },
-      });
-      healthy = !!resp.ok;
+      const resp = await withTimeout(
+        deps.fetch(url, { headers: { Authorization: `Bearer ${sandbox_token}` } }),
+        LABOR_CONTROL_TIMEOUT_MS,
+        "health probe",
+      );
+      return !!resp.ok;
     } catch (_err) {
-      healthy = false;
+      return false;
     }
+  }
+
+  async function heartbeatOnce() {
+    // Health = reachable over the public tunnel — that is the path buyers use.
+    // A locally-healthy container behind a dead tunnel is offline as far as
+    // buyers are concerned, so report it as such.
+    const healthy = await probeHealth(publicHealthUrl);
+
+    if (!healthy) {
+      // Distinguish "tunnel down" from "container down" so the seller knows what
+      // to fix; surface recovery instructions once per outage.
+      const localOk = await probeHealth(localHealthUrl);
+      if (localOk) {
+        if (!warnedTunnelDown) {
+          warnedTunnelDown = true;
+          stdout(
+            `\n⚠️  Sandbox is healthy locally but unreachable over the public tunnel ` +
+              `(${publicHealthUrl}). Buyers can't reach it, so the platform will mark this ` +
+              `labor OFFLINE.\n   The Cloudflare tunnel likely dropped (free-plan tunnels often ` +
+              `exit with error 1033). To recover: stop this process (Ctrl+C) and re-run\n` +
+              `     clawlabor labor-serve --labor ${laborId}\n`,
+          );
+        }
+      } else {
+        warnedTunnelDown = false;
+        stdout(`\n⚠️  Sandbox container is not responding; reporting OFFLINE to the platform.\n`);
+      }
+    } else {
+      warnedTunnelDown = false;
+    }
+
     try {
       await withTimeout(
         requestJson(sellerDeps, "POST", `/labor/${laborId}/heartbeat`, { body: { healthy } }),
@@ -894,20 +934,14 @@ async function commandLaborServe(options, deps) {
     return Promise.race([sleep(ms), stop]);
   }
 
-  // Wait for the container to accept requests before the first heartbeat, so the
-  // resource isn't briefly flagged as offline during the ~10s container startup.
-  stdout("Waiting for sandbox to be ready...");
+  // Wait until publicly reachable (container booted AND tunnel connected) before
+  // the first heartbeat, so the resource isn't briefly flagged offline during the
+  // ~10s container/tunnel startup.
+  stdout("Waiting for sandbox to be reachable over the tunnel...");
   for (let i = 0; i < 30 && running; i += 1) {
-    try {
-      const r = await deps.fetch(`http://127.0.0.1:${port}/v1/health`, {
-        headers: { Authorization: `Bearer ${sandbox_token}` },
-      });
-      if (r.ok) {
-        stdout("Sandbox is healthy and ready for work.");
-        break;
-      }
-    } catch (_err) {
-      /* not up yet */
+    if (await probeHealth(publicHealthUrl)) {
+      stdout("Sandbox is healthy and reachable; ready for work.");
+      break;
     }
     await interruptibleSleep(1000);
   }
