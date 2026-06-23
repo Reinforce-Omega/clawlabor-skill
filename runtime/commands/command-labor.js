@@ -28,6 +28,10 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
+function dockerName(value) {
+  return String(value).replace(/[^a-zA-Z0-9_.-]/g, "-");
+}
+
 async function withTimeout(promise, ms, label) {
   let timer;
   try {
@@ -47,6 +51,25 @@ function opencodeAuthPath(env) {
   const os = require("os");
   const base = (env && env.XDG_DATA_HOME) || path.join((env && env.HOME) || os.homedir(), ".local", "share");
   return path.join(base, "opencode", "auth.json");
+}
+
+function runtimeStateMounts(runtime, hireId) {
+  const source = `clawlabor-hire-${dockerName(hireId)}-state`;
+  const targets = {
+    claude: ["/home/sandbox/.claude"],
+    codex: ["/home/sandbox/.codex"],
+    opencode: ["/home/sandbox/.local/share/opencode"],
+  }[runtime] || [];
+  return targets.map((target) => ({ source, target, type: "volume" }));
+}
+
+function dockerContainerRunning(name, deps = {}) {
+  const run = deps.spawnSync || spawnSync;
+  const result = run("docker", ["inspect", "-f", "{{.State.Running}}", name], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 && String(result.stdout || "").trim() === "true";
 }
 
 // What to inject into the per-hire `docker run` so the runtime can authenticate.
@@ -894,7 +917,7 @@ async function commandLaborServe(options, deps) {
     return null;
   }
 
-  async function cleanupRuntime({ hireId, containerName, container, tunnel, cleanedUpRef }) {
+  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, cleanedUpRef }) {
     if (cleanedUpRef.value) return;
     cleanedUpRef.value = true;
     stdout(`Shutting down hire ${hireId} runtime...`);
@@ -903,22 +926,26 @@ async function commandLaborServe(options, deps) {
     terminateProcessGroup(tunnel, "SIGTERM");
     await forceKill(tunnel, "tunnel", 3000);
 
-    stdout("Stopping sandbox container...");
-    terminateChild(container);
-    await forceKill(container, "container", 2000);
+    if (ownsContainer) {
+      stdout("Stopping sandbox container...");
+      terminateChild(container);
+      await forceKill(container, "container", 2000);
 
-    stdout("Removing docker container...");
-    try {
-      await new Promise((resolve) => {
-        const dockerRm = spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" });
-        if (dockerRm && typeof dockerRm.once === "function") {
-          dockerRm.once("exit", () => resolve());
-          setTimeout(resolve, 1500);
-        } else {
-          resolve();
-        }
-      });
-    } catch (_err) { /* noop */ }
+      stdout("Removing docker container...");
+      try {
+        await new Promise((resolve) => {
+          const dockerRm = spawn("docker", ["rm", "-f", containerName], { stdio: "ignore" });
+          if (dockerRm && typeof dockerRm.once === "function") {
+            dockerRm.once("exit", () => resolve());
+            setTimeout(resolve, 1500);
+          } else {
+            resolve();
+          }
+        });
+      } catch (_err) { /* noop */ }
+    } else {
+      stdout("Leaving existing sandbox container running for the active hire.");
+    }
     stdout(`Hire ${hireId} runtime stopped.`);
   }
 
@@ -941,67 +968,14 @@ async function commandLaborServe(options, deps) {
     const provisioned = await requestJson(sellerDeps, "POST", `/labor/hires/${hireId}/serve`, {});
     const { tunnel_token, sandbox_token, hostname } = provisioned;
     stdout("[6/7] Tunnel provisioned, initializing local runtime...");
-    const containerName = `clawlabor-hire-${String(hireId).replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
+    const containerName = `clawlabor-hire-${dockerName(hireId)}`;
+    const publicHealthUrl = `https://${hostname}/v1/health`;
+    const localHealthUrl = `http://127.0.0.1:${port}/v1/health`;
     const runtimeEnv = {
       ...deps.env,
       CLAWLABOR_AGENT_RUNTIME: runtime,
       ...sandboxCreds.env,
     };
-
-    try {
-      const { execSync } = require("child_process");
-      const occupied = execSync(
-        `docker ps --filter "publish=${port}" --format '{{.Names}}'`,
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-      ).trim();
-      if (occupied) {
-        execSync(`docker rm -f ${occupied}`, { stdio: "ignore" });
-        stdout(`[4/7] Stopped existing container ${occupied} occupying port ${port}`);
-      }
-    } catch (_err) {
-      /* best effort — if the command fails, let docker run surface the real error */
-    }
-
-    stdout(`[5/7] Starting sandbox container (${image})...`);
-    const credEnvFlags = Object.keys(sandboxCreds.env).flatMap((envName) => ["-e", envName]);
-    const credMountFlags = sandboxCreds.mounts.flatMap((m) => ["-v", `${m.host}:${m.container}${m.ro ? ":ro" : ""}`]);
-    const container = spawn(
-      "docker",
-      [
-        "run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
-        "-e", "CLAWLABOR_AGENT_RUNTIME",
-        ...credEnvFlags,
-        ...credMountFlags,
-        "--entrypoint", "sh",
-        image,
-        "-lc",
-        [
-          `sandbox-clawlabor install-agent ${shellQuote(runtime)}`,
-          `exec sandbox-clawlabor server --token ${shellQuote(sandbox_token)} --host 0.0.0.0 --port 2468`,
-        ].join(" && "),
-      ],
-      { stdio: "ignore", env: runtimeEnv },
-    );
-    stdout("[7/7] Starting Cloudflare tunnel...");
-    const tunnel = spawn(
-      "cloudflared",
-      ["tunnel", "--grace-period=3s", "run", "--token", tunnel_token],
-      { stdio: "inherit", detached: true },
-    );
-
-    stdout(`Hire ${hireId} is now serving at https://${hostname}`);
-    stdout("Waiting for health check...");
-
-    let hireRunning = true;
-    const cleanedUpRef = { value: false };
-
-    const publicHealthUrl = `https://${hostname}/v1/health`;
-    const localHealthUrl = `http://127.0.0.1:${port}/v1/health`;
-    let warnedTunnelDown = false;
-
-    async function cleanupCurrentHire() {
-      await cleanupRuntime({ hireId, containerName, container, tunnel, cleanedUpRef });
-    }
 
     async function probeHealth(url, { publicTunnel = false } = {}) {
       try {
@@ -1018,8 +992,131 @@ async function commandLaborServe(options, deps) {
       }
     }
 
+    function stopContainerByName(name) {
+      const run = deps.spawnSync || spawnSync;
+      run("docker", ["rm", "-f", name], { stdio: "ignore" });
+    }
+
+    function restartContainerByName(name) {
+      const run = deps.spawnSync || spawnSync;
+      return run("docker", ["restart", name], { stdio: "ignore" }).status === 0;
+    }
+
+    function clearPortOccupant() {
+      try {
+        const { execSync } = require("child_process");
+        const occupied = execSync(
+          `docker ps --filter "publish=${port}" --format '{{.Names}}'`,
+          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        ).trim();
+        if (occupied && occupied !== containerName) {
+          execSync(`docker rm -f ${occupied}`, { stdio: "ignore" });
+          stdout(`[4/7] Stopped existing container ${occupied} occupying port ${port}`);
+        }
+      } catch (_err) {
+        /* best effort — if the command fails, let docker run surface the real error */
+      }
+    }
+
+    function startSandboxContainer() {
+      clearPortOccupant();
+      stdout(`[5/7] Starting sandbox container (${image})...`);
+      const credEnvFlags = Object.keys(sandboxCreds.env).flatMap((envName) => ["-e", envName]);
+      const stateMountFlags = runtimeStateMounts(runtime, hireId).flatMap((m) => [
+        "--mount", `type=${m.type},source=${m.source},target=${m.target}`,
+      ]);
+      const credMountFlags = sandboxCreds.mounts.flatMap((m) => ["-v", `${m.host}:${m.container}${m.ro ? ":ro" : ""}`]);
+      container = spawn(
+        "docker",
+        [
+          "run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
+          "-e", "CLAWLABOR_AGENT_RUNTIME",
+          ...credEnvFlags,
+          ...stateMountFlags,
+          ...credMountFlags,
+          "--entrypoint", "sh",
+          image,
+          "-lc",
+          [
+            `sandbox-clawlabor install-agent ${shellQuote(runtime)}`,
+            `exec sandbox-clawlabor server --token=${shellQuote(sandbox_token)} --host 0.0.0.0 --port 2468`,
+          ].join(" && "),
+        ],
+        { stdio: "ignore", env: runtimeEnv },
+      );
+      return container;
+    }
+
+    let container = null;
+    let ownsContainer = false;
+    if (dockerContainerRunning(containerName, deps) && await probeHealth(localHealthUrl)) {
+      stdout(`[5/7] Reusing existing sandbox container ${containerName}.`);
+    } else {
+      container = startSandboxContainer();
+      ownsContainer = true;
+    }
+    stdout("[7/7] Starting Cloudflare tunnel...");
+    const tunnel = spawn(
+      "cloudflared",
+      ["tunnel", "--grace-period=3s", "run", "--token", tunnel_token],
+      { stdio: "inherit", detached: true },
+    );
+
+    stdout(`Hire ${hireId} is now serving at https://${hostname}`);
+    stdout("Waiting for health check...");
+
+    let hireRunning = true;
+    const cleanedUpRef = { value: false };
+    let warnedTunnelDown = false;
+    let healingSandbox = false;
+
+    async function cleanupCurrentHire() {
+      await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, cleanedUpRef });
+    }
+
+    async function selfHealSandbox() {
+      if (healingSandbox) return false;
+      healingSandbox = true;
+      try {
+        if (!(await activeHireStillPresent(hireId))) {
+          hireRunning = false;
+          return false;
+        }
+
+        const running = dockerContainerRunning(containerName, deps);
+        if (running) {
+          stdout(`\n⚠️  Sandbox container is unhealthy; restarting ${containerName}.\n`);
+          if (restartContainerByName(containerName)) {
+            await interruptibleSleep(2000);
+            if (await probeHealth(localHealthUrl)) {
+              stdout("Sandbox container recovered after restart.");
+              return true;
+            }
+          }
+          stdout(`Sandbox container restart did not recover; rebuilding ${containerName}.`);
+          stopContainerByName(containerName);
+        } else {
+          stdout(`\n⚠️  Sandbox container ${containerName} is not running; rebuilding it for the active hire.\n`);
+        }
+
+        container = startSandboxContainer();
+        ownsContainer = true;
+        for (let i = 0; i < 15; i += 1) {
+          await interruptibleSleep(1000);
+          if (await probeHealth(localHealthUrl)) {
+            stdout("Sandbox container rebuilt and healthy.");
+            return true;
+          }
+        }
+        stdout("Sandbox container rebuild did not become healthy before the next heartbeat.");
+        return false;
+      } finally {
+        healingSandbox = false;
+      }
+    }
+
     async function heartbeatOnce() {
-      const healthy = await probeHealth(publicHealthUrl, { publicTunnel: true });
+      let healthy = await probeHealth(publicHealthUrl, { publicTunnel: true });
 
       if (!healthy) {
         const localOk = await probeHealth(localHealthUrl);
@@ -1040,7 +1137,18 @@ async function commandLaborServe(options, deps) {
           }
         } else {
           warnedTunnelDown = false;
-          stdout(`\n⚠️  Sandbox container is not responding; reporting OFFLINE to the platform.\n`);
+          const recovered = await selfHealSandbox();
+          if (recovered) {
+            healthy = await probeHealth(publicHealthUrl, { publicTunnel: true });
+            if (!healthy) {
+              stdout(
+                `\n⚠️  Sandbox recovered locally but is still unreachable over the public tunnel ` +
+                  `(${publicHealthUrl}); reporting current public health to the platform.\n`,
+              );
+            }
+          } else if (hireRunning) {
+            stdout(`\n⚠️  Sandbox container is not responding; reporting OFFLINE to the platform.\n`);
+          }
         }
       } else {
         warnedTunnelDown = false;
@@ -1139,5 +1247,6 @@ module.exports = {
   commandLaborServe,
   parseSseChunks,
   opencodeAuthPath,
+  runtimeStateMounts,
   resolveRuntimeSandboxCredentials,
 };

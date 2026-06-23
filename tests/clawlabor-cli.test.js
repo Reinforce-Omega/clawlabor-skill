@@ -4344,7 +4344,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   // provisioned, started docker + cloudflared, heartbeat at least once, torn down
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "POST"));
   assert.equal(spawned[0].cmd, "docker");
-  assert.match(spawned[0].args.join(" "), /--token 'SBX'/); // sandbox_token passed to server
+  assert.match(spawned[0].args.join(" "), /--token='SBX'/); // sandbox_token passed to server
   assert.ok(spawned[0].args.includes("--name"));
   assert.ok(spawned[0].args.includes("clawlabor-hire-hire-1"));
   assert.ok(spawned[0].args.includes("CLAWLABOR_AGENT_RUNTIME"));
@@ -4353,7 +4353,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(spawned[0].args.includes("--entrypoint"));
   assert.ok(spawned[0].args.includes("sh"));
   assert.match(spawned[0].args.join(" "), /sandbox-clawlabor install-agent 'claude'/);
-  assert.match(spawned[0].args.join(" "), /sandbox-clawlabor server --token 'SBX'/);
+  assert.match(spawned[0].args.join(" "), /sandbox-clawlabor server --token='SBX'/);
   assert.ok(!spawned[0].args.includes("oauth-token-123"));
   assert.equal(spawned[1].cmd, "cloudflared");
   assert.ok(spawned[1].args.includes("TT")); // tunnel_token
@@ -4514,6 +4514,149 @@ test("labor-serve uses Cloudflare DNS fallback before marking a public tunnel of
   );
   assert.deepEqual(JSON.parse(heartbeat.options.body), { healthy: true });
   assert.doesNotMatch(out.join("\n"), /OFFLINE/);
+});
+
+test("labor-serve reuses a running hire container instead of starting a replacement", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const spawned = [];
+  const out = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args.includes("inspect")) {
+          return { status: 0, stdout: "true\n" };
+        }
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = { cmd, args, opts, kills: [], kill(signal) { this.kills.push(signal || "SIGTERM"); } };
+        spawned.push(child);
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.ok(out.some((line) => line.includes("Reusing existing sandbox container clawlabor-hire-hire-1")));
+  assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.includes("run")), false);
+  assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"), false);
+  assert.ok(spawned.some((child) => child.cmd === "cloudflared"));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
+});
+
+test("labor-serve self-heals a missing active-hire sandbox container with the same state volume", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  let publicHealthCalls = 0;
+  let localHealthCalls = 0;
+  const spawned = [];
+  const out = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls <= 3) {
+          return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        }
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && String(url).endsWith("/v1/health"),
+      respond: ({ url }) => {
+        if (String(url).startsWith("https://")) {
+          publicHealthCalls += 1;
+          return publicHealthCalls === 3
+            ? { status: 503, body: "down" }
+            : { status: 200, body: '{"status":"ok"}' };
+        }
+        localHealthCalls += 1;
+        return localHealthCalls === 1
+          ? { status: 503, body: "down" }
+          : { status: 200, body: '{"status":"ok"}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args.includes("inspect")) {
+          return { status: 1, stdout: "" };
+        }
+        if (cmd === "docker" && args.includes("restart")) {
+          return { status: 1, stdout: "" };
+        }
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = { cmd, args, opts, kills: [], kill(signal) { this.kills.push(signal || "SIGTERM"); } };
+        spawned.push(child);
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  const dockerRuns = spawned.filter((child) => child.cmd === "docker" && child.args.includes("run"));
+  assert.equal(dockerRuns.length, 2);
+  for (const run of dockerRuns) {
+    assert.ok(run.args.includes("clawlabor-hire-hire-1"));
+    assert.ok(run.args.includes("--mount"));
+    assert.ok(run.args.includes("type=volume,source=clawlabor-hire-hire-1-state,target=/home/sandbox/.claude"));
+  }
+  assert.ok(out.some((line) => line.includes("is not running; rebuilding it for the active hire")));
+  assert.ok(out.some((line) => line.includes("Sandbox container rebuilt and healthy.")));
+  const heartbeatBodies = calls
+    .filter((call) => call.options.method === "POST" && call.url.endsWith("/labor/hires/hire-1/heartbeat"))
+    .map((call) => JSON.parse(call.options.body));
+  assert.deepEqual(heartbeatBodies, [{ healthy: true }, { healthy: true }]);
 });
 
 test("labor-serve drains current hire instead of killing it when seller goes offline", async () => {
@@ -5104,11 +5247,28 @@ test("labor-unpublish delists a resource (sets it inactive)", async () => {
 });
 
 // --- opencode runtime: per-runtime sandbox credential seam (Task 1) ---
-const { opencodeAuthPath, resolveRuntimeSandboxCredentials } = require("../runtime/commands/command-labor");
+const {
+  opencodeAuthPath,
+  resolveRuntimeSandboxCredentials,
+  runtimeStateMounts,
+} = require("../runtime/commands/command-labor");
 
 test("opencodeAuthPath honors XDG_DATA_HOME then HOME", () => {
   assert.equal(opencodeAuthPath({ XDG_DATA_HOME: "/x" }), "/x/opencode/auth.json");
   assert.equal(opencodeAuthPath({ HOME: "/home/u" }), "/home/u/.local/share/opencode/auth.json");
+});
+
+test("runtimeStateMounts uses one hire-scoped volume source for every runtime", () => {
+  const claude = runtimeStateMounts("claude", "hire-123")[0];
+  const codex = runtimeStateMounts("codex", "hire-123")[0];
+  const opencode = runtimeStateMounts("opencode", "hire-123")[0];
+
+  assert.equal(claude.source, "clawlabor-hire-hire-123-state");
+  assert.equal(codex.source, claude.source);
+  assert.equal(opencode.source, claude.source);
+  assert.equal(claude.target, "/home/sandbox/.claude");
+  assert.equal(codex.target, "/home/sandbox/.codex");
+  assert.equal(opencode.target, "/home/sandbox/.local/share/opencode");
 });
 
 test("resolveRuntimeSandboxCredentials: claude returns oauth env, no mounts", async () => {
@@ -5155,7 +5315,7 @@ test("labor-serve --runtime opencode mounts auth.json ro and installs opencode",
           : JSON.stringify({ items: [] }) };
       } },
     matchRoute("POST", "/labor/hires/hire-oc/serve", { status: 200,
-      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-hire-oc.clawlabor.com" }) }),
+      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "-SBX", hostname: "labor-hire-oc.clawlabor.com" }) }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
     matchRoute("POST", "/labor/hires/hire-oc/heartbeat", { status: 204, body: "" }),
     matchRoute("DELETE", "/labor/hires/hire-oc/serve", { status: 204, body: "" }),
@@ -5173,8 +5333,10 @@ test("labor-serve --runtime opencode mounts auth.json ro and installs opencode",
   const dockerRun = spawned.find((s) => s.cmd === "docker" && s.args.includes("run"));
   assert.ok(dockerRun, "docker run was spawned");
   const joined = dockerRun.args.join(" ");
+  assert.match(joined, /--mount type=volume,source=clawlabor-hire-hire-oc-state,target=\/home\/sandbox\/\.local\/share\/opencode/);
   assert.match(joined, /-v \/home\/seller\/\.local\/share\/opencode\/auth\.json:\/home\/sandbox\/\.local\/share\/opencode\/auth\.json:ro/);
   assert.match(joined, /install-agent 'opencode'/);
+  assert.match(joined, /sandbox-clawlabor server --token='-SBX'/);
   assert.equal(dockerRun.args.includes("CLAUDE_CODE_OAUTH_TOKEN"), false);
 });
 
