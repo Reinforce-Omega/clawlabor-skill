@@ -690,19 +690,18 @@ async function commandLaborPublish(options, deps) {
 // ---------------------------------------------------------------------------
 async function commandLaborStart(options, deps) {
   const runtime = options.runtime || "claude";
-  if (runtime !== "claude") {
-    throw new Error("labor-start currently supports --runtime claude");
-  }
 
   const marketplaceAgent = await currentMarketplaceAgent(deps);
   if (marketplaceAgent.status !== "authenticated") {
     throw new Error("Authenticate before starting labor. Run `clawlabor auth status`.");
   }
 
-  const agent = await claudeRuntimeAgent(deps);
-  if (!agent.ready_to_serve) {
-    const missing = missingRequirementNames(agent).join(", ") || "unknown requirements";
-    throw new Error(`Cannot start ${runtime} labor yet; missing: ${missing}. Run \`clawlabor labor-agents --verbose\` for diagnostics.`);
+  // Readiness: reuse the labor-agents inventory for the chosen runtime.
+  const inventory = JSON.parse(await commandLaborAgents({}, deps));
+  const agent = (inventory.agents || []).find((a) => a.runtime === runtime);
+  if (!agent || !agent.can_serve) {
+    const needs = (agent && agent.needs) ? agent.needs.join(", ") : "runtime not serveable";
+    throw new Error(`Cannot start ${runtime} labor yet; ${needs}. Run \`clawlabor labor-agents --verbose\` for diagnostics.`);
   }
 
   const existing = existingLaborByRuntime(
@@ -710,10 +709,15 @@ async function commandLaborStart(options, deps) {
   )[runtime];
   let laborId = existing && existing.id;
   if (!laborId) {
+    const defaults = {
+      claude: { name: "Claude Code Labor", description: "Claude Code Labor backed by the local Claude Code Sandbox runtime." },
+      opencode: { name: "OpenCode Labor", description: "OpenCode Labor backed by the local OpenCode Sandbox runtime." },
+    }[runtime] || { name: `${runtime} Labor`, description: `${runtime} Labor backed by the local sandbox runtime.` };
     const publishOut = await commandLaborPublish(
       {
-        name: options.name || "Claude Code Labor",
-        description: options.description || "Claude Code Labor backed by the local Claude Code Sandbox runtime.",
+        runtime,
+        name: options.name || defaults.name,
+        description: options.description || defaults.description,
         "daily-rate": options["daily-rate"] || String(DEFAULT_DAILY_RATE_UAT),
         tier: options.tier,
       },

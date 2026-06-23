@@ -5207,3 +5207,34 @@ test("labor-agents marks opencode serveable when CLI + auth present", async () =
   const oc = JSON.parse(out.join("")).agents.find((a) => a.runtime === "opencode");
   assert.equal(oc.can_serve, true);
 });
+
+test("labor-start --runtime opencode publishes missing opencode labor then serves", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-oc", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-oc", { status: 200, body: JSON.stringify({ id: "labor-oc", name: "OpenCode Labor", status: "available" }) }),
+    matchRoute("POST", "/labor/labor-oc/serve", { status: 204, body: "" }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc/hires"),
+      respond: { status: 200, body: JSON.stringify({ items: [] }) } },
+    matchRoute("DELETE", "/labor/labor-oc/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(["labor-start", "--runtime", "opencode"], {
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fetch,
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+    spawnSync: (cmd, args) => {
+      const tool = cmd === "sh" ? args[3] : cmd;
+      const status = ["claude", "codex", "opencode", "docker", "cloudflared"].includes(tool) ? 0 : 1;
+      return { status, stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} 1.0`, stderr: "" };
+    },
+    spawn: () => ({ kill() {}, once() {}, pid: 1 }),
+    sleep: async () => {},
+    waitForExit: () => Promise.resolve(),
+    stdout: () => {},
+  });
+  assert.ok(calls.some((c) => c.url.endsWith("/labor") && c.options.method === "POST"), "published");
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-oc/serve") && c.options.method === "POST"), "served seat");
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  assert.equal(JSON.parse(create.options.body).runtime, "opencode");
+});
