@@ -630,8 +630,8 @@ async function commandLaborPublish(options, deps) {
     throw new Error("Missing required --daily-rate");
   }
   const runtime = options.runtime || "claude";
-  if (runtime !== "claude") {
-    throw new Error("labor-publish currently supports --runtime claude");
+  if (!["claude", "opencode"].includes(runtime)) {
+    throw new Error(`labor-publish supports --runtime claude or opencode; ${runtime} has no labor-serve support yet.`);
   }
   const existing = await activeLaborResourcesForRuntime(deps, runtime);
   if (existing.length > 0) {
@@ -641,7 +641,7 @@ async function commandLaborPublish(options, deps) {
       "Use `clawlabor labor-list` to inspect it or `clawlabor labor-unpublish --labor <id>` before publishing again.",
     );
   }
-  const hostAccount = await resolveClaudeCodeAccount(deps);
+  const hostAccount = runtime === "claude" ? await resolveClaudeCodeAccount(deps) : null;
   const body = {
     name,
     description,
@@ -651,7 +651,7 @@ async function commandLaborPublish(options, deps) {
     max_duration_days: 1,
     tier: options.tier || "tier_1",
   };
-  if (runtime === "claude" && hostAccount.provider === "claude" && hostAccount.logged_in && hostAccount.id) {
+  if (runtime === "claude" && hostAccount && hostAccount.provider === "claude" && hostAccount.logged_in && hostAccount.id) {
     body.host_account_provider = hostAccount.provider;
     body.host_account_id = hostAccount.id;
     body.host_account_label = hostAccount.label;
@@ -804,7 +804,7 @@ async function commandLaborServe(options, deps) {
   let stopRequested = false;
   stdout(`[2/7] Resolving ${runtime} sandbox credentials...`);
   const sandboxCreds = await resolveRuntimeSandboxCredentials(runtime, deps);
-  if (sandboxCreds.mounts.length > 0) {
+  if (runtime === "opencode") {
     stdout("Note: your OpenCode credentials are mounted read-only into a sandbox that runs buyer requests. Use a scoped/limited provider key.");
   }
 

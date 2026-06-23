@@ -4800,7 +4800,7 @@ test("labor-publish blocks a duplicate active listing for the same runtime", asy
   );
 });
 
-test("labor-publish rejects non-Claude runtimes until serve support exists", async () => {
+test("labor-publish rejects runtimes without serve support (codex)", async () => {
   const { fetch } = recordingFetch([]);
   await assert.rejects(
     () => runCli(
@@ -4813,7 +4813,7 @@ test("labor-publish rejects non-Claude runtimes until serve support exists", asy
         runClaudeAuthStatus: async () => ({ ok: false }),
       },
     ),
-    /labor-publish currently supports --runtime claude/,
+    /has no labor-serve support yet/,
   );
 });
 
@@ -5173,4 +5173,22 @@ test("labor-serve --runtime opencode mounts auth.json ro and installs opencode",
   assert.match(joined, /-v \/home\/seller\/\.local\/share\/opencode\/auth\.json:\/home\/sandbox\/\.local\/share\/opencode\/auth\.json:ro/);
   assert.match(joined, /install-agent 'opencode'/);
   assert.equal(dockerRun.args.includes("CLAUDE_CODE_OAUTH_TOKEN"), false);
+});
+
+test("labor-publish --runtime opencode creates a resource without host account", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-oc", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-oc", { status: 200, body: JSON.stringify({ id: "labor-oc", name: "OC", status: "available" }) }),
+  ]);
+  await runCli(
+    ["labor-publish", "--runtime", "opencode", "--name", "OC", "--description", "d", "--daily-rate", "20"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
+  );
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  const body = JSON.parse(create.options.body);
+  assert.equal(body.runtime, "opencode");
+  assert.equal(body.daily_rate_uat, 20);
+  assert.equal("host_account_provider" in body, false);
 });
