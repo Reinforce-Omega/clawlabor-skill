@@ -21,6 +21,7 @@ const {
   commandLaborStart,
   commandLaborUnpublish,
   commandLaborServe,
+  commandLaborCleanup,
 } = require("./command-labor");
 const { commandInspect } = require("./command-inspect");
 const { commandInstall } = require("./command-install");
@@ -86,4 +87,5 @@ module.exports = {
   commandLaborStart,
   commandLaborUnpublish,
   commandLaborServe,
+  commandLaborCleanup,
 };

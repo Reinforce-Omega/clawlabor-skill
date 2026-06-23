@@ -63,6 +63,29 @@ function runtimeStateMounts(runtime, hireId) {
   return targets.map((target) => ({ source, target, type: "volume" }));
 }
 
+function runtimeStateInitCommand(mounts, { excludePaths = [] } = {}) {
+  const targets = [
+    "/home/sandbox/.local",
+    "/home/sandbox/.cache",
+    "/home/sandbox/.config",
+    ...mounts.map((m) => m.target),
+  ];
+  if (targets.length === 0) return "true";
+  const quoted = targets.map(shellQuote).join(" ");
+  const excludes = excludePaths.map((p) => `! -path ${shellQuote(p)}`).join(" ");
+  const recursiveChowns = targets
+    .map((target) => `find ${shellQuote(target)} -mindepth 1 ${excludes} -exec chown sandbox:sandbox {} +`)
+    .join(" && ");
+  // Docker creates named volumes as root-owned directories. The runtime agents
+  // run as the sandbox user, so normalize ownership before agent startup. Some
+  // credentials are mounted read-only under these dirs and must be skipped.
+  return `mkdir -p ${quoted} && chown sandbox:sandbox ${quoted} && ${recursiveChowns}`;
+}
+
+function sandboxUserCommand(command) {
+  return `setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=/home/sandbox ${command}`;
+}
+
 function dockerContainerRunning(name, deps = {}) {
   const run = deps.spawnSync || spawnSync;
   const result = run("docker", ["inspect", "-f", "{{.State.Running}}", name], {
@@ -70,6 +93,45 @@ function dockerContainerRunning(name, deps = {}) {
     stdio: ["ignore", "pipe", "ignore"],
   });
   return result.status === 0 && String(result.stdout || "").trim() === "true";
+}
+
+function hireStateVolumeName(hireId) {
+  return `clawlabor-hire-${dockerName(hireId)}-state`;
+}
+
+function dockerVolumeExists(name, deps = {}) {
+  const run = deps.spawnSync || spawnSync;
+  const result = run("docker", ["volume", "inspect", name], {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  return result.status === 0;
+}
+
+function dockerRemoveVolume(name, deps = {}) {
+  const run = deps.spawnSync || spawnSync;
+  const result = run("docker", ["volume", "rm", name], {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  return result.status === 0;
+}
+
+function dockerListHireStateVolumes(deps = {}) {
+  const run = deps.spawnSync || spawnSync;
+  const result = run(
+    "docker",
+    ["volume", "ls", "--filter", "name=clawlabor-hire-", "--format", "{{.Name}}"],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+  );
+  if (result.status !== 0) return [];
+  return String(result.stdout || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("clawlabor-hire-") && line.endsWith("-state"));
+}
+
+function hireIdFromVolumeName(volumeName) {
+  const m = /^clawlabor-hire-(.+)-state$/.exec(volumeName);
+  return m ? m[1] : null;
 }
 
 // What to inject into the per-hire `docker run` so the runtime can authenticate.
@@ -120,10 +182,12 @@ async function resolveViaCloudflare(hostname) {
 function httpsGetViaResolvedIp(url, token, ip) {
   return new Promise((resolve) => {
     const parsed = new URL(url);
+    const family = ip.includes(":") ? 6 : 4;
     const req = https.request(
       {
         protocol: parsed.protocol,
-        hostname: parsed.hostname,
+        hostname: ip,
+        family,
         path: `${parsed.pathname}${parsed.search}`,
         method: "GET",
         headers: {
@@ -131,15 +195,6 @@ function httpsGetViaResolvedIp(url, token, ip) {
           Host: parsed.hostname,
         },
         servername: parsed.hostname,
-        lookup: (_hostname, opts, cb) => {
-          const done = typeof opts === "function" ? opts : cb;
-          const family = ip.includes(":") ? 6 : 4;
-          if (opts && opts.all) {
-            done(null, [{ address: ip, family }]);
-            return;
-          }
-          done(null, ip, family);
-        },
         timeout: LABOR_CONTROL_TIMEOUT_MS,
       },
       (resp) => {
@@ -154,9 +209,13 @@ function httpsGetViaResolvedIp(url, token, ip) {
 }
 
 async function probePublicHealthWithDnsFallback(url, token) {
-  const ips = await resolveViaCloudflare(new URL(url).hostname);
-  for (const ip of ips) {
-    if (await httpsGetViaResolvedIp(url, token, ip)) return true;
+  try {
+    const ips = await resolveViaCloudflare(new URL(url).hostname);
+    for (const ip of ips) {
+      if (await httpsGetViaResolvedIp(url, token, ip)) return true;
+    }
+  } catch (_err) {
+    return false;
   }
   return false;
 }
@@ -839,6 +898,7 @@ async function commandLaborServe(options, deps) {
   const sellerDeps = { ...deps, env: envWithApiKey(deps.env, sellerApiKey) };
   const stop = deps.waitForExit ? deps.waitForExit() : new Promise(() => {});
   let stopRequested = false;
+  let stopNoticePrinted = false;
   stdout(`[2/7] Resolving ${runtime} sandbox credentials...`);
   const sandboxCreds = await resolveRuntimeSandboxCredentials(runtime, deps);
   if (runtime === "opencode") {
@@ -847,9 +907,11 @@ async function commandLaborServe(options, deps) {
 
   stdout("[3/7] Marking labor seat online...");
   await requestJson(sellerDeps, "POST", `/labor/${laborId}/serve`, {});
+  let activeCleanupCurrentHire = null;
+  let activeStopCleanupPromise = null;
   let laborSeatOfflinePromise = null;
 
-  async function markLaborSeatOffline() {
+  function markLaborSeatOffline() {
     if (!laborSeatOfflinePromise) {
       laborSeatOfflinePromise = (async () => {
         stdout("Notifying platform of labor seat shutdown...");
@@ -865,46 +927,70 @@ async function commandLaborServe(options, deps) {
         }
       })();
     }
-    await laborSeatOfflinePromise;
+    return laborSeatOfflinePromise;
   }
 
-  // Force kill a child process after a timeout if it doesn't exit gracefully
-  function forceKill(process, name, timeoutMs = 5000) {
-    if (!process || process.exitCode !== null) return Promise.resolve();
-    if (typeof process.once !== "function") return Promise.resolve();
+  function requestActiveCleanup() {
+    if (activeCleanupCurrentHire && !activeStopCleanupPromise) {
+      activeStopCleanupPromise = activeCleanupCurrentHire();
+    }
+    return activeStopCleanupPromise;
+  }
+
+  function requestStop() {
+    stopRequested = true;
+    if (!stopNoticePrinted) {
+      stopNoticePrinted = true;
+      stdout("\nReceived shutdown signal; stopping local serve/tunnel...");
+    }
+    requestActiveCleanup();
+    markLaborSeatOffline();
+  }
+
+  // Force kill a child process after a timeout if it doesn't exit gracefully.
+  function forceKill(child, name, timeoutMs = 5000) {
+    if (!child || child.exitCode !== null) return Promise.resolve();
+    if (typeof child.once !== "function") return Promise.resolve();
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        try {
-          process.kill("SIGKILL");
-        } catch (_err) { /* noop */ }
+        terminateProcessGroup(child, "SIGKILL");
       }, timeoutMs);
-      process.once("exit", () => {
+      child.once("exit", () => {
         clearTimeout(timer);
         resolve();
       });
     });
   }
 
-  function terminateChild(process, signal = "SIGTERM") {
-    if (!process || typeof process.kill !== "function") return;
+  function terminateChild(child, signal = "SIGTERM") {
+    if (!child || typeof child.kill !== "function") return;
     try {
-      process.kill(signal);
+      child.kill(signal);
     } catch (_err) { /* noop */ }
   }
 
-  function terminateProcessGroup(process, signal = "SIGTERM") {
-    if (!process) return;
-    if (process.pid) {
+  function terminateProcessGroup(child, signal = "SIGTERM") {
+    if (!child) return;
+    if (child.pid) {
       try {
-        process.kill(-process.pid, signal);
+        const killProcessGroup = deps.killProcessGroup || process.kill;
+        killProcessGroup(-child.pid, signal);
         return;
       } catch (_err) { /* fall back to child kill */ }
     }
-    terminateChild(process, signal);
+    terminateChild(child, signal);
   }
 
   function interruptibleSleep(ms) {
-    return Promise.race([sleep(ms), stop]);
+    return Promise.race([
+      stop.then(() => {
+        requestStop();
+        return activeStopCleanupPromise;
+      }).then(() => {
+        return true;
+      }),
+      sleep(ms).then(() => false),
+    ]);
   }
 
   async function waitForActiveHire() {
@@ -988,7 +1074,11 @@ async function commandLaborServe(options, deps) {
       } catch (_err) {
         if (!publicTunnel) return false;
         const fallbackProbe = deps.probePublicHealthWithDnsFallback || probePublicHealthWithDnsFallback;
-        return fallbackProbe(url, sandbox_token);
+        try {
+          return await fallbackProbe(url, sandbox_token);
+        } catch (_fallbackErr) {
+          return false;
+        }
       }
     }
 
@@ -1022,7 +1112,9 @@ async function commandLaborServe(options, deps) {
       clearPortOccupant();
       stdout(`[5/7] Starting sandbox container (${image})...`);
       const credEnvFlags = Object.keys(sandboxCreds.env).flatMap((envName) => ["-e", envName]);
-      const stateMountFlags = runtimeStateMounts(runtime, hireId).flatMap((m) => [
+      const stateMounts = runtimeStateMounts(runtime, hireId);
+      const readOnlyCredPaths = sandboxCreds.mounts.filter((m) => m.ro).map((m) => m.container);
+      const stateMountFlags = stateMounts.flatMap((m) => [
         "--mount", `type=${m.type},source=${m.source},target=${m.target}`,
       ]);
       const credMountFlags = sandboxCreds.mounts.flatMap((m) => ["-v", `${m.host}:${m.container}${m.ro ? ":ro" : ""}`]);
@@ -1030,6 +1122,9 @@ async function commandLaborServe(options, deps) {
         "docker",
         [
           "run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
+          // Start as root only long enough to repair fresh volume ownership;
+          // agent install and the long-running server run as sandbox below.
+          "-u", "root",
           "-e", "CLAWLABOR_AGENT_RUNTIME",
           ...credEnvFlags,
           ...stateMountFlags,
@@ -1038,8 +1133,10 @@ async function commandLaborServe(options, deps) {
           image,
           "-lc",
           [
-            `sandbox-clawlabor install-agent ${shellQuote(runtime)}`,
-            `exec sandbox-clawlabor server --token=${shellQuote(sandbox_token)} --host 0.0.0.0 --port 2468`,
+            runtimeStateInitCommand(stateMounts, { excludePaths: readOnlyCredPaths }),
+            sandboxUserCommand(`sandbox-clawlabor install-agent ${shellQuote(runtime)}`),
+            runtimeStateInitCommand(stateMounts, { excludePaths: readOnlyCredPaths }),
+            `exec ${sandboxUserCommand(`sandbox-clawlabor server --token=${shellQuote(sandbox_token)} --host 0.0.0.0 --port 2468`)}`,
           ].join(" && "),
         ],
         { stdio: "ignore", env: runtimeEnv },
@@ -1058,7 +1155,7 @@ async function commandLaborServe(options, deps) {
     stdout("[7/7] Starting Cloudflare tunnel...");
     const tunnel = spawn(
       "cloudflared",
-      ["tunnel", "--grace-period=3s", "run", "--token", tunnel_token],
+      ["tunnel", "--no-autoupdate", "--grace-period=3s", "run", "--token", tunnel_token],
       { stdio: "inherit", detached: true },
     );
 
@@ -1073,6 +1170,8 @@ async function commandLaborServe(options, deps) {
     async function cleanupCurrentHire() {
       await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, cleanedUpRef });
     }
+    activeCleanupCurrentHire = cleanupCurrentHire;
+    activeStopCleanupPromise = null;
 
     async function selfHealSandbox() {
       if (healingSandbox) return false;
@@ -1184,53 +1283,195 @@ async function commandLaborServe(options, deps) {
 
     await tick();
     while (hireRunning) {
-      await (stopRequested ? sleep(60000) : interruptibleSleep(60000));
+      if (stopRequested) break;
+      const stopped = await interruptibleSleep(60000);
+      if (stopped) break;
+      if (stopRequested) break;
       if (!hireRunning) break;
       await tick();
     }
 
     if (stopRequested) {
-      stdout("Current hire ended after shutdown request; cleaning up isolated runtime.");
+      stdout("Shutdown requested; stopping local tunnel and sandbox for the current hire.");
+      requestActiveCleanup();
+    }
+    if (activeStopCleanupPromise) {
+      await activeStopCleanupPromise;
     }
     if (!cleanedUpRef.value) {
       stdout("Cleaning up completed hire runtime...");
       await cleanupCurrentHire();
     }
-    stdout(`Notifying platform of hire ${hireId} shutdown...`);
-    try {
-      await withTimeout(
-        requestJson(sellerDeps, "DELETE", `/labor/hires/${hireId}/serve`, {}),
-        3000,
-        "hire teardown",
-      );
-      stdout("Hire platform teardown notified.");
-    } catch (_err) {
-      stdout("Hire platform notification timed out (best effort).");
+    if (stopRequested) {
+      // Ctrl+C path: the hire is still ACTIVE on the platform. Do NOT call
+      // DELETE /labor/hires/<id>/serve — that would release the platform-side
+      // tunnel and drop the hire's sandbox record while the buyer's hire is
+      // still live. Just leave it; the platform will mark the sandbox
+      // unhealthy via missing heartbeats and notify the seller to recover.
+      // The hire's named state volume is also preserved so the seller can
+      // resume with the same agent state on the next `labor-serve`.
+      stdout(`Hire ${hireId} interrupted while still active; leaving platform record and state volume intact.`);
+    } else {
+      stdout(`Notifying platform of hire ${hireId} shutdown...`);
+      let teardownNotified = false;
+      try {
+        await withTimeout(
+          requestJson(sellerDeps, "DELETE", `/labor/hires/${hireId}/serve`, {}),
+          3000,
+          "hire teardown",
+        );
+        teardownNotified = true;
+        stdout("Hire platform teardown notified.");
+      } catch (_err) {
+        stdout("Hire platform notification timed out (best effort).");
+      }
+      // Only reclaim the hire's named state volume once the platform has
+      // accepted teardown — that guarantees no recovery path needs the
+      // agent state any more. Best-effort: keep the volume on failure.
+      if (teardownNotified) {
+        const volumeName = hireStateVolumeName(hireId);
+        if (dockerVolumeExists(volumeName, deps)) {
+          if (dockerRemoveVolume(volumeName, deps)) {
+            stdout(`Removed hire state volume ${volumeName}.`);
+          } else {
+            stdout(`Could not remove hire state volume ${volumeName} (in use?); leaving for manual cleanup.`);
+          }
+        }
+      }
+    }
+    if (activeCleanupCurrentHire === cleanupCurrentHire) {
+      activeCleanupCurrentHire = null;
+      activeStopCleanupPromise = null;
     }
     return { hireId, hostname };
   }
 
   stop.then(() => {
-    stopRequested = true;
-    stdout("\nReceived shutdown signal; stopping new hires after the current hire drains...");
-    markLaborSeatOffline();
+    requestStop();
   });
 
   let lastRun = null;
-  while (!stopRequested) {
-    stdout("[4/7] Waiting for active hire...");
-    const active = await waitForActiveHire();
-    if (!active) break;
-    lastRun = await runHireSandbox(active);
-    if (!stopRequested) {
-      stdout(`Hire ${lastRun.hireId} ended; labor seat remains online for the next hire.`);
+  try {
+    while (!stopRequested) {
+      stdout("[4/7] Waiting for active hire...");
+      const active = await waitForActiveHire();
+      if (!active) break;
+      lastRun = await runHireSandbox(active);
+      if (!stopRequested) {
+        stdout(`Hire ${lastRun.hireId} ended; labor seat remains online for the next hire.`);
+      }
     }
+  } catch (err) {
+    stdout(`Labor serve failed; stopping local serve/tunnel before exiting. ${err.message || err}`);
+    stopRequested = true;
+    requestActiveCleanup();
+    markLaborSeatOffline();
+    if (activeStopCleanupPromise) {
+      await activeStopCleanupPromise;
+    }
+    throw err;
   }
 
-  await markLaborSeatOffline();
+  if (stopRequested && laborSeatOfflinePromise) {
+    await laborSeatOfflinePromise;
+  }
 
   return JSON.stringify(
     { action: "labor-serve", labor_id: laborId, hostname: lastRun && lastRun.hostname, status: "stopped" },
+    null,
+    2,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// labor-cleanup — reclaim stale hire state volumes left on this machine.
+//
+// `labor-serve` removes a hire's named state volume after the platform accepts
+// the hire teardown (the natural-end path). Volumes can still pile up when the
+// process is interrupted (Ctrl+C, crash, host reboot) before that teardown.
+// This command lists every `clawlabor-hire-<hireId>-state` volume on the host,
+// asks the platform which hires are still ACTIVE for the seller's labor
+// resources, and removes the rest. `--dry-run` reports without deleting.
+// ---------------------------------------------------------------------------
+async function commandLaborCleanup(_options, deps, flags) {
+  const dryRun = !(flags && flags.has && flags.has("apply"));
+  const volumes = dockerListHireStateVolumes(deps);
+  if (volumes.length === 0) {
+    return JSON.stringify(
+      { action: "labor-cleanup", mode: dryRun ? "dry-run" : "apply", checked: 0, kept: [], removed: [], failed: [] },
+      null,
+      2,
+    );
+  }
+
+  // Gather all hire IDs that are still ACTIVE across this seller's labor
+  // resources. Volumes for those hires must never be removed — buyers are
+  // still using them.
+  const activeHireIds = new Set();
+  let labors = [];
+  try {
+    let cursor = null;
+    do {
+      const params = new URLSearchParams({ limit: "100" });
+      if (cursor) params.set("cursor", cursor);
+      const page = await requestJson(deps, "GET", `/labor/list?${params.toString()}`);
+      const me = await requestJson(deps, "GET", "/agents/me");
+      const owner = me.agent || me;
+      const ownerId = owner && owner.id ? String(owner.id) : null;
+      const owned = (page.items || []).filter((it) => String(it.seller_agent_id) === ownerId);
+      labors = labors.concat(owned);
+      cursor = page.next_cursor || null;
+    } while (cursor);
+  } catch (err) {
+    throw new Error(`labor-cleanup: could not list seller labors: ${err.message || err}`);
+  }
+  for (const labor of labors) {
+    try {
+      const hires = await requestJson(deps, "GET", `/labor/${labor.id}/hires?status=active`, {});
+      for (const hire of hires.items || []) {
+        if (hire && hire.id != null) activeHireIds.add(String(hire.id));
+      }
+    } catch (_err) {
+      // If we cannot determine the active set for a labor, fail safe: skip
+      // cleanup entirely by adding a sentinel that prevents any removal.
+      throw new Error(
+        `labor-cleanup: could not list active hires for labor ${labor.id}; aborting to avoid deleting a live hire's state.`,
+      );
+    }
+  }
+
+  const kept = [];
+  const removed = [];
+  const failed = [];
+  for (const volume of volumes) {
+    const hireId = hireIdFromVolumeName(volume);
+    if (!hireId) continue;
+    if (activeHireIds.has(hireId)) {
+      kept.push({ volume, reason: "active-hire" });
+      continue;
+    }
+    if (dryRun) {
+      removed.push({ volume, hire_id: hireId, dry_run: true });
+      continue;
+    }
+    if (dockerRemoveVolume(volume, deps)) {
+      removed.push({ volume, hire_id: hireId });
+    } else {
+      failed.push({ volume, hire_id: hireId, reason: "docker volume rm failed (in use?)" });
+    }
+  }
+
+  return JSON.stringify(
+    {
+      action: "labor-cleanup",
+      mode: dryRun ? "dry-run" : "apply",
+      checked: volumes.length,
+      active_hires: Array.from(activeHireIds),
+      kept,
+      removed,
+      failed,
+      hint: dryRun ? "Re-run with --apply to delete the listed volumes." : undefined,
+    },
     null,
     2,
   );
@@ -1245,8 +1486,13 @@ module.exports = {
   commandLaborStart,
   commandLaborUnpublish,
   commandLaborServe,
+  commandLaborCleanup,
   parseSseChunks,
   opencodeAuthPath,
   runtimeStateMounts,
+  runtimeStateInitCommand,
+  sandboxUserCommand,
   resolveRuntimeSandboxCredentials,
+  hireStateVolumeName,
+  hireIdFromVolumeName,
 };

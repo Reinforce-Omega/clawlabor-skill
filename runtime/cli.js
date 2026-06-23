@@ -70,6 +70,7 @@ const {
   commandLaborStart,
   commandLaborUnpublish,
   commandLaborServe,
+  commandLaborCleanup,
 } = require("./commands/core");
 
 const PKG_VERSION = require("../package.json").version;
@@ -270,6 +271,12 @@ const COMMANDS = {
     summary: "Seller: provision a platform tunnel, run the sandbox + cloudflared, auto-accept hires, and heartbeat",
     usage: "labor-serve --labor <labor_resource_id> [--runtime claude] [--port 2468] [--image <docker_image>]",
   },
+  "labor-cleanup": {
+    handler: commandLaborCleanup,
+    section: "Labor",
+    summary: "Seller: remove leftover hire state volumes for hires that are no longer active (default dry-run)",
+    usage: "labor-cleanup [--apply]",
+  },
   labor: {
     handler(_options, _deps) {
       const lines = [
@@ -292,6 +299,9 @@ const COMMANDS = {
         "",
         "  clawlabor labor-serve --labor <id>",
         "    Provision tunnel, run sandbox, auto-accept hires",
+        "",
+        "  clawlabor labor-cleanup [--apply]",
+        "    Remove leftover hire state volumes for inactive hires (dry-run by default)",
         "",
         "  clawlabor labor-unpublish --labor <id>",
         "    Delist a labor resource",
@@ -483,6 +493,7 @@ async function runCli(argv, injected = {}) {
     readClaudeOauthToken: injected.readClaudeOauthToken,
     runClaudeAuthStatus: injected.runClaudeAuthStatus,
     probePublicHealthWithDnsFallback: injected.probePublicHealthWithDnsFallback,
+    killProcessGroup: injected.killProcessGroup,
   };
   if (!deps.fetch) {
     throw new Error("This Node.js runtime does not provide fetch");
