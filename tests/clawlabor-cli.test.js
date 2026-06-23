@@ -5137,3 +5137,40 @@ test("resolveRuntimeSandboxCredentials: opencode missing auth throws actionable 
     /opencode auth login/,
   );
 });
+
+test("labor-serve --runtime opencode mounts auth.json ro and installs opencode", async () => {
+  const spawned = [];
+  let hirePolls = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor/labor-oc/serve", { status: 204, body: "" }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return { status: 200, body: hirePolls === 1
+          ? JSON.stringify({ items: [{ id: "hire-oc", status: "active" }] })
+          : JSON.stringify({ items: [] }) };
+      } },
+    matchRoute("POST", "/labor/hires/hire-oc/serve", { status: 200,
+      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "labor-hire-oc.clawlabor.com" }) }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-oc/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/hires/hire-oc/serve", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/labor-oc/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(["labor-serve", "--labor", "labor-oc", "--runtime", "opencode"], {
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fetch,
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+    spawn: (cmd, args) => { spawned.push({ cmd, args }); return { kill() {}, once() {}, pid: 123 }; },
+    sleep: async () => {},
+    waitForExit: () => Promise.resolve(),
+    stdout: () => {},
+  });
+  const dockerRun = spawned.find((s) => s.cmd === "docker" && s.args.includes("run"));
+  assert.ok(dockerRun, "docker run was spawned");
+  const joined = dockerRun.args.join(" ");
+  assert.match(joined, /-v \/home\/seller\/\.local\/share\/opencode\/auth\.json:\/home\/sandbox\/\.local\/share\/opencode\/auth\.json:ro/);
+  assert.match(joined, /install-agent 'opencode'/);
+  assert.equal(dockerRun.args.includes("CLAUDE_CODE_OAUTH_TOKEN"), false);
+});

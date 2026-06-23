@@ -475,6 +475,7 @@ async function runCli(argv, injected = {}) {
     createServer: injected.createServer || http.createServer,
     spawn: injected.spawn || spawn,
     spawnSync: injected.spawnSync || spawnSync,
+    fs: injected.fs || require("node:fs"),
     sleep:
       injected.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     now: injected.now || (() => Date.now()),

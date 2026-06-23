@@ -788,9 +788,6 @@ async function commandLaborChat(options, deps) {
 async function commandLaborServe(options, deps) {
   const laborId = requiredOption(options, "labor");
   const runtime = options.runtime || "claude";
-  if (runtime !== "claude") {
-    throw new Error("labor-serve currently supports --runtime claude");
-  }
   const port = numberOption(options, "port") || 2468;
   const image = options.image || "ryanxdocker/sandbox-clawlabor";
   const spawn = deps.spawn || require("child_process").spawn;
@@ -805,15 +802,10 @@ async function commandLaborServe(options, deps) {
   const sellerDeps = { ...deps, env: envWithApiKey(deps.env, sellerApiKey) };
   const stop = deps.waitForExit ? deps.waitForExit() : new Promise(() => {});
   let stopRequested = false;
-  stdout("[2/7] Checking Claude Code authentication...");
-  const claudeOauth = await resolveClaudeCodeOauthToken(deps);
-  if (!claudeOauth.token) {
-    const authHint = claudeOauth.authStatusOk
-      ? "Claude Code is logged in, but no fresh local claude.ai OAuth token was available. Open Claude Code once or wait for any Claude session limit to reset, then retry."
-      : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription.";
-    throw new Error(
-      `labor-serve requires a working local Claude Code claude.ai subscription login. ${authHint}`,
-    );
+  stdout(`[2/7] Resolving ${runtime} sandbox credentials...`);
+  const sandboxCreds = await resolveRuntimeSandboxCredentials(runtime, deps);
+  if (sandboxCreds.mounts.length > 0) {
+    stdout("Note: your OpenCode credentials are mounted read-only into a sandbox that runs buyer requests. Use a scoped/limited provider key.");
   }
 
   stdout("[3/7] Marking labor seat online...");
@@ -939,7 +931,7 @@ async function commandLaborServe(options, deps) {
     const runtimeEnv = {
       ...deps.env,
       CLAWLABOR_AGENT_RUNTIME: runtime,
-      CLAUDE_CODE_OAUTH_TOKEN: claudeOauth.token,
+      ...sandboxCreds.env,
     };
 
     try {
@@ -957,12 +949,15 @@ async function commandLaborServe(options, deps) {
     }
 
     stdout(`[5/7] Starting sandbox container (${image})...`);
+    const credEnvFlags = Object.keys(sandboxCreds.env).flatMap((envName) => ["-e", envName]);
+    const credMountFlags = sandboxCreds.mounts.flatMap((m) => ["-v", `${m.host}:${m.container}${m.ro ? ":ro" : ""}`]);
     const container = spawn(
       "docker",
       [
         "run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
         "-e", "CLAWLABOR_AGENT_RUNTIME",
-        "-e", "CLAUDE_CODE_OAUTH_TOKEN",
+        ...credEnvFlags,
+        ...credMountFlags,
         "--entrypoint", "sh",
         image,
         "-lc",
