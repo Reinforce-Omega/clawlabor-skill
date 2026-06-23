@@ -4104,6 +4104,9 @@ function laborAgentsDeps(fetch, out) {
   return {
     env: BASE_ENV,
     fetch,
+    // Default: no local opencode auth (deterministic — tests that want opencode
+    // serveable override fs with existsSync -> true).
+    fs: { existsSync: () => false },
     stdout: (t) => out.push(t),
     readClaudeOauthToken: () => "oauth-token-123",
     runClaudeAuthStatus: async () => ({
@@ -4291,7 +4294,7 @@ test("labor-agents --verbose keeps diagnostic detail", async () => {
   const opencode = parsed.agents[2];
   assert.equal(opencode.ready_to_publish, true);
   assert.equal(opencode.ready_to_serve, false);
-  assert.equal(opencode.serve_status, "candidate_not_wired_to_labor_serve");
+  assert.equal(opencode.serve_status, "needs_opencode_auth");
 });
 
 test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats, and tears down", async () => {
@@ -5191,4 +5194,16 @@ test("labor-publish --runtime opencode creates a resource without host account",
   assert.equal(body.runtime, "opencode");
   assert.equal(body.daily_rate_uat, 20);
   assert.equal("host_account_provider" in body, false);
+});
+
+test("labor-agents marks opencode serveable when CLI + auth present", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(["labor-agents"], {
+    ...laborAgentsDeps(fetch, out),
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+  });
+  const oc = JSON.parse(out.join("")).agents.find((a) => a.runtime === "opencode");
+  assert.equal(oc.can_serve, true);
 });

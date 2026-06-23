@@ -435,6 +435,7 @@ async function commandLaborAgents(_options, deps, flags) {
   const claudeAgent = await claudeRuntimeAgent(deps);
   const codex = commandProbe(deps, "codex");
   const opencode = commandProbe(deps, "opencode");
+  const opencodeAuthPresent = opencode.status === "pass" && (deps.fs || require("fs")).existsSync(opencodeAuthPath(deps.env));
   const agents = [
     claudeAgent,
     runtimeAgent({
@@ -469,10 +470,12 @@ async function commandLaborAgents(_options, deps, flags) {
       runtime: "opencode",
       command: "opencode",
       probe: opencode,
-      readyToServe: false,
-      serveStatus: opencode.status === "pass"
-        ? "candidate_not_wired_to_labor_serve"
-        : "not_installed",
+      readyToServe: opencodeAuthPresent,
+      serveStatus: opencodeAuthPresent
+        ? "ready_to_serve"
+        : opencode.status === "pass"
+          ? "needs_opencode_auth"
+          : "not_installed",
       requirements: [
         {
           name: "opencode_cli",
@@ -480,11 +483,18 @@ async function commandLaborAgents(_options, deps, flags) {
           command: "opencode --version",
           version: opencode.version,
           detail: opencode.status === "pass"
-            ? "OpenCode CLI is installed locally; Clawlabor labor-serve is not wired to start OpenCode-backed sandbox sessions yet"
+            ? "OpenCode CLI is installed locally"
             : opencode.on_path
               ? "OpenCode CLI is on PATH but failed to run; repair the local OpenCode install before publishing an OpenCode-backed labor runtime"
               : "Install OpenCode CLI before publishing an OpenCode-backed labor runtime",
           error: opencode.error,
+        },
+        {
+          name: "opencode_auth",
+          status: opencodeAuthPresent ? "pass" : "fail",
+          detail: opencodeAuthPresent
+            ? "OpenCode auth.json found; labor-serve will mount it read-only into the sandbox"
+            : "Run `opencode auth login` so labor-serve can pass your provider credentials into the sandbox",
         },
       ],
       publishName: "OpenCode Labor",
