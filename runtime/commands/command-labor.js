@@ -10,7 +10,7 @@ const {
   resolveClaudeCodeOauthToken,
 } = require("../claude_auth");
 const { apiBase, envWithApiKey, request, requestJson, resolveApiKey } = require("../http");
-const { numberOption, positiveNumberOption, requiredOption } = require("../options");
+const { numberOption, positiveNumberOption, requiredOption, tokenCountOption } = require("../options");
 
 const LABOR_STATUSES = new Set(["draft", "available", "occupied", "inactive", "all"]);
 const DEFAULT_DAILY_RATE_UAT = 50;
@@ -621,6 +621,7 @@ function compactLaborResource(resource) {
     status: resource.status,
     serve_status: resource.serve_status,
     daily_rate_uat: nanoToUatDisplay(resource.daily_rate_nano),
+    daily_token_cap: resource.daily_token_cap ?? null,
     tier: resource.tier,
     seller_agent_id: resource.seller_agent_id,
     host_account_provider: resource.host_account_provider || null,
@@ -721,6 +722,7 @@ async function commandLaborPublish(options, deps) {
   if (dailyRate === undefined) {
     throw new Error("Missing required --daily-rate");
   }
+  const dailyTokenCap = tokenCountOption(options, "daily-token-cap");
   const runtime = options.runtime || "claude";
   if (!["claude", "opencode"].includes(runtime)) {
     throw new Error(`labor-publish supports --runtime claude or opencode; ${runtime} has no labor-serve support yet.`);
@@ -743,6 +745,9 @@ async function commandLaborPublish(options, deps) {
     max_duration_days: 1,
     tier: options.tier || "tier_1",
   };
+  if (dailyTokenCap !== undefined) {
+    body.daily_token_cap = dailyTokenCap;
+  }
   if (runtime === "claude" && hostAccount && hostAccount.provider === "claude" && hostAccount.logged_in && hostAccount.id) {
     body.host_account_provider = hostAccount.provider;
     body.host_account_id = hostAccount.id;

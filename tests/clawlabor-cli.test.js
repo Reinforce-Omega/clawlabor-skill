@@ -5435,6 +5435,51 @@ test("labor-publish --runtime opencode creates a resource without host account",
   assert.equal("host_account_provider" in body, false);
 });
 
+test("labor-publish forwards --daily-token-cap as an integer", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-tc", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-tc", { status: 200, body: JSON.stringify({ id: "labor-tc", name: "OC", status: "available" }) }),
+  ]);
+  await runCli(
+    ["labor-publish", "--runtime", "opencode", "--name", "OC", "--description", "d",
+     "--daily-rate", "20", "--daily-token-cap", "1.5m"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
+  );
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  const body = JSON.parse(create.options.body);
+  assert.equal(body.daily_token_cap, 1_500_000);
+});
+
+test("labor-publish omits daily_token_cap when --daily-token-cap is not provided", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-no-tc", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-no-tc", { status: 200, body: JSON.stringify({ id: "labor-no-tc", name: "OC", status: "available" }) }),
+  ]);
+  await runCli(
+    ["labor-publish", "--runtime", "opencode", "--name", "OC", "--description", "d", "--daily-rate", "20"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
+  );
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  const body = JSON.parse(create.options.body);
+  assert.equal("daily_token_cap" in body, false);
+});
+
+test("labor-publish rejects --daily-token-cap with bad suffix", async () => {
+  const { fetch } = recordingFetch([]);
+  await assert.rejects(
+    runCli(
+      ["labor-publish", "--runtime", "opencode", "--name", "OC", "--description", "d",
+       "--daily-rate", "20", "--daily-token-cap", "100x"],
+      { env: BASE_ENV, fetch, stdout: () => {} },
+    ),
+    /daily-token-cap/,
+  );
+});
+
 test("labor-agents marks opencode serveable when CLI + auth present", async () => {
   const { fetch } = laborAgentsFetch();
   const out = [];
