@@ -5480,6 +5480,18 @@ test("labor-publish rejects --daily-token-cap with bad suffix", async () => {
   );
 });
 
+test("labor-publish rejects --daily-token-cap with --runtime claude (opencode-only enforcement)", async () => {
+  const { fetch } = recordingFetch([]);
+  await assert.rejects(
+    runCli(
+      ["labor-publish", "--runtime", "claude", "--name", "Claude bot", "--description", "d",
+       "--daily-rate", "20", "--daily-token-cap", "100k"],
+      { env: BASE_ENV, fetch, stdout: () => {} },
+    ),
+    /opencode-only/,
+  );
+});
+
 test("labor-agents marks opencode serveable when CLI + auth present", async () => {
   const { fetch } = laborAgentsFetch();
   const out = [];

@@ -727,6 +727,12 @@ async function commandLaborPublish(options, deps) {
   if (!["claude", "opencode"].includes(runtime)) {
     throw new Error(`labor-publish supports --runtime claude or opencode; ${runtime} has no labor-serve support yet.`);
   }
+  if (dailyTokenCap !== undefined && runtime !== "opencode") {
+    throw new Error(
+      `--daily-token-cap is currently opencode-only; ${runtime} hires do not report per-prompt token usage yet, so the cap would never trip. ` +
+      "Re-run with --runtime opencode, or omit --daily-token-cap.",
+    );
+  }
   const existing = await activeLaborResourcesForRuntime(deps, runtime);
   if (existing.length > 0) {
     const ids = existing.map((item) => `${item.id}(${item.status})`).join(", ");
