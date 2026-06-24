@@ -23,7 +23,12 @@ runCli(process.argv.slice(2)).then(() => {
     if (error.rerunCommand) payload.rerun_command = error.rerunCommand;
     payload.next = "Run plan_command to preview the listing's required_fields and sample_requirement, replace any <TODO:...> placeholders, then re-run rerun_command.";
   }
-  console.error(JSON.stringify(payload));
+  if (error.errorCode === "labor_cap_immutable_on_existing_labor") {
+    if (error.labor_id) payload.labor_id = error.labor_id;
+    if (error.runtime) payload.runtime = error.runtime;
+    if (error.next_steps) payload.next_steps = error.next_steps;
+  }
+  console.error(JSON.stringify(payload, null, 2));
   if (error.errorCode === "insufficient_credits") {
     process.exit(2);
   }

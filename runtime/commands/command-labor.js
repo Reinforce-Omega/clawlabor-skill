@@ -19,6 +19,10 @@ const PLAN_MONTHLY_COST_UAT = {
   team: 50 * 10, // $50/month = 500 UAT/month
   enterprise: 200 * 10, // $200/month = 2000 UAT/month
 };
+// Default per-day raw totalTokens cap suggested for opencode labors.
+// Enforcement is currently opencode-only (see docs/spec/2026-06-23-labor-daily-token-cap-spec.md);
+// other runtimes have no per-prompt usage feed, so we don't suggest a cap for them.
+const DEFAULT_DAILY_TOKEN_CAP = 1_000_000; // 1M tokens/day
 const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const CLOUDFLARE_RESOLVERS = ["1.1.1.1", "1.0.0.1"];
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
@@ -257,11 +261,22 @@ function runtimeAgent({
   serveStatus,
   requirements,
   publishName,
+  defaultDailyTokenCap = null,
 }) {
   const suggestedDailyRate = hostPlan && PLAN_MONTHLY_COST_UAT[hostPlan?.toLowerCase()]
     ? Math.ceil(PLAN_MONTHLY_COST_UAT[hostPlan.toLowerCase()] / 30)
     : DEFAULT_DAILY_RATE_UAT;
   const installed = probe.status === "pass";
+  const publishParts = [
+    "clawlabor labor-publish",
+    `--runtime ${runtime}`,
+    `--name ${shellQuote(publishName)}`,
+    `--description ${shellQuote(`${publishName}${hostPlan ? ` (${hostPlan} plan)` : ""} backed by the local ${name} runtime.`)}`,
+    `--daily-rate ${suggestedDailyRate}`,
+  ];
+  if (defaultDailyTokenCap) {
+    publishParts.push(`--daily-token-cap ${defaultDailyTokenCap}`);
+  }
   return {
     id,
     name,
@@ -277,13 +292,9 @@ function runtimeAgent({
     serve_status: serveStatus,
     host_account: hostAccount || null,
     suggested_daily_rate_uat: suggestedDailyRate,
+    suggested_daily_token_cap: defaultDailyTokenCap,
     requirements,
-    publish_command_template: [
-      "clawlabor labor-publish",
-      `--name ${shellQuote(publishName)}`,
-      `--description ${shellQuote(`${publishName}${hostPlan ? ` (${hostPlan} plan)` : ""} backed by the local ${name} runtime.`)}`,
-      `--daily-rate ${suggestedDailyRate}`,
-    ].join(" "),
+    publish_command_template: publishParts.join(" "),
   };
 }
 
@@ -334,6 +345,9 @@ function summarizeLaborAgent(agent, existingLaborByRuntime) {
     suggested_daily_rate_uat: agent.suggested_daily_rate_uat,
     can_serve: agent.ready_to_serve,
   };
+  if (agent.suggested_daily_token_cap) {
+    summary.suggested_daily_token_cap = agent.suggested_daily_token_cap;
+  }
   if (missing.length > 0) {
     summary.needs = missing;
   }
@@ -345,7 +359,18 @@ function summarizeLaborAgent(agent, existingLaborByRuntime) {
     summary.labor_status = existing.status;
   }
   if (agent.ready_to_serve) {
-    summary.start_command = `clawlabor labor-start --runtime ${agent.runtime}`;
+    // When there is no existing labor, labor-start auto-publishes and forwards
+    // the same suggested rate / token cap. When a labor already exists, the
+    // cap is immutable post-publish (see labor-start guard), so we only surface
+    // --runtime here.
+    const startParts = [`clawlabor labor-start --runtime ${agent.runtime}`];
+    if (!existing) {
+      startParts.push(`--daily-rate ${agent.suggested_daily_rate_uat}`);
+      if (agent.suggested_daily_token_cap) {
+        startParts.push(`--daily-token-cap ${agent.suggested_daily_token_cap}`);
+      }
+    }
+    summary.start_command = startParts.join(" ");
   }
   return summary;
 }
@@ -558,6 +583,7 @@ async function commandLaborAgents(_options, deps, flags) {
         : opencode.status === "pass"
           ? "needs_opencode_auth"
           : "not_installed",
+      defaultDailyTokenCap: DEFAULT_DAILY_TOKEN_CAP,
       requirements: [
         {
           name: "opencode_cli",
@@ -819,11 +845,20 @@ async function commandLaborStart(options, deps) {
     const publishOut = await commandLaborPublish(publishOptions, deps);
     laborId = JSON.parse(publishOut).labor_resource_id;
   } else if (options["daily-token-cap"] !== undefined) {
-    throw new Error(
-      `Cannot set --daily-token-cap on an existing labor (${laborId}); labor-start reuses the existing listing. ` +
-      "Unpublish it first (`clawlabor labor-unpublish --labor " + laborId + "`) and re-run labor-start, " +
-      "or update the cap via `clawlabor labor-update` (not yet implemented).",
+    const dailyRate = options["daily-rate"] || String(DEFAULT_DAILY_RATE_UAT);
+    const unpublishCommand = `clawlabor labor-unpublish --labor ${laborId}`;
+    const restartCommand = `clawlabor labor-start --runtime ${runtime} --daily-rate ${dailyRate} --daily-token-cap ${options["daily-token-cap"]}`;
+    const err = new Error(
+      `Cannot change --daily-token-cap on existing labor ${laborId}. A labor's cap is fixed at publish time; to change it you must unpublish the listing first and then run labor-start again. Execute next_steps in order.`,
     );
+    err.errorCode = "labor_cap_immutable_on_existing_labor";
+    err.labor_id = laborId;
+    err.runtime = runtime;
+    err.next_steps = [
+      { step: 1, run: unpublishCommand, why: "Mark the existing listing inactive so labor-start can publish a new one." },
+      { step: 2, run: restartCommand, why: "Re-publish with the new cap and serve in one go." },
+    ];
+    throw err;
   }
 
   return commandLaborServe(
@@ -1013,7 +1048,18 @@ async function commandLaborServe(options, deps) {
 
   async function waitForActiveHire() {
     while (!stopRequested) {
-      const hires = await requestJson(sellerDeps, "GET", `/labor/${laborId}/hires?status=active`, {});
+      const hires = await Promise.race([
+        withTimeout(
+          requestJson(sellerDeps, "GET", `/labor/${laborId}/hires?status=active`, {}),
+          LABOR_CONTROL_TIMEOUT_MS,
+          "labor active hire poll",
+        ),
+        stop.then(() => {
+          requestStop();
+          return null;
+        }),
+      ]);
+      if (!hires) return null;
       const active = (hires.items || [])[0] || null;
       if (active) return active;
       await interruptibleSleep(5000);

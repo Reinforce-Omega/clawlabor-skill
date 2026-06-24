@@ -4246,7 +4246,9 @@ test("labor-agents gives a complete publish command before a labor exists", asyn
   assert.equal(claude.publish_command.includes("<"), false);
   assert.equal(claude.publish_command.includes("--gatekeeper"), false);
   assert.equal(claude.serve_command, undefined);
-  assert.equal(claude.start_command, "clawlabor labor-start --runtime claude");
+  // No existing labor → start_command embeds the suggested daily rate so the
+  // agent can fire it off without lookups. Claude has no suggested token cap.
+  assert.match(claude.start_command, /^clawlabor labor-start --runtime claude --daily-rate \d+$/);
   assert.equal(claude.start_command.includes("<"), false);
 });
 
@@ -5162,9 +5164,43 @@ test("labor-serve waits for an active hire before provisioning a sandbox", async
   assert.ok(!calls.some((call) => call.url.endsWith("/labor/hire-1/accept")));
 });
 
+test("labor-serve Ctrl+C exits while active-hire poll is pending", async () => {
+  const stop = deferred();
+  let pollStarted = false;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        pollStarted = true;
+        stop.resolve();
+        return new Promise(() => {});
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.equal(pollStarted, true);
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
+});
+
 test("labor-serve keeps the labor seat online across sequential hires", async () => {
   const stop = deferred();
   let hirePolls = 0;
+  let stopTriggered = false;
   const { fetch, calls } = recordingFetch([
     matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
     {
@@ -5174,6 +5210,10 @@ test("labor-serve keeps the labor seat online across sequential hires", async ()
         if (hirePolls === 1) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
         if (hirePolls === 2) return { status: 200, body: '{"items":[]}' };
         if (hirePolls === 3) return { status: 200, body: '{"items":[{"id":"hire-2","status":"active"}]}' };
+        if (hirePolls === 5 && !stopTriggered) {
+          stopTriggered = true;
+          stop.resolve();
+        }
         return { status: 200, body: '{"items":[]}' };
       },
     },
@@ -5189,13 +5229,7 @@ test("labor-serve keeps the labor seat online across sequential hires", async ()
     matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
     matchRoute("POST", "/labor/hires/hire-2/heartbeat", { status: 204, body: "" }),
     matchRoute("DELETE", "/labor/hires/hire-1/serve", { status: 204, body: "" }),
-    {
-      match: ({ url, options }) => options.method === "DELETE" && url.endsWith("/labor/hires/hire-2/serve"),
-      respond: () => {
-        stop.resolve();
-        return { status: 204, body: "" };
-      },
-    },
+    matchRoute("DELETE", "/labor/hires/hire-2/serve", { status: 204, body: "" }),
     matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
   ]);
   await runCli(
@@ -5219,6 +5253,7 @@ test("labor-serve keeps the labor seat online across sequential hires", async ()
   );
   assert.deepEqual(hireServeCalls.map((call) => call.url.match(/hire-\d/)[0]), ["hire-1", "hire-2"]);
   assert.equal(laborSeatDeletes.length, 1);
+  assert.equal(stopTriggered, true);
   assert.ok(calls.findIndex((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE") <
     calls.findIndex((call) => call.url.endsWith("/labor/hires/hire-2/serve") && call.options.method === "POST"));
 });
@@ -5376,6 +5411,7 @@ test("resolveRuntimeSandboxCredentials: opencode missing auth throws actionable 
 
 test("labor-serve --runtime opencode mounts auth.json ro and installs opencode", async () => {
   const spawned = [];
+  const stop = deferred();
   let hirePolls = 0;
   const { fetch } = recordingFetch([
     matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
@@ -5383,6 +5419,7 @@ test("labor-serve --runtime opencode mounts auth.json ro and installs opencode",
     { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc/hires"),
       respond: () => {
         hirePolls += 1;
+        if (hirePolls > 1) stop.resolve();
         return { status: 200, body: hirePolls === 1
           ? JSON.stringify({ items: [{ id: "hire-oc", status: "active" }] })
           : JSON.stringify({ items: [] }) };
@@ -5399,7 +5436,7 @@ test("labor-serve --runtime opencode mounts auth.json ro and installs opencode",
     fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
     spawn: (cmd, args) => { spawned.push({ cmd, args }); return { kill() {}, once() {}, pid: 123 }; },
     sleep: async () => {},
-    waitForExit: () => Promise.resolve(),
+    waitForExit: () => stop.promise,
     stdout: () => {},
   });
   const dockerRun = spawned.find((s) => s.cmd === "docker" && s.args.includes("run"));
@@ -5502,9 +5539,36 @@ test("labor-agents marks opencode serveable when CLI + auth present", async () =
   });
   const oc = JSON.parse(out.join("")).agents.find((a) => a.runtime === "opencode");
   assert.equal(oc.can_serve, true);
+  assert.equal(oc.suggested_daily_token_cap, 1_000_000);
+  assert.match(oc.publish_command, /--runtime opencode/);
+  assert.match(oc.publish_command, /--daily-token-cap 1000000/);
+  assert.match(oc.start_command, /--daily-rate \d+/);
+  assert.match(oc.start_command, /--daily-token-cap 1000000/);
+});
+
+test("labor-agents does not suggest a daily_token_cap for non-opencode runtimes", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(["labor-agents"], {
+    ...laborAgentsDeps(fetch, out),
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+  });
+  const parsed = JSON.parse(out.join(""));
+  for (const a of parsed.agents) {
+    if (a.runtime === "opencode") continue;
+    assert.equal(a.suggested_daily_token_cap, undefined, `${a.runtime} should not suggest a token cap`);
+    if (a.publish_command) {
+      assert.doesNotMatch(a.publish_command, /--daily-token-cap/);
+    }
+    if (a.start_command) {
+      assert.doesNotMatch(a.start_command, /--daily-token-cap/);
+    }
+  }
 });
 
 test("labor-start --runtime opencode publishes missing opencode labor then serves", async () => {
+  const stop = deferred();
   const { fetch, calls } = recordingFetch([
     matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
     matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
@@ -5512,7 +5576,10 @@ test("labor-start --runtime opencode publishes missing opencode labor then serve
     matchRoute("PUT", "/labor/labor-oc", { status: 200, body: JSON.stringify({ id: "labor-oc", name: "OpenCode Labor", status: "available" }) }),
     matchRoute("POST", "/labor/labor-oc/serve", { status: 204, body: "" }),
     { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc/hires"),
-      respond: { status: 200, body: JSON.stringify({ items: [] }) } },
+      respond: () => {
+        stop.resolve();
+        return { status: 200, body: JSON.stringify({ items: [] }) };
+      } },
     matchRoute("DELETE", "/labor/labor-oc/serve", { status: 204, body: "" }),
   ]);
   await runCli(["labor-start", "--runtime", "opencode"], {
@@ -5526,7 +5593,7 @@ test("labor-start --runtime opencode publishes missing opencode labor then serve
     },
     spawn: () => ({ kill() {}, once() {}, pid: 1 }),
     sleep: async () => {},
-    waitForExit: () => Promise.resolve(),
+    waitForExit: () => stop.promise,
     stdout: () => {},
   });
   assert.ok(calls.some((c) => c.url.endsWith("/labor") && c.options.method === "POST"), "published");
@@ -5536,6 +5603,7 @@ test("labor-start --runtime opencode publishes missing opencode labor then serve
 });
 
 test("labor-start --runtime opencode forwards --daily-token-cap when publishing a new labor", async () => {
+  const stop = deferred();
   const { fetch, calls } = recordingFetch([
     matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
     matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
@@ -5543,7 +5611,10 @@ test("labor-start --runtime opencode forwards --daily-token-cap when publishing 
     matchRoute("PUT", "/labor/labor-oc-cap", { status: 200, body: JSON.stringify({ id: "labor-oc-cap", name: "OpenCode Labor", status: "available" }) }),
     matchRoute("POST", "/labor/labor-oc-cap/serve", { status: 204, body: "" }),
     { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc-cap/hires"),
-      respond: { status: 200, body: JSON.stringify({ items: [] }) } },
+      respond: () => {
+        stop.resolve();
+        return { status: 200, body: JSON.stringify({ items: [] }) };
+      } },
     matchRoute("DELETE", "/labor/labor-oc-cap/serve", { status: 204, body: "" }),
   ]);
   await runCli(["labor-start", "--runtime", "opencode", "--daily-token-cap", "10k"], {
@@ -5557,7 +5628,7 @@ test("labor-start --runtime opencode forwards --daily-token-cap when publishing 
     },
     spawn: () => ({ kill() {}, once() {}, pid: 1 }),
     sleep: async () => {},
-    waitForExit: () => Promise.resolve(),
+    waitForExit: () => stop.promise,
     stdout: () => {},
   });
   const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
@@ -5575,9 +5646,10 @@ test("labor-start rejects --daily-token-cap when reusing an existing labor", asy
       }),
     }),
   ]);
+  let captured;
   await assert.rejects(
     runCli(
-      ["labor-start", "--runtime", "opencode", "--daily-token-cap", "10k"],
+      ["labor-start", "--runtime", "opencode", "--daily-rate", "50", "--daily-token-cap", "10k"],
       {
         env: { ...BASE_ENV, HOME: "/home/seller" },
         fetch,
@@ -5590,7 +5662,20 @@ test("labor-start rejects --daily-token-cap when reusing an existing labor", asy
         stdout: () => {},
       },
     ),
-    /daily-token-cap/,
+    (err) => {
+      captured = err;
+      return /labor's cap is fixed at publish time/.test(err.message);
+    },
+  );
+  assert.equal(captured.errorCode, "labor_cap_immutable_on_existing_labor");
+  assert.equal(captured.labor_id, "labor-existing");
+  assert.equal(captured.runtime, "opencode");
+  assert.deepEqual(
+    captured.next_steps.map((s) => ({ step: s.step, run: s.run })),
+    [
+      { step: 1, run: "clawlabor labor-unpublish --labor labor-existing" },
+      { step: 2, run: "clawlabor labor-start --runtime opencode --daily-rate 50 --daily-token-cap 10k" },
+    ],
   );
 });
 

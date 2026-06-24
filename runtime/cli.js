@@ -116,9 +116,16 @@ function parseArgs(argv) {
 
 function waitForSignals() {
   return new Promise((resolve) => {
-    const shutdown = () => resolve();
-    process.once("SIGINT", shutdown);
-    process.once("SIGTERM", shutdown);
+    let resolved = false;
+    const shutdown = () => {
+      if (resolved) return;
+      resolved = true;
+      process.off("SIGINT", shutdown);
+      process.off("SIGTERM", shutdown);
+      resolve();
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
   });
 }
 
