@@ -806,17 +806,24 @@ async function commandLaborStart(options, deps) {
       claude: { name: "Claude Code Labor", description: "Claude Code Labor backed by the local Claude Code Sandbox runtime." },
       opencode: { name: "OpenCode Labor", description: "OpenCode Labor backed by the local OpenCode Sandbox runtime." },
     }[runtime] || { name: `${runtime} Labor`, description: `${runtime} Labor backed by the local sandbox runtime.` };
-    const publishOut = await commandLaborPublish(
-      {
-        runtime,
-        name: options.name || defaults.name,
-        description: options.description || defaults.description,
-        "daily-rate": options["daily-rate"] || String(DEFAULT_DAILY_RATE_UAT),
-        tier: options.tier,
-      },
-      deps,
-    );
+    const publishOptions = {
+      runtime,
+      name: options.name || defaults.name,
+      description: options.description || defaults.description,
+      "daily-rate": options["daily-rate"] || String(DEFAULT_DAILY_RATE_UAT),
+      tier: options.tier,
+    };
+    if (options["daily-token-cap"] !== undefined) {
+      publishOptions["daily-token-cap"] = options["daily-token-cap"];
+    }
+    const publishOut = await commandLaborPublish(publishOptions, deps);
     laborId = JSON.parse(publishOut).labor_resource_id;
+  } else if (options["daily-token-cap"] !== undefined) {
+    throw new Error(
+      `Cannot set --daily-token-cap on an existing labor (${laborId}); labor-start reuses the existing listing. ` +
+      "Unpublish it first (`clawlabor labor-unpublish --labor " + laborId + "`) and re-run labor-start, " +
+      "or update the cap via `clawlabor labor-update` (not yet implemented).",
+    );
   }
 
   return commandLaborServe(

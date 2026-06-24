@@ -5535,6 +5535,65 @@ test("labor-start --runtime opencode publishes missing opencode labor then serve
   assert.equal(JSON.parse(create.options.body).runtime, "opencode");
 });
 
+test("labor-start --runtime opencode forwards --daily-token-cap when publishing a new labor", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-oc-cap", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-oc-cap", { status: 200, body: JSON.stringify({ id: "labor-oc-cap", name: "OpenCode Labor", status: "available" }) }),
+    matchRoute("POST", "/labor/labor-oc-cap/serve", { status: 204, body: "" }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc-cap/hires"),
+      respond: { status: 200, body: JSON.stringify({ items: [] }) } },
+    matchRoute("DELETE", "/labor/labor-oc-cap/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(["labor-start", "--runtime", "opencode", "--daily-token-cap", "10k"], {
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fetch,
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+    spawnSync: (cmd, args) => {
+      const tool = cmd === "sh" ? args[3] : cmd;
+      const status = ["claude", "codex", "opencode", "docker", "cloudflared"].includes(tool) ? 0 : 1;
+      return { status, stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} 1.0`, stderr: "" };
+    },
+    spawn: () => ({ kill() {}, once() {}, pid: 1 }),
+    sleep: async () => {},
+    waitForExit: () => Promise.resolve(),
+    stdout: () => {},
+  });
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  assert.equal(JSON.parse(create.options.body).daily_token_cap, 10_000);
+});
+
+test("labor-start rejects --daily-token-cap when reusing an existing labor", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{ id: "labor-existing", runtime: "opencode", status: "available", seller_agent_id: "seller-1" }],
+        next_cursor: null,
+      }),
+    }),
+  ]);
+  await assert.rejects(
+    runCli(
+      ["labor-start", "--runtime", "opencode", "--daily-token-cap", "10k"],
+      {
+        env: { ...BASE_ENV, HOME: "/home/seller" },
+        fetch,
+        fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+        spawnSync: (cmd, args) => {
+          const tool = cmd === "sh" ? args[3] : cmd;
+          const status = ["claude", "codex", "opencode", "docker", "cloudflared"].includes(tool) ? 0 : 1;
+          return { status, stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} 1.0`, stderr: "" };
+        },
+        stdout: () => {},
+      },
+    ),
+    /daily-token-cap/,
+  );
+});
+
 test("labor-serve removes the hire state volume after the platform accepts teardown", async () => {
   const spawnSyncCalls = [];
   const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
