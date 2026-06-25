@@ -146,7 +146,7 @@ async function resolveRuntimeSandboxCredentials(runtime, deps) {
     const claudeOauth = await resolveClaudeCodeOauthToken(deps);
     if (!claudeOauth.token) {
       const authHint = claudeOauth.authStatusOk
-        ? "Claude Code is logged in, but no fresh local claude.ai OAuth token was available. Open Claude Code once or wait for any Claude session limit to reset, then retry."
+        ? "Claude Code is logged in, but the local claude.ai OAuth access token is missing or expired. Run `claude setup-token`, then retry `clawlabor labor-start --runtime claude`."
         : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription.";
       throw new Error(`labor-serve requires a working local Claude Code claude.ai subscription login. ${authHint}`);
     }
@@ -508,7 +508,7 @@ async function claudeRuntimeAgent(deps) {
       detail: claudeOauth.token
         ? "Claude Code claude.ai OAuth token is available"
         : claudeOauth.authStatusOk
-          ? "Claude Code auth status passed, but no fresh local claude.ai OAuth token was available"
+          ? "Claude Code auth status passed, but the local claude.ai OAuth access token is missing or expired. Run `claude setup-token`, then retry `clawlabor labor-start --runtime claude`."
           : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription.",
     },
     ...sharedServeRequirements,
@@ -816,11 +816,20 @@ async function commandLaborStart(options, deps) {
   }
 
   // Readiness: reuse the labor-agents inventory for the chosen runtime.
-  const inventory = JSON.parse(await commandLaborAgents({}, deps));
+  const inventory = JSON.parse(await commandLaborAgents({ verbose: true }, deps));
   const agent = (inventory.agents || []).find((a) => a.runtime === runtime);
-  if (!agent || !agent.can_serve) {
+  const canServe = Boolean(agent && (agent.can_serve || agent.ready_to_serve));
+  if (!agent || !canServe) {
+    const failedRequirements = Array.isArray(agent && agent.requirements)
+      ? agent.requirements.filter((item) => item && item.status !== "pass")
+      : [];
     const needs = (agent && agent.needs) ? agent.needs.join(", ") : "runtime not serveable";
-    throw new Error(`Cannot start ${runtime} labor yet; ${needs}. Run \`clawlabor labor-agents --verbose\` for diagnostics.`);
+    const details = failedRequirements
+      .map((item) => item.detail)
+      .filter(Boolean)
+      .join(" ");
+    const hint = details ? ` ${details}` : " Run `clawlabor labor-agents --verbose` for diagnostics.";
+    throw new Error(`Cannot start ${runtime} labor yet; ${needs}.${hint}`);
   }
 
   const existing = existingLaborByRuntime(

@@ -4299,6 +4299,65 @@ test("labor-agents --verbose keeps diagnostic detail", async () => {
   assert.equal(opencode.serve_status, "needs_opencode_auth");
 });
 
+test("labor-agents --verbose explains expired Claude OAuth token recovery", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents", "--verbose"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      readClaudeOauthToken: () => null,
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          authMethod: "claude.ai",
+          apiProvider: "firstParty",
+          email: "seller@example.com",
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents.find((agent) => agent.runtime === "claude");
+  const oauthRequirement = claude.requirements.find((item) => item.name === "claude_code_oauth");
+  assert.equal(claude.ready_to_serve, false);
+  assert.equal(oauthRequirement.status, "fail");
+  assert.match(oauthRequirement.detail, /claude setup-token/);
+  assert.match(oauthRequirement.detail, /clawlabor labor-start --runtime claude/);
+  assert.doesNotMatch(oauthRequirement.detail, /CLAUDE_CODE_OAUTH_TOKEN/);
+});
+
+test("labor-start explains expired Claude OAuth token recovery", async () => {
+  const { fetch } = laborAgentsFetch();
+  await assert.rejects(
+    () => runCli(
+      ["labor-start", "--runtime", "claude"],
+      {
+        ...laborAgentsDeps(fetch, []),
+        readClaudeOauthToken: () => null,
+        runClaudeAuthStatus: async () => ({
+          ok: true,
+          account: {
+            loggedIn: true,
+            authMethod: "claude.ai",
+            apiProvider: "firstParty",
+            email: "seller@example.com",
+            orgId: "org-123",
+            orgName: "Seller Team",
+            subscriptionType: "team",
+          },
+        }),
+      },
+    ),
+    /claude setup-token.*clawlabor labor-start --runtime claude/,
+  );
+});
+
 test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats, and tears down", async () => {
   const spawned = [];
   const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
