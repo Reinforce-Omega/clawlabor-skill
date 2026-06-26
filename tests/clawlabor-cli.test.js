@@ -16,11 +16,18 @@ const {
   parseDeliveryNote,
   COMMANDS,
 } = require("../runtime/cli");
+const {
+  isExpired,
+  readClaudeCodeKeychainCredentials,
+  readClaudeOauthToken,
+  resolveClaudeCodeOauthToken,
+} = require("../runtime/claude_auth");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 
 const BASE_ENV = {
   CLAWLABOR_API_KEY: "test-key",
+  XDG_STATE_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-cli-state-")),
 };
 
 function tempTestFile(name) {
@@ -66,6 +73,21 @@ function deferred() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function laborServeStopAfterHireTeardown() {
+  const stop = deferred();
+  return {
+    stop,
+    route: {
+      match: ({ url, options }) =>
+        options.method === "DELETE" && /\/labor\/hires\/[^/]+\/serve$/.test(url),
+      respond: () => {
+        stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+  };
 }
 
 function createMockResponse() {
@@ -2757,6 +2779,60 @@ test("clawlabor install links agent dirs to the npm-global canonical when presen
   }
 });
 
+test("clawlabor install falls back to copy mode when canonical is a symlink", async () => {
+  // npm i -g . or npm link creates a symlink at the global package path.
+  // If we symlink agent skill dirs to that, writes go straight to the source repo.
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-symlink-canonical-"));
+  const fakeNpmRoot = path.join(tmpRoot, "node_modules");
+  const realSourceDir = path.join(tmpRoot, "real-source");
+  const fakeCanonical = path.join(fakeNpmRoot, "clawlabor");
+
+  // Create a "source repo" with enough files to be copyable.
+  fs.mkdirSync(realSourceDir, { recursive: true });
+  fs.writeFileSync(path.join(realSourceDir, "package.json"), "{}\n");
+  fs.writeFileSync(path.join(realSourceDir, "SKILL.md"), "stub\n");
+  fs.mkdirSync(path.join(realSourceDir, "runtime"), { recursive: true });
+  fs.writeFileSync(path.join(realSourceDir, "runtime", "http.js"), "// stub\n");
+
+  // npm global "package" is a symlink pointing to the real source dir.
+  fs.mkdirSync(fakeNpmRoot, { recursive: true });
+  fs.symlinkSync(realSourceDir, fakeCanonical, "dir");
+
+  const tmpHome = path.join(tmpRoot, "home");
+  fs.mkdirSync(path.join(tmpHome, ".claude"), { recursive: true });
+
+  const originalHome = process.env.HOME;
+  const originalOverride = process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+  process.env.HOME = tmpHome;
+  process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = fakeNpmRoot;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    const out = [];
+    await runCli(["install", "--claude"], {
+      env: {},
+      fetch: async () => { throw new Error("install must not call API"); },
+      stdout: (text) => out.push(text),
+    });
+    const result = JSON.parse(out.join(""));
+    assert.equal(result.action, "install");
+    assert.equal(result.installed.length, 1, "should install for exactly one platform");
+    assert.equal(result.installed[0].mode, "copy", "must fall back to copy when canonical is a symlink");
+    assert.ok(!result.installed[0].target, "should not have a symlink target");
+
+    const skillDir = result.installed[0].dir;
+    const lstat = fs.lstatSync(skillDir);
+    assert.ok(lstat.isDirectory(), "skill dir should be a real directory, not a symlink");
+    assert.ok(fs.existsSync(path.join(skillDir, "SKILL.md")), "copied files must exist");
+  } finally {
+    console.log = originalLog;
+    if (originalHome) process.env.HOME = originalHome; else delete process.env.HOME;
+    if (originalOverride) process.env.CLAWLABOR_NPM_ROOT_OVERRIDE = originalOverride;
+    else delete process.env.CLAWLABOR_NPM_ROOT_OVERRIDE;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test("clawlabor install falls back to copy mode when canonical does not exist", async () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-copy-"));
   const fakeNpmRoot = path.join(tmpRoot, "node_modules");
@@ -3930,4 +4006,2442 @@ withSandboxHome("ensureUploadPathAllowed: CLAWLABOR_UPLOAD_BLOCKLIST extends the
     /CLAWLABOR_UPLOAD_BLOCKLIST/,
   );
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Labor mode: hire / labor-chat / labor-serve
+// ---------------------------------------------------------------------------
+
+test("hire posts a one-day labor hire and reports the frozen escrow", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/hire", {
+      status: 201,
+      body: JSON.stringify({
+        id: "hire-1", status: "pending_accept", labor_resource_id: "labor-9",
+        duration_days: 1, frozen_nano: 240000000000,
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["hire", "--listing", "labor-9", "--message", "hello"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(calls[0].url, "https://www.clawlabor.com/api/labor/hire");
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.labor_resource_id, "labor-9");
+  assert.equal(body.duration_days, 1); // one day, fixed
+  assert.equal(body.message, "hello");
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.hire_id, "hire-1");
+  assert.equal(parsed.duration_days, 1);
+  assert.equal(parsed.status, "pending_accept");
+});
+
+test("labor-chat streams the SSE reply as plain text", async () => {
+  const sse =
+    'event: chunk\ndata: {"text": "Boil "}\n\n' +
+    'event: chunk\ndata: {"text": "the egg 7 min."}\n\n' +
+    'event: done\ndata: {"session_id": "s1"}\n\n';
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/hire-1/messages/stream", { status: 200, body: sse }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-chat", "--hire", "hire-1", "--message", "how long to boil an egg?"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(JSON.parse(calls[0].options.body).content, "how long to boil an egg?");
+  assert.equal(out.join(""), "Boil the egg 7 min.");
+});
+
+test("labor-chat surfaces an SSE error event", async () => {
+  const sse = 'event: error\ndata: {"code": "seller_unreachable", "detail": "down"}\n\n';
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/hire-1/messages/stream", { status: 200, body: sse }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-chat", "--hire", "hire-1", "--message", "hi"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.error.code, "seller_unreachable");
+});
+
+function laborAgentsFetch() {
+  return recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        id: "seller-1",
+        agent_id: "agent_seller",
+        name: "Seller",
+        owner_email: "seller@example.com",
+        balance: "500.00",
+        frozen: "10.00",
+        is_online: true,
+      }),
+    }),
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{
+          id: "labor-claude",
+          seller_agent_id: "seller-1",
+          name: "Claude Labor",
+          status: "available",
+          runtime: "claude",
+          host_account_provider: "claude",
+          host_account_id: "org:org-123",
+        }],
+        next_cursor: null,
+      }),
+    }),
+  ]);
+}
+
+function laborAgentsDeps(fetch, out) {
+  return {
+    env: BASE_ENV,
+    fetch,
+    // Default: no local opencode auth (deterministic — tests that want opencode
+    // serveable override fs with existsSync -> true).
+    fs: { existsSync: () => false },
+    stdout: (t) => out.push(t),
+    readClaudeOauthToken: () => "oauth-token-123",
+    runClaudeAuthStatus: async () => ({
+      ok: true,
+      account: {
+        loggedIn: true,
+        authMethod: "claude.ai",
+        apiProvider: "firstParty",
+        email: "seller@example.com",
+        orgId: "org-123",
+        orgName: "Seller Team",
+        subscriptionType: "team",
+      },
+    }),
+    spawnSync: (cmd, args) => {
+      const tool = cmd === "sh" ? args[3] : cmd;
+      const status = ["claude", "codex", "opencode", "docker", "cloudflared"].includes(tool) ? 0 : 1;
+      return {
+        status,
+        stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} version ok`,
+        stderr: "",
+      };
+    },
+  };
+}
+
+test("labor-agents reports concise local runtime inventory by default", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(["labor-agents"], laborAgentsDeps(fetch, out));
+
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.action, "labor-agents");
+  assert.deepEqual(parsed.account, {
+    status: "authenticated",
+    name: "Seller",
+    balance: "500.00",
+    frozen: "10.00",
+    online: true,
+  });
+  assert.deepEqual(parsed.host.claude, {
+    provider: "claude",
+    label: "Seller Team (team)",
+    plan: "team",
+  });
+  assert.deepEqual(parsed.agents.map((agent) => agent.runtime), ["claude", "codex", "opencode"]);
+  const claude = parsed.agents[0];
+  assert.equal(claude.status, "ready_to_serve");
+  assert.equal(claude.can_publish, true);
+  assert.equal(claude.can_serve, true);
+  assert.match(claude.publish_command, /labor-publish/);
+  assert.equal(claude.publish_command.includes("<"), false);
+  assert.equal(claude.publish_command.includes("--gatekeeper"), false);
+  assert.equal(claude.labor_id, "labor-claude");
+  // start_command converges publish+serve into one command (serve_command removed).
+  assert.equal(claude.serve_command, undefined);
+  assert.equal(claude.start_command, "clawlabor labor-start --runtime claude");
+  assert.equal(claude.path, undefined);
+  assert.equal(claude.requirements, undefined);
+  const codex = parsed.agents[1];
+  assert.equal(codex.status, "publish_only");
+  assert.equal(codex.can_publish, true);
+  assert.equal(codex.can_serve, false);
+});
+
+test("labor-agents shows auth failure instead of null account fields", async () => {
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    laborAgentsDeps(
+      async (url) => {
+        if (url.endsWith("/agents/me")) {
+          return {
+            ok: false,
+            status: 401,
+            text: async () => JSON.stringify({ detail: "Invalid or expired token" }),
+          };
+        }
+        if (url.endsWith("/labor/list?limit=100")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ items: [], next_cursor: null }),
+          };
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      out,
+    ),
+  );
+  const parsed = JSON.parse(out.join(""));
+  assert.deepEqual(parsed.account, {
+    status: "unavailable",
+    api_base: DEFAULT_API_BASE,
+    reason: "unauthenticated",
+    next: "Run clawlabor auth status.",
+  });
+  assert.equal(parsed.account.name, undefined);
+  assert.equal(parsed.account.balance, undefined);
+});
+
+test("labor-agents gives a complete publish command before a labor exists", async () => {
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    laborAgentsDeps(
+      async (url) => {
+        if (url.endsWith("/agents/me")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({
+              id: "seller-1",
+              agent_id: "agent_seller",
+              name: "Seller",
+              balance: 500,
+              frozen: 0,
+            }),
+          };
+        }
+        if (url.endsWith("/labor/list?limit=100")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ items: [], next_cursor: null }),
+          };
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      out,
+    ),
+  );
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents[0];
+  assert.match(claude.publish_command, /--name 'Claude Code Labor'/);
+  assert.match(claude.publish_command, /--daily-rate 1/);
+  assert.equal(claude.publish_command.includes("<"), false);
+  assert.equal(claude.publish_command.includes("--gatekeeper"), false);
+  assert.equal(claude.serve_command, undefined);
+  // No existing labor → start_command embeds the suggested daily rate so the
+  // agent can fire it off without lookups. Claude has no suggested token cap.
+  assert.match(claude.start_command, /^clawlabor labor-start --runtime claude --daily-rate \d+$/);
+  assert.equal(claude.start_command.includes("<"), false);
+});
+
+test("labor-agents --verbose keeps diagnostic detail", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({
+        id: "seller-1",
+        agent_id: "agent_seller",
+        name: "Seller",
+        owner_email: "seller@example.com",
+        balance: "500.00",
+        frozen: "10.00",
+        is_online: true,
+      }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-agents", "--verbose"],
+    laborAgentsDeps(fetch, out),
+  );
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.action, "labor-agents");
+  assert.deepEqual(parsed.agents.map((agent) => agent.id), [
+    "claude-code-sandbox",
+    "codex-sandbox",
+    "opencode-sandbox",
+  ]);
+  const claude = parsed.agents[0];
+  assert.equal(claude.ready_to_publish, true);
+  assert.equal(claude.ready_to_serve, true);
+  assert.equal(claude.host_account.id, "org:org-123");
+  assert.equal(claude.host_account.plan, "team");
+  assert.match(claude.publish_command_template, /labor-publish/);
+  assert.equal(parsed.marketplace_agent.agent_id, "agent_seller");
+  // marketplace_agent is the raw /agents/me payload (balance is a UAT string).
+  assert.equal(parsed.marketplace_agent.balance, "500.00");
+  const codex = parsed.agents[1];
+  assert.equal(codex.present_on_path, true);
+  assert.equal(codex.ready_to_publish, true);
+  assert.equal(codex.ready_to_serve, false);
+  assert.equal(codex.serve_status, "candidate_not_wired_to_labor_serve");
+  const opencode = parsed.agents[2];
+  assert.equal(opencode.ready_to_publish, true);
+  assert.equal(opencode.ready_to_serve, false);
+  assert.equal(opencode.serve_status, "needs_opencode_auth");
+});
+
+test("labor-agents --verbose explains expired Claude OAuth token recovery", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents", "--verbose"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      readClaudeOauthToken: () => null,
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          authMethod: "claude.ai",
+          apiProvider: "firstParty",
+          email: "seller@example.com",
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents.find((agent) => agent.runtime === "claude");
+  const oauthRequirement = claude.requirements.find((item) => item.name === "claude_code_oauth");
+  assert.equal(claude.ready_to_serve, false);
+  assert.equal(oauthRequirement.status, "fail");
+  assert.match(oauthRequirement.detail, /claude setup-token/);
+  assert.match(oauthRequirement.detail, /clawlabor labor-start --runtime claude/);
+  assert.doesNotMatch(oauthRequirement.detail, /CLAUDE_CODE_OAUTH_TOKEN/);
+});
+
+test("labor-start explains expired Claude OAuth token recovery", async () => {
+  const { fetch } = laborAgentsFetch();
+  await assert.rejects(
+    () => runCli(
+      ["labor-start", "--runtime", "claude"],
+      {
+        ...laborAgentsDeps(fetch, []),
+        readClaudeOauthToken: () => null,
+        runClaudeAuthStatus: async () => ({
+          ok: true,
+          account: {
+            loggedIn: true,
+            authMethod: "claude.ai",
+            apiProvider: "firstParty",
+            email: "seller@example.com",
+            orgId: "org-123",
+            orgName: "Seller Team",
+            subscriptionType: "team",
+          },
+        }),
+      },
+    ),
+    /claude setup-token.*clawlabor labor-start --runtime claude/,
+  );
+});
+
+test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats, and tears down", async () => {
+  const spawned = [];
+  const spawnSyncCalls = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        spawnSyncCalls.push({ cmd, args });
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") {
+          return { status: 0, stdout: "", stderr: "" };
+        }
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.kill = function kill() {};
+        spawned.push(child);
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  // provisioned, started docker + cloudflared, heartbeat at least once, torn down
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "POST"));
+  assert.equal(spawned[0].cmd, "docker");
+  assert.match(spawned[0].args.join(" "), /--token='SBX'/); // sandbox_token passed to server
+  assert.ok(spawned[0].args.includes("--name"));
+  assert.ok(spawned[0].args.includes("clawlabor-hire-hire-1"));
+  assert.ok(spawned[0].args.includes("CLAWLABOR_AGENT_RUNTIME"));
+  assert.ok(spawned[0].args.includes("CLAUDE_CODE_OAUTH_TOKEN"));
+  assert.equal(spawned[0].opts.env.CLAWLABOR_AGENT_RUNTIME, "claude");
+  assert.ok(spawned[0].args.includes("-u"));
+  assert.ok(spawned[0].args.includes("root"));
+  assert.ok(spawned[0].args.includes("--entrypoint"));
+  assert.ok(spawned[0].args.includes("sh"));
+  assert.ok(spawned[0].args.includes("ryanxdocker/sandbox-clawlabor:0.4.3"));
+  assert.match(spawned[0].args.join(" "), /mkdir -p '\/home\/sandbox\/\.local' '\/home\/sandbox\/\.cache' '\/home\/sandbox\/\.config'/);
+  assert.match(spawned[0].args.join(" "), /chown sandbox:sandbox/);
+  assert.match(spawned[0].args.join(" "), /find '\/home\/sandbox\/\.claude' -mindepth 1\s+-exec chown sandbox:sandbox/);
+  assert.match(spawned[0].args.join(" "), /'\/home\/sandbox\/\.claude'/);
+  assert.match(spawned[0].args.join(" "), /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor install-agent 'claude'/);
+  assert.match(spawned[0].args.join(" "), /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor server/);
+  assert.match(spawned[0].args.join(" "), /sandbox-clawlabor server --token='SBX'/);
+  assert.ok(!spawned[0].args.includes("oauth-token-123"));
+  assert.equal(spawned[1].cmd, "cloudflared");
+  assert.ok(spawned[1].args.includes("TT")); // tunnel_token
+  assert.ok(spawned[1].args.includes("--no-autoupdate"));
+  assert.deepEqual(spawned[1].opts.stdio, ["ignore", "pipe", "pipe"]);
+  assert.equal(spawned[1].opts.detached, true);
+  assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
+  assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "image inspect ryanxdocker/sandbox-clawlabor:0.4.3"));
+  assert.ok(!spawnSyncCalls.some((c) => c.cmd === "docker" && c.args[0] === "pull"));
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/heartbeat")));
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"));
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "DELETE"));
+});
+
+test("labor-serve suppresses captured cloudflared logs during the tunnel grace period", async () => {
+  const spawned = [];
+  const stop = deferred();
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => {
+        if (url.startsWith("https://")) {
+          return { status: 503, body: '{"ok":false}' };
+        }
+        return { status: 200, body: '{"ok":true}' };
+      },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: () => {
+        stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill() {};
+        spawned.push(child);
+        if (cmd === "cloudflared") {
+          queueMicrotask(() => child.stderr.emit("data", Buffer.from("cf tunnel noisy line\n")));
+        }
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+    },
+  );
+
+  assert.ok(spawned.some((child) => child.cmd === "cloudflared" && child.opts.stdio[1] === "pipe"));
+  assert.doesNotMatch(out.join("\n"), /Recent cloudflared logs:/);
+  assert.doesNotMatch(out.join("\n"), /cf tunnel noisy line/);
+  assert.match(out.join("\n"), /allowing up to 180s/);
+  assert.doesNotMatch(out.join("\n"), /ready for work/);
+});
+
+test("labor-serve keeps heartbeat healthy during the tunnel availability grace period", async () => {
+  const stop = deferred();
+  const heartbeatBodies = [];
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => String(url).startsWith("https://")
+        ? { status: 503, body: "down" }
+        : { status: 200, body: '{"status":"ok"}' },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: ({ options }) => {
+        heartbeatBodies.push(JSON.parse(options.body));
+        stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill() {};
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+      now: () => 1000,
+    },
+  );
+
+  assert.deepEqual(heartbeatBodies, [{ healthy: true }]);
+  assert.match(out.join("\n"), /allowing up to 180s/);
+  assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
+});
+
+test("labor-serve reports tunnel error after the availability timeout", async () => {
+  const stop = deferred();
+  const heartbeatBodies = [];
+  let nowMs = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => String(url).startsWith("https://")
+        ? { status: 503, body: "down" }
+        : { status: 200, body: '{"status":"ok"}' },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: ({ options }) => {
+        heartbeatBodies.push(JSON.parse(options.body));
+        stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill() {};
+        if (cmd === "cloudflared") {
+          queueMicrotask(() => child.stderr.emit("data", Buffer.from("cf still unavailable\n")));
+        }
+        return child;
+      },
+      sleep: async () => {
+        nowMs = 181_000;
+      },
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+      now: () => nowMs,
+    },
+  );
+
+  assert.equal(heartbeatBodies.length, 1);
+  assert.equal(heartbeatBodies[0].healthy, false);
+  assert.equal(heartbeatBodies[0].error.reason, "tunnel_unreachable");
+  assert.match(heartbeatBodies[0].error.detail, /Public tunnel health check failed/);
+  assert.deepEqual(heartbeatBodies[0].error.recent_cloudflared_logs, ["cf still unavailable"]);
+  assert.match(out.join("\n"), /more than 180s; reporting OFFLINE/);
+});
+
+test("labor-serve pulls the pinned sandbox image when it is missing locally", async () => {
+  const spawned = [];
+  const spawnSyncCalls = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        spawnSyncCalls.push({ cmd, args });
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 1 };
+        if (cmd === "docker" && args[0] === "pull") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        spawned.push({ cmd, args, opts });
+        return { kill() {} };
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "pull ryanxdocker/sandbox-clawlabor:0.4.3"));
+  assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.includes("ryanxdocker/sandbox-clawlabor:0.4.3")));
+});
+
+test("labor-serve keeps the startup seller API key for long-running requests", async () => {
+  const seenAuth = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: { ...BASE_ENV },
+      fetch: async (url, options) => {
+        if (url.endsWith("/labor/labor-9/serve") || url.endsWith("/labor/hires/hire-1/heartbeat") || url.endsWith("/labor/hires/hire-1/serve")) {
+          seenAuth.push(options.headers.Authorization);
+        }
+        return fetch(url, options);
+      },
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+  assert.deepEqual([...new Set(seenAuth)], ["Bearer test-key"]);
+});
+
+test("labor-serve heartbeat is not blocked by a slow active-hire poll", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls === 1) {
+          return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        }
+        if (hirePolls === 2) {
+          return new Promise((resolve) => {
+            setTimeout(() => resolve({ status: 200, body: '{"items":[]}' }), 1);
+          });
+        }
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE"));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
+});
+
+test("labor-serve uses Cloudflare DNS fallback before marking a public tunnel offline", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const out = [];
+  const { fetch: apiFetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch: async (url, options) => {
+        if (String(url).startsWith("https://hire-1.clawlabor.com/")) {
+          throw new Error("getaddrinfo ENOTFOUND hire-1.clawlabor.com");
+        }
+        return apiFetch(url, options);
+      },
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async (url, token) => (
+        url === "https://hire-1.clawlabor.com/v1/health" && token === "SBX"
+      ),
+    },
+  );
+
+  const heartbeat = calls.find((call) =>
+    call.options.method === "POST" && call.url.endsWith("/labor/hires/hire-1/heartbeat"),
+  );
+  assert.deepEqual(JSON.parse(heartbeat.options.body), { healthy: true });
+  assert.doesNotMatch(out.join("\n"), /reporting OFFLINE/);
+});
+
+test("labor-serve treats public health fallback exceptions as unhealthy", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  let nowMs = 0;
+  const { fetch: apiFetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch: async (url, options) => {
+        if (String(url).startsWith("https://hire-1.clawlabor.com/")) {
+          throw new Error("Cannot read properties of null (reading 'setServername')");
+        }
+        return apiFetch(url, options);
+      },
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {
+        nowMs = 181_000;
+      },
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => {
+        throw new Error("Cannot read properties of null (reading 'setServername')");
+      },
+      now: () => nowMs,
+    },
+  );
+
+  const heartbeat = calls.find((call) =>
+    call.options.method === "POST" && call.url.endsWith("/labor/hires/hire-1/heartbeat"),
+  );
+  assert.equal(JSON.parse(heartbeat.options.body).healthy, false);
+});
+
+test("labor-serve starts cloudflared only after sandbox local health is ready", async () => {
+  const heartbeatBodies = [];
+  const spawned = [];
+  let localHealthCalls = 0;
+  let hirePolls = 0;
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls <= 2
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) =>
+        (options.method || "GET") === "GET" &&
+        String(url).startsWith("http://127.0.0.1:2468/") &&
+        String(url).endsWith("/v1/health"),
+      respond: () => {
+        localHealthCalls += 1;
+        return localHealthCalls === 1
+          ? { status: 503, body: "starting" }
+          : { status: 200, body: '{"status":"ok"}' };
+      },
+    },
+    {
+      match: ({ url, options }) =>
+        (options.method || "GET") === "GET" &&
+        String(url).startsWith("https://hire-1.clawlabor.com/") &&
+        String(url).endsWith("/v1/health"),
+      respond: () => ({ status: 200, body: '{"status":"ok"}' }),
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: ({ options }) => {
+        heartbeatBodies.push(JSON.parse(options.body));
+        return { status: 204, body: "" };
+      },
+    },
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        spawned.push({ cmd, args, opts, localHealthCallsAtSpawn: localHealthCalls });
+        return { kill() {} };
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  const tunnelSpawn = spawned.find((child) => child.cmd === "cloudflared");
+  assert.ok(tunnelSpawn);
+  assert.equal(tunnelSpawn.localHealthCallsAtSpawn, 2);
+  assert.ok(heartbeatBodies.some((body) => body.healthy === true));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE"));
+});
+
+test("labor-serve does not start cloudflared when sandbox local health never becomes ready", async () => {
+  const heartbeatBodies = [];
+  const spawned = [];
+  let hirePolls = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 503, body: "starting" }),
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: ({ options }) => {
+        heartbeatBodies.push(JSON.parse(options.body));
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await assert.rejects(
+    () => runCli(
+      ["labor-serve", "--labor", "labor-9"],
+      {
+        env: BASE_ENV,
+        fetch,
+        stdout: (text) => out.push(text),
+        readClaudeOauthToken: () => "oauth-token-123",
+        spawnSync: (cmd, args) => {
+          if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+          return spawnSync(cmd, args);
+        },
+        spawn: (cmd, args, opts) => {
+          spawned.push({ cmd, args, opts });
+          return { kill() {} };
+        },
+        sleep: async () => {},
+        waitForExit: () => new Promise(() => {}),
+        sandboxStartupTimeoutMs: 2000,
+      },
+    ),
+    /Sandbox did not become locally healthy within 2s/,
+  );
+
+  assert.equal(spawned.some((child) => child.cmd === "cloudflared"), false);
+  assert.ok(spawned.some((child) => child.cmd === "docker" && child.args.includes("run")));
+  assert.ok(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
+  assert.equal(heartbeatBodies.length, 1);
+  assert.equal(heartbeatBodies[0].healthy, false);
+  assert.equal(heartbeatBodies[0].error.reason, "sandbox_unhealthy");
+  assert.match(out.join("\n"), /Waiting for sandbox local health before starting tunnel/);
+});
+
+test("labor-serve rejects a second local serve process for the same runtime", async () => {
+  const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-lock-test-"));
+  const lockDir = path.join(stateHome, "clawlabor");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(lockDir, "labor-serve-port-2468.lock"),
+    JSON.stringify({
+      pid: process.pid,
+      labor_id: "labor-existing",
+      runtime: "opencode",
+      port: 2468,
+      started_at: new Date().toISOString(),
+    }),
+  );
+
+  await assert.rejects(
+    () => runCli(
+      ["labor-serve", "--labor", "labor-9", "--runtime", "opencode"],
+      {
+        env: { ...BASE_ENV, XDG_STATE_HOME: stateHome },
+        fetch: async () => {
+          throw new Error("fetch should not be called when serve lock is held");
+        },
+        stdout: () => {},
+      },
+    ),
+    /Another clawlabor labor-serve is already using local port 2468/,
+  );
+});
+
+test("labor-serve reuses a running hire container instead of starting a replacement", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const spawned = [];
+  const out = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args.includes("inspect")) {
+          return { status: 0, stdout: "true\n" };
+        }
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = { cmd, args, opts, kills: [], kill(signal) { this.kills.push(signal || "SIGTERM"); } };
+        spawned.push(child);
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.ok(out.some((line) => line.includes("Reusing existing sandbox container clawlabor-hire-hire-1")));
+  assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.includes("run")), false);
+  assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"), false);
+  assert.ok(spawned.some((child) => child.cmd === "cloudflared"));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
+});
+
+test("labor-serve self-heals a missing active-hire sandbox container with the same state volume", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  let publicHealthCalls = 0;
+  let localHealthCalls = 0;
+  const spawned = [];
+  const out = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls <= 3) {
+          return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        }
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && String(url).endsWith("/v1/health"),
+      respond: ({ url }) => {
+        if (String(url).startsWith("https://")) {
+          publicHealthCalls += 1;
+          return publicHealthCalls === 2
+            ? { status: 503, body: "down" }
+            : { status: 200, body: '{"status":"ok"}' };
+        }
+        localHealthCalls += 1;
+        return localHealthCalls === 3
+          ? { status: 503, body: "down" }
+          : { status: 200, body: '{"status":"ok"}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") {
+          return { status: 0, stdout: "" };
+        }
+        if (cmd === "docker" && args[0] === "inspect") {
+          return { status: 1, stdout: "" };
+        }
+        if (cmd === "docker" && args.includes("restart")) {
+          return { status: 1, stdout: "" };
+        }
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = { cmd, args, opts, kills: [], kill(signal) { this.kills.push(signal || "SIGTERM"); } };
+        spawned.push(child);
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  const dockerRuns = spawned.filter((child) => child.cmd === "docker" && child.args.includes("run"));
+  assert.equal(dockerRuns.length, 2);
+  for (const run of dockerRuns) {
+    assert.ok(run.args.includes("clawlabor-hire-hire-1"));
+    assert.ok(run.args.includes("--mount"));
+    assert.ok(run.args.includes("type=volume,source=clawlabor-hire-hire-1-state,target=/home/sandbox/.claude"));
+  }
+  assert.ok(out.some((line) => line.includes("is not running; rebuilding it for the active hire")));
+  assert.ok(out.some((line) => line.includes("Sandbox container rebuilt and healthy.")));
+  const heartbeatBodies = calls
+    .filter((call) => call.options.method === "POST" && call.url.endsWith("/labor/hires/hire-1/heartbeat"))
+    .map((call) => JSON.parse(call.options.body));
+  assert.deepEqual(heartbeatBodies, [{ healthy: true }, { healthy: true }]);
+});
+
+test("labor-serve Ctrl+C stops local runtime and marks the labor seat offline", async () => {
+  const stop = deferred();
+  let hirePolls = 0;
+  let stopTriggered = false;
+  const sleeps = [];
+  const children = [];
+  const processGroupKills = [];
+  const out = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls === 1) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: (cmd, args, opts) => {
+        const child = {
+          cmd,
+          args,
+          opts,
+          pid: 1000 + children.length,
+          exitCode: null,
+          kills: [],
+          kill(signal) { this.kills.push(signal || "SIGTERM"); },
+          once(_event, cb) { this.exitCode = 0; cb(); },
+        };
+        children.push(child);
+        return child;
+      },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        if (ms === 60000 && !stopTriggered) {
+          stopTriggered = true;
+          stop.resolve();
+          return new Promise(() => {});
+        }
+      },
+      waitForExit: () => stop.promise,
+      killProcessGroup: (pid, signal) => { processGroupKills.push([pid, signal]); },
+    },
+  );
+  assert.equal(sleeps.includes(60000), true);
+  const tunnel = children.find((child) => child.cmd === "cloudflared");
+  const container = children.find((child) => child.cmd === "docker" && child.args.includes("run"));
+  assert.ok(out.some((line) => line.includes("Stopping Cloudflare tunnel")), out.join("\n"));
+  assert.equal(tunnel.opts.detached, true);
+  assert.deepEqual(processGroupKills, [[-tunnel.pid, "SIGTERM"]], out.join("\n"));
+  assert.deepEqual(container.kills, ["SIGTERM"]);
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
+  assert.ok(
+    !calls.some((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE"),
+    "Ctrl+C must not DELETE the hire's serve record while the hire is still active",
+  );
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
+});
+
+test("labor-start publishes missing Claude labor then serves it", async () => {
+  const spawned = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", name: "Seller" }),
+    }),
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    }),
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", name: "Seller" }),
+    }),
+    matchRoute("POST", "/labor", {
+      status: 201,
+      body: JSON.stringify({ id: "labor-new", status: "draft" }),
+    }),
+    matchRoute("PUT", "/labor/labor-new", {
+      status: 200,
+      body: JSON.stringify({ id: "labor-new", name: "Claude Code Labor", status: "available" }),
+    }),
+    matchRoute("POST", "/labor/labor-new/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-new/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-new","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-new/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-new", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-new.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-new/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-new/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-start", "--runtime", "claude"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          authMethod: "claude.ai",
+          apiProvider: "firstParty",
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+      spawnSync: (cmd, args) => {
+        const tool = cmd === "sh" ? args[3] : cmd;
+        return {
+          status: 0,
+          stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} version ok`,
+          stderr: "",
+        };
+      },
+      spawn: (cmd, args) => {
+        spawned.push({ cmd, args });
+        return { kill() {} };
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+  assert.equal(calls.some((call) => call.url.endsWith("/labor") && call.options.method === "POST"), true);
+  assert.equal(calls.some((call) => call.url.endsWith("/labor/labor-new/serve")), true);
+  assert.equal(spawned.some((item) => item.cmd === "docker"), true);
+  assert.match(out.join(""), /Hire hire-new public URL assigned: https:\/\/hire-new\.clawlabor\.com/);
+  assert.match(out.join(""), /public tunnel is reachable; ready for work/);
+});
+
+test("labor-publish creates and publishes a labor resource", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", agent_id: "agent_seller" }),
+    }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-7" }) }),
+    matchRoute("PUT", "/labor/labor-7", {
+      status: 200,
+      body: JSON.stringify({ id: "labor-7", status: "available", name: "Cook bot" }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-publish", "--name", "Cook bot", "--description", "rented cook",
+     "--daily-rate", "240", "--gatekeeper", "only cooking"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          email: "seller@example.com",
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+    },
+  );
+  const createBody = JSON.parse(calls[2].options.body);
+  assert.equal(createBody.daily_rate_uat, 240);
+  assert.equal(createBody.min_duration_days, 1); // one-day rentals only
+  assert.equal(createBody.max_duration_days, 1);
+  assert.equal(createBody.gatekeeper_prompt, "only cooking");
+  assert.equal(createBody.host_account_provider, "claude");
+  assert.equal(createBody.host_account_id, "org:org-123");
+  assert.equal(createBody.host_account_plan, "team");
+  assert.equal(JSON.parse(calls[3].options.body).status, "available");
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.labor_resource_id, "labor-7");
+  assert.equal(parsed.status, "available");
+});
+
+test("labor-publish applies the default gatekeeper when omitted", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", agent_id: "agent_seller" }),
+    }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-8" }) }),
+    matchRoute("PUT", "/labor/labor-8", {
+      status: 200,
+      body: JSON.stringify({ id: "labor-8", status: "available", name: "Cook bot" }),
+    }),
+  ]);
+  await runCli(
+    ["labor-publish", "--name", "Cook bot", "--description", "rented cook", "--daily-rate", "240"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+    },
+  );
+  const createBody = JSON.parse(calls[2].options.body);
+  assert.match(createBody.gatekeeper_prompt, /Accept only safe, legal, well-scoped requests/);
+});
+
+test("labor-publish blocks a duplicate active listing for the same runtime", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{
+          id: "labor-existing",
+          seller_agent_id: "seller-1",
+          name: "Existing",
+          status: "available",
+          runtime: "claude",
+        }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: "seller-1", agent_id: "agent_seller" }),
+    }),
+  ]);
+  await assert.rejects(
+    () => runCli(
+      ["labor-publish", "--name", "Cook bot", "--description", "rented cook", "--daily-rate", "240"],
+      {
+        env: BASE_ENV,
+        fetch,
+        stdout: () => {},
+        runClaudeAuthStatus: async () => ({
+          ok: true,
+          account: {
+            loggedIn: true,
+            orgId: "org-123",
+            orgName: "Seller Team",
+            subscriptionType: "team",
+          },
+        }),
+      },
+    ),
+    /Already have an active claude labor: labor-existing/,
+  );
+});
+
+test("labor-publish rejects runtimes without serve support (codex)", async () => {
+  const { fetch } = recordingFetch([]);
+  await assert.rejects(
+    () => runCli(
+      ["labor-publish", "--runtime", "codex", "--name", "Codex bot", "--description", "rented codex",
+       "--daily-rate", "240"],
+      {
+        env: BASE_ENV,
+        fetch,
+        stdout: () => {},
+        runClaudeAuthStatus: async () => ({ ok: false }),
+      },
+    ),
+    /has no labor-serve support yet/,
+  );
+});
+
+test("labor-list defaults to current seller resources", async () => {
+  const mine = "11111111-1111-1111-1111-111111111111";
+  const other = "22222222-2222-2222-2222-222222222222";
+  const laborItems = [
+    {
+      id: "labor-mine",
+      seller_agent_id: mine,
+      name: "Mine",
+      status: "available",
+      serve_status: "online",
+      daily_rate_nano: 100000000000,
+      tier: "tier_1",
+      created_at: "2026-06-17T00:00:00Z",
+      updated_at: "2026-06-17T00:00:00Z",
+    },
+    {
+      id: "labor-other",
+      seller_agent_id: other,
+      name: "Other",
+      status: "available",
+      serve_status: "offline",
+      daily_rate_nano: 200000000000,
+      tier: "tier_1",
+      created_at: "2026-06-17T00:00:00Z",
+      updated_at: "2026-06-17T00:00:00Z",
+    },
+  ];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100&status=available", {
+      status: 200,
+      body: JSON.stringify({ items: laborItems, next_cursor: null }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: mine, agent_id: "agent-mine", name: "Seller" }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-list", "--status", "available"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(calls[0].url, `${DEFAULT_API_BASE}/labor/list?limit=100&status=available`);
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.scope, "mine");
+  assert.equal(parsed.count, 1);
+  assert.equal(parsed.items[0].id, "labor-mine");
+  assert.equal(parsed.items[0].daily_rate_uat, "100.00");
+  assert.equal(Object.hasOwn(parsed.items[0], "daily_rate_nano"), false);
+  assert.equal(
+    parsed.items[0].management_commands.serve_command,
+    "clawlabor labor-serve --labor labor-mine",
+  );
+  assert.equal(
+    parsed.items[0].management_commands.unpublish_command,
+    "clawlabor labor-unpublish --labor labor-mine",
+  );
+  assert.equal(
+    parsed.management_commands.serve_command,
+    "clawlabor labor-serve --labor <labor_resource_id>",
+  );
+  assert.equal(
+    parsed.management_commands.unpublish_command,
+    "clawlabor labor-unpublish --labor <labor_resource_id>",
+  );
+});
+
+test("labor-list defaults to currently published resources", async () => {
+  const mine = "11111111-1111-1111-1111-111111111111";
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100&status=available", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{
+          id: "labor-live",
+          seller_agent_id: mine,
+          name: "Live labor",
+          status: "available",
+          serve_status: "offline",
+          daily_rate_nano: 100000000000,
+          tier: "tier_1",
+          created_at: "2026-06-17T00:00:00Z",
+          updated_at: "2026-06-17T00:00:00Z",
+        }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", {
+      status: 200,
+      body: JSON.stringify({ id: mine, name: "Seller" }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-list"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(calls[0].url, `${DEFAULT_API_BASE}/labor/list?limit=100&status=available`);
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.status, "available");
+  assert.equal(parsed.count, 1);
+  assert.equal(parsed.items[0].id, "labor-live");
+});
+
+test("labor-serve waits for an active hire before provisioning a sandbox", async () => {
+  let polls = 0;
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        polls += 1;
+        if (polls === 1) return { status: 200, body: '{"items":[]}' };
+        if (polls === 2) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    { env: BASE_ENV, fetch, stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }), sleep: async () => {}, waitForExit: () => stop.promise },
+  );
+  assert.equal(polls, 3);
+  assert.ok(!calls.some((call) => call.url.endsWith("/labor/hire-1/accept")));
+});
+
+test("labor-serve Ctrl+C exits while active-hire poll is pending", async () => {
+  const stop = deferred();
+  let pollStarted = false;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        pollStarted = true;
+        stop.resolve();
+        return new Promise(() => {});
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.equal(pollStarted, true);
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
+});
+
+test("labor-serve keeps the labor seat online across sequential hires", async () => {
+  const stop = deferred();
+  let hirePolls = 0;
+  let stopTriggered = false;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls === 1) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        if (hirePolls === 2) return { status: 200, body: '{"items":[]}' };
+        if (hirePolls === 3) return { status: 200, body: '{"items":[{"id":"hire-2","status":"active"}]}' };
+        if (hirePolls === 5 && !stopTriggered) {
+          stopTriggered = true;
+          stop.resolve();
+        }
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT1", sandbox_token: "SBX1", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("POST", "/labor/hires/hire-2/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-2", tunnel_token: "TT2", sandbox_token: "SBX2", hostname: "hire-2.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    matchRoute("POST", "/labor/hires/hire-2/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/hires/hire-1/serve", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/hires/hire-2/serve", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  const laborSeatDeletes = calls.filter((call) =>
+    call.options.method === "DELETE" && call.url.endsWith("/labor/labor-9/serve"),
+  );
+  const hireServeCalls = calls.filter((call) =>
+    call.options.method === "POST" && /\/labor\/hires\/hire-[12]\/serve$/.test(call.url),
+  );
+  assert.deepEqual(hireServeCalls.map((call) => call.url.match(/hire-\d/)[0]), ["hire-1", "hire-2"]);
+  assert.equal(laborSeatDeletes.length, 1);
+  assert.equal(stopTriggered, true);
+  assert.ok(calls.findIndex((call) => call.url.endsWith("/labor/hires/hire-1/serve") && call.options.method === "DELETE") <
+    calls.findIndex((call) => call.url.endsWith("/labor/hires/hire-2/serve") && call.options.method === "POST"));
+});
+
+test("readClaudeOauthToken reads valid Claude Code OAuth credentials and skips expired ones", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-claude-oauth-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  const credentialsFile = path.join(credentialsDir, ".credentials.json");
+  fs.writeFileSync(credentialsFile, JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "fresh-oauth-token",
+      expiresAt: Date.now() + 60_000,
+    },
+  }));
+  assert.equal(readClaudeOauthToken({ HOME: home }), "fresh-oauth-token");
+  fs.writeFileSync(credentialsFile, JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "expired-oauth-token",
+      expiresAt: Date.now() - 60_000,
+    },
+  }));
+  assert.equal(readClaudeOauthToken({ HOME: home }), null);
+  assert.equal(isExpired("2000-01-01T00:00:00Z"), true);
+});
+
+test("readClaudeOauthToken falls back to macOS keychain credentials", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-claude-keychain-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, ".credentials.json"), JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "expired-file-token",
+      expiresAt: Date.now() - 60_000,
+    },
+  }));
+  const token = readClaudeOauthToken(
+    { HOME: home },
+    Date.now(),
+    {
+      readClaudeCodeKeychainCredentials: () => JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "fresh-keychain-token",
+          expiresAt: Date.now() + 60_000,
+        },
+      }),
+    },
+  );
+  assert.equal(token, "fresh-keychain-token");
+});
+
+test("readClaudeCodeKeychainCredentials is disabled outside macOS", () => {
+  if (process.platform === "darwin") return;
+  assert.equal(readClaudeCodeKeychainCredentials({}), null);
+});
+
+test("resolveClaudeCodeOauthToken never runs claude setup-token", async () => {
+  const calls = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-no-setup-token-")) },
+    readClaudeOauthToken: () => null,
+    runClaudeAuthStatus: async () => {
+      calls.push(["auth", "status"]);
+      return { ok: true };
+    },
+  });
+  assert.equal(result.token, null);
+  assert.equal(result.authStatusOk, true);
+  assert.deepEqual(calls, [["auth", "status"]]);
+});
+
+test("labor-unpublish delists a resource (sets it inactive)", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("PUT", "/labor/labor-7", {
+      status: 200,
+      body: JSON.stringify({ id: "labor-7", status: "inactive", name: "Cook bot" }),
+    }),
+  ]);
+  const out = [];
+  await runCli(
+    ["labor-unpublish", "--labor", "labor-7"],
+    { env: BASE_ENV, fetch, stdout: (t) => out.push(t) },
+  );
+  assert.equal(JSON.parse(calls[0].options.body).status, "inactive");
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.labor_resource_id, "labor-7");
+  assert.equal(parsed.status, "inactive");
+});
+
+// --- opencode runtime: per-runtime sandbox credential seam (Task 1) ---
+const {
+  opencodeAuthPath,
+  resolveRuntimeSandboxCredentials,
+  runtimeStateInitCommand,
+  runtimeStateMounts,
+} = require("../runtime/commands/command-labor");
+
+test("opencodeAuthPath honors XDG_DATA_HOME then HOME", () => {
+  assert.equal(opencodeAuthPath({ XDG_DATA_HOME: "/x" }), "/x/opencode/auth.json");
+  assert.equal(opencodeAuthPath({ HOME: "/home/u" }), "/home/u/.local/share/opencode/auth.json");
+});
+
+test("runtimeStateMounts uses one hire-scoped volume source for every runtime", () => {
+  const claude = runtimeStateMounts("claude", "hire-123")[0];
+  const codex = runtimeStateMounts("codex", "hire-123")[0];
+  const opencode = runtimeStateMounts("opencode", "hire-123")[0];
+
+  assert.equal(claude.source, "clawlabor-hire-hire-123-state");
+  assert.equal(codex.source, claude.source);
+  assert.equal(opencode.source, claude.source);
+  assert.equal(claude.target, "/home/sandbox/.claude");
+  assert.equal(codex.target, "/home/sandbox/.codex");
+  assert.equal(opencode.target, "/home/sandbox/.local/share/opencode");
+});
+
+test("runtimeStateInitCommand fixes hire volume ownership before agent startup", () => {
+  const mounts = runtimeStateMounts("claude", "hire-123");
+  const command = runtimeStateInitCommand(mounts);
+
+  assert.match(command, /mkdir -p .*'\/home\/sandbox\/\.claude'/);
+  assert.match(command, /mkdir -p '\/home\/sandbox\/\.local' '\/home\/sandbox\/\.cache' '\/home\/sandbox\/\.config'/);
+  assert.match(command, /chown sandbox:sandbox .*'\/home\/sandbox\/\.claude'/);
+  assert.match(command, /find '\/home\/sandbox\/\.claude' -mindepth 1\s+-exec chown sandbox:sandbox/);
+});
+
+test("resolveRuntimeSandboxCredentials: claude returns oauth env, no mounts", async () => {
+  const creds = await resolveRuntimeSandboxCredentials("claude", {
+    env: {},
+    readClaudeOauthToken: () => "oauth-token-123",
+    runClaudeAuthStatus: async () => ({ ok: true, account: { loggedIn: true, authMethod: "claude.ai" } }),
+  });
+  assert.equal(creds.env.CLAUDE_CODE_OAUTH_TOKEN, "oauth-token-123");
+  assert.deepEqual(creds.mounts, []);
+});
+
+test("resolveRuntimeSandboxCredentials: opencode mounts auth.json read-only when present", async () => {
+  const creds = await resolveRuntimeSandboxCredentials("opencode", {
+    env: { HOME: "/home/seller" },
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+  });
+  assert.deepEqual(creds.env, {});
+  assert.deepEqual(creds.mounts, [{
+    host: "/home/seller/.local/share/opencode/auth.json",
+    container: "/home/sandbox/.local/share/opencode/auth.json",
+    ro: true,
+  }]);
+});
+
+test("resolveRuntimeSandboxCredentials: opencode missing auth throws actionable error", async () => {
+  await assert.rejects(
+    resolveRuntimeSandboxCredentials("opencode", { env: { HOME: "/home/seller" }, fs: { existsSync: () => false } }),
+    /opencode auth login/,
+  );
+});
+
+test("labor-serve --runtime opencode mounts auth.json ro and installs opencode", async () => {
+  const spawned = [];
+  const stop = deferred();
+  let hirePolls = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor/labor-oc/serve", { status: 204, body: "" }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc/hires"),
+      respond: () => {
+        hirePolls += 1;
+        if (hirePolls > 1) stop.resolve();
+        return { status: 200, body: hirePolls === 1
+          ? JSON.stringify({ items: [{ id: "hire-oc", status: "active" }] })
+          : JSON.stringify({ items: [] }) };
+      } },
+    matchRoute("POST", "/labor/hires/hire-oc/serve", { status: 200,
+      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "-SBX", hostname: "labor-hire-oc.clawlabor.com" }) }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-oc/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/hires/hire-oc/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(["labor-serve", "--labor", "labor-oc", "--runtime", "opencode"], {
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fetch,
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+    spawn: (cmd, args) => { spawned.push({ cmd, args }); return { kill() {}, once() {}, pid: 123 }; },
+    sleep: async () => {},
+    waitForExit: () => stop.promise,
+    stdout: () => {},
+  });
+  const dockerRun = spawned.find((s) => s.cmd === "docker" && s.args.includes("run"));
+  assert.ok(dockerRun, "docker run was spawned");
+  const joined = dockerRun.args.join(" ");
+  assert.match(joined, /-u root/);
+  assert.match(joined, /--mount type=volume,source=clawlabor-hire-hire-oc-state,target=\/home\/sandbox\/\.local\/share\/opencode/);
+  assert.match(joined, /-v \/home\/seller\/\.local\/share\/opencode\/auth\.json:\/home\/sandbox\/\.local\/share\/opencode\/auth\.json:ro/);
+  assert.match(joined, /chown sandbox:sandbox/);
+  assert.match(joined, /find '\/home\/sandbox\/\.local\/share\/opencode' -mindepth 1 ! -path '\/home\/sandbox\/\.local\/share\/opencode\/auth\.json' -exec chown sandbox:sandbox/);
+  assert.match(joined, /'\/home\/sandbox\/\.local\/share\/opencode'/);
+  assert.match(joined, /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor install-agent 'opencode'/);
+  assert.match(joined, /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor server/);
+  assert.match(joined, /sandbox-clawlabor server --token='-SBX'/);
+  assert.equal(dockerRun.args.includes("CLAUDE_CODE_OAUTH_TOKEN"), false);
+});
+
+test("labor-publish --runtime opencode creates a resource without host account", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-oc", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-oc", { status: 200, body: JSON.stringify({ id: "labor-oc", name: "OC", status: "available" }) }),
+  ]);
+  await runCli(
+    ["labor-publish", "--runtime", "opencode", "--name", "OC", "--description", "d", "--daily-rate", "20"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
+  );
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  const body = JSON.parse(create.options.body);
+  assert.equal(body.runtime, "opencode");
+  assert.equal(body.daily_rate_uat, 20);
+  assert.equal("host_account_provider" in body, false);
+});
+
+test("labor-publish forwards --daily-token-cap as an integer", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-tc", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-tc", { status: 200, body: JSON.stringify({ id: "labor-tc", name: "OC", status: "available" }) }),
+  ]);
+  await runCli(
+    ["labor-publish", "--runtime", "opencode", "--name", "OC", "--description", "d",
+     "--daily-rate", "20", "--daily-token-cap", "1.5m"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
+  );
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  const body = JSON.parse(create.options.body);
+  assert.equal(body.daily_token_cap, 1_500_000);
+});
+
+test("labor-publish omits daily_token_cap when --daily-token-cap is not provided", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-no-tc", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-no-tc", { status: 200, body: JSON.stringify({ id: "labor-no-tc", name: "OC", status: "available" }) }),
+  ]);
+  await runCli(
+    ["labor-publish", "--runtime", "opencode", "--name", "OC", "--description", "d", "--daily-rate", "20"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
+  );
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  const body = JSON.parse(create.options.body);
+  assert.equal("daily_token_cap" in body, false);
+});
+
+test("labor-publish rejects --daily-token-cap with bad suffix", async () => {
+  const { fetch } = recordingFetch([]);
+  await assert.rejects(
+    runCli(
+      ["labor-publish", "--runtime", "opencode", "--name", "OC", "--description", "d",
+       "--daily-rate", "20", "--daily-token-cap", "100x"],
+      { env: BASE_ENV, fetch, stdout: () => {} },
+    ),
+    /daily-token-cap/,
+  );
+});
+
+test("labor-publish rejects --daily-token-cap with --runtime claude (opencode-only enforcement)", async () => {
+  const { fetch } = recordingFetch([]);
+  await assert.rejects(
+    runCli(
+      ["labor-publish", "--runtime", "claude", "--name", "Claude bot", "--description", "d",
+       "--daily-rate", "20", "--daily-token-cap", "100k"],
+      { env: BASE_ENV, fetch, stdout: () => {} },
+    ),
+    /opencode-only/,
+  );
+});
+
+test("labor-agents marks opencode serveable when CLI + auth present", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(["labor-agents"], {
+    ...laborAgentsDeps(fetch, out),
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+  });
+  const oc = JSON.parse(out.join("")).agents.find((a) => a.runtime === "opencode");
+  assert.equal(oc.can_serve, true);
+  assert.equal(oc.suggested_daily_token_cap, 1_000_000);
+  assert.match(oc.publish_command, /--runtime opencode/);
+  assert.match(oc.publish_command, /--daily-token-cap 1000000/);
+  assert.match(oc.start_command, /--daily-rate \d+/);
+  assert.match(oc.start_command, /--daily-token-cap 1000000/);
+});
+
+test("labor-agents does not suggest a daily_token_cap for non-opencode runtimes", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(["labor-agents"], {
+    ...laborAgentsDeps(fetch, out),
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+  });
+  const parsed = JSON.parse(out.join(""));
+  for (const a of parsed.agents) {
+    if (a.runtime === "opencode") continue;
+    assert.equal(a.suggested_daily_token_cap, undefined, `${a.runtime} should not suggest a token cap`);
+    if (a.publish_command) {
+      assert.doesNotMatch(a.publish_command, /--daily-token-cap/);
+    }
+    if (a.start_command) {
+      assert.doesNotMatch(a.start_command, /--daily-token-cap/);
+    }
+  }
+});
+
+test("labor-start --runtime opencode publishes missing opencode labor then serves", async () => {
+  const stop = deferred();
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-oc", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-oc", { status: 200, body: JSON.stringify({ id: "labor-oc", name: "OpenCode Labor", status: "available" }) }),
+    matchRoute("POST", "/labor/labor-oc/serve", { status: 204, body: "" }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc/hires"),
+      respond: () => {
+        stop.resolve();
+        return { status: 200, body: JSON.stringify({ items: [] }) };
+      } },
+    matchRoute("DELETE", "/labor/labor-oc/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(["labor-start", "--runtime", "opencode"], {
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fetch,
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+    spawnSync: (cmd, args) => {
+      const tool = cmd === "sh" ? args[3] : cmd;
+      const status = ["claude", "codex", "opencode", "docker", "cloudflared"].includes(tool) ? 0 : 1;
+      return { status, stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} 1.0`, stderr: "" };
+    },
+    spawn: () => ({ kill() {}, once() {}, pid: 1 }),
+    sleep: async () => {},
+    waitForExit: () => stop.promise,
+    stdout: () => {},
+  });
+  assert.ok(calls.some((c) => c.url.endsWith("/labor") && c.options.method === "POST"), "published");
+  assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-oc/serve") && c.options.method === "POST"), "served seat");
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  assert.equal(JSON.parse(create.options.body).runtime, "opencode");
+});
+
+test("labor-start --runtime opencode forwards --daily-token-cap when publishing a new labor", async () => {
+  const stop = deferred();
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-oc-cap", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-oc-cap", { status: 200, body: JSON.stringify({ id: "labor-oc-cap", name: "OpenCode Labor", status: "available" }) }),
+    matchRoute("POST", "/labor/labor-oc-cap/serve", { status: 204, body: "" }),
+    { match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-oc-cap/hires"),
+      respond: () => {
+        stop.resolve();
+        return { status: 200, body: JSON.stringify({ items: [] }) };
+      } },
+    matchRoute("DELETE", "/labor/labor-oc-cap/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(["labor-start", "--runtime", "opencode", "--daily-token-cap", "10k"], {
+    env: { ...BASE_ENV, HOME: "/home/seller" },
+    fetch,
+    fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+    spawnSync: (cmd, args) => {
+      const tool = cmd === "sh" ? args[3] : cmd;
+      const status = ["claude", "codex", "opencode", "docker", "cloudflared"].includes(tool) ? 0 : 1;
+      return { status, stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} 1.0`, stderr: "" };
+    },
+    spawn: () => ({ kill() {}, once() {}, pid: 1 }),
+    sleep: async () => {},
+    waitForExit: () => stop.promise,
+    stdout: () => {},
+  });
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  assert.equal(JSON.parse(create.options.body).daily_token_cap, 10_000);
+});
+
+test("labor-start rejects --daily-token-cap when reusing an existing labor", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{ id: "labor-existing", runtime: "opencode", status: "available", seller_agent_id: "seller-1" }],
+        next_cursor: null,
+      }),
+    }),
+  ]);
+  let captured;
+  await assert.rejects(
+    runCli(
+      ["labor-start", "--runtime", "opencode", "--daily-rate", "50", "--daily-token-cap", "10k"],
+      {
+        env: { ...BASE_ENV, HOME: "/home/seller" },
+        fetch,
+        fs: { existsSync: (p) => p === "/home/seller/.local/share/opencode/auth.json" },
+        spawnSync: (cmd, args) => {
+          const tool = cmd === "sh" ? args[3] : cmd;
+          const status = ["claude", "codex", "opencode", "docker", "cloudflared"].includes(tool) ? 0 : 1;
+          return { status, stdout: cmd === "sh" ? `/usr/bin/${tool}\n` : `${tool} 1.0`, stderr: "" };
+        },
+        stdout: () => {},
+      },
+    ),
+    (err) => {
+      captured = err;
+      return /labor's cap is fixed at publish time/.test(err.message);
+    },
+  );
+  assert.equal(captured.errorCode, "labor_cap_immutable_on_existing_labor");
+  assert.equal(captured.labor_id, "labor-existing");
+  assert.equal(captured.runtime, "opencode");
+  assert.deepEqual(
+    captured.next_steps.map((s) => ({ step: s.step, run: s.run })),
+    [
+      { step: 1, run: "clawlabor labor-unpublish --labor labor-existing" },
+      { step: 2, run: "clawlabor labor-start --runtime opencode --daily-rate 50 --daily-token-cap 10k" },
+    ],
+  );
+});
+
+test("labor-serve removes the hire state volume after the platform accepts teardown", async () => {
+  const spawnSyncCalls = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: (cmd) => ({ cmd, kill() {} }),
+      spawnSync: (cmd, args) => {
+        spawnSyncCalls.push({ cmd, args });
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        if (cmd === "docker" && args[0] === "volume" && args[1] === "inspect") return { status: 0 };
+        if (cmd === "docker" && args[0] === "volume" && args[1] === "rm") return { status: 0 };
+        return { status: 1, stdout: "", stderr: "" };
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.ok(
+    calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"),
+    "natural teardown DELETE was called",
+  );
+  const inspect = spawnSyncCalls.find(
+    (c) => c.cmd === "docker" && c.args[0] === "volume" && c.args[1] === "inspect" && c.args[2] === "clawlabor-hire-hire-1-state",
+  );
+  assert.ok(inspect, "checks if hire state volume exists");
+  const rm = spawnSyncCalls.find(
+    (c) => c.cmd === "docker" && c.args[0] === "volume" && c.args[1] === "rm" && c.args[2] === "clawlabor-hire-hire-1-state",
+  );
+  assert.ok(rm, "removes the hire state volume after teardown");
+});
+
+test("labor-serve keeps the hire state volume on Ctrl+C while hire is still active", async () => {
+  const stop = deferred();
+  let stopTriggered = false;
+  const spawnSyncCalls = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: (cmd, args, opts) => ({
+        cmd, args, opts, pid: 4242, exitCode: null,
+        kill() {},
+        once(_e, cb) { this.exitCode = 0; cb(); },
+      }),
+      spawnSync: (cmd, args) => {
+        spawnSyncCalls.push({ cmd, args });
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return { status: 1, stdout: "", stderr: "" };
+      },
+      sleep: async (ms) => {
+        if (ms === 60000 && !stopTriggered) {
+          stopTriggered = true;
+          stop.resolve();
+          return new Promise(() => {});
+        }
+      },
+      waitForExit: () => stop.promise,
+      killProcessGroup: () => {},
+    },
+  );
+
+  assert.ok(
+    !calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"),
+    "Ctrl+C must not DELETE hires/serve while still active",
+  );
+  assert.ok(
+    !spawnSyncCalls.some((c) => c.cmd === "docker" && c.args[0] === "volume" && c.args[1] === "rm"),
+    "Ctrl+C must not remove the hire state volume",
+  );
+});
+
+test("labor-cleanup defaults to dry-run and lists stale volumes that would be removed", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{ id: "labor-9", seller_agent_id: "seller-1", name: "L", status: "available" }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1" }) }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: { status: 200, body: '{"items":[{"id":"hire-active","status":"active"}]}' },
+    },
+  ]);
+
+  const out = [];
+  await runCli(["labor-cleanup"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+    spawnSync: (cmd, args) => {
+      if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
+        return {
+          status: 0,
+          stdout: ["clawlabor-hire-hire-active-state", "clawlabor-hire-hire-stale-state", "some-other-volume", ""].join("\n"),
+          stderr: "",
+        };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    },
+  });
+
+  const result = JSON.parse(out[0]);
+  assert.equal(result.action, "labor-cleanup");
+  assert.equal(result.mode, "dry-run");
+  assert.equal(result.checked, 2);
+  assert.deepEqual(result.kept.map((k) => k.volume), ["clawlabor-hire-hire-active-state"]);
+  assert.deepEqual(result.removed.map((r) => r.volume), ["clawlabor-hire-hire-stale-state"]);
+  assert.equal(result.removed[0].dry_run, true);
+});
+
+test("labor-cleanup --apply removes stale volumes via docker volume rm", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{ id: "labor-9", seller_agent_id: "seller-1", name: "L", status: "available" }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1" }) }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: { status: 200, body: '{"items":[]}' },
+    },
+  ]);
+
+  const removed = [];
+  const out = [];
+  await runCli(["labor-cleanup", "--apply"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+    spawnSync: (cmd, args) => {
+      if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
+        return { status: 0, stdout: "clawlabor-hire-hire-stale-state\n", stderr: "" };
+      }
+      if (cmd === "docker" && args[0] === "volume" && args[1] === "rm") {
+        removed.push(args[2]);
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    },
+  });
+
+  assert.deepEqual(removed, ["clawlabor-hire-hire-stale-state"]);
+  const result = JSON.parse(out[0]);
+  assert.equal(result.mode, "apply");
+  assert.deepEqual(result.removed.map((r) => r.volume), ["clawlabor-hire-hire-stale-state"]);
+});
+
+test("labor-cleanup aborts when active hire lookup fails so live hires are safe", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{ id: "labor-9", seller_agent_id: "seller-1", name: "L", status: "available" }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1" }) }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: { status: 503, body: "down" },
+    },
+  ]);
+
+  const removed = [];
+  await assert.rejects(
+    runCli(["labor-cleanup", "--apply"], {
+      env: BASE_ENV,
+      fetch,
+      stdout: () => {},
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
+          return { status: 0, stdout: "clawlabor-hire-hire-stale-state\n", stderr: "" };
+        }
+        if (cmd === "docker" && args[0] === "volume" && args[1] === "rm") {
+          removed.push(args[2]);
+          return { status: 0 };
+        }
+        return { status: 1, stdout: "", stderr: "" };
+      },
+    }),
+    /could not list active hires/,
+  );
+  assert.deepEqual(removed, [], "no volume should be removed when active-hire lookup fails");
 });
