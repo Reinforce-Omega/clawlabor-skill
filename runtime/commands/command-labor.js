@@ -986,12 +986,13 @@ async function commandLaborServe(options, deps) {
     return null;
   }
 
-  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, cleanedUpRef }) {
+  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef }) {
     if (cleanedUpRef.value) return;
     cleanedUpRef.value = true;
     stdout(`Shutting down hire ${hireId} runtime...`);
 
     stdout("Stopping Cloudflare tunnel...");
+    tunnel = tunnelRuntime?.currentTunnel ? tunnelRuntime.currentTunnel() : tunnel;
     terminateProcessGroup(tunnel, "SIGTERM", deps);
     await forceKillProcess(tunnel, 3000, deps);
 
@@ -1072,9 +1073,10 @@ async function commandLaborServe(options, deps) {
     let tunnelGraceNoticePrinted = false;
     let healingSandbox = false;
     let tunnelAvailability = null;
+    let tunnelRuntime = null;
 
     async function cleanupCurrentHire() {
-      await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, cleanedUpRef });
+      await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef });
     }
     activeCleanupCurrentHire = cleanupCurrentHire;
     activeStopCleanupPromise = null;
@@ -1238,7 +1240,7 @@ async function commandLaborServe(options, deps) {
       throw new Error(`Sandbox did not become locally healthy within ${tunnelAvailabilityTimeoutSeconds(sandboxStartupTimeoutMs)}s: ${localHealthUrl}`);
     }
 
-    const tunnelRuntime = startCloudflareTunnel({
+    tunnelRuntime = startCloudflareTunnel({
       spawn,
       stdout,
       tunnelToken: tunnel_token,
