@@ -501,6 +501,7 @@ async function runCli(argv, injected = {}) {
     runClaudeAuthStatus: injected.runClaudeAuthStatus,
     probePublicHealthWithDnsFallback: injected.probePublicHealthWithDnsFallback,
     killProcessGroup: injected.killProcessGroup,
+    sandboxStartupTimeoutMs: injected.sandboxStartupTimeoutMs,
   };
   if (!deps.fetch) {
     throw new Error("This Node.js runtime does not provide fetch");
