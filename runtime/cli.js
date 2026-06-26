@@ -1,5 +1,5 @@
 const http = require("node:http");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const {
   ApiError,
   apiBase,
@@ -54,6 +54,8 @@ const {
   commandUploadAttachment,
   commandValidate,
   commandWait,
+  commandLaborAgents,
+  commandLaborList,
   ensureUploadPathAllowed,
   isUrlField,
   parseFileFlags,
@@ -62,6 +64,13 @@ const {
   pickCompatibleListing,
   stageAndUploadFile,
   validateRequirementAgainstSchema,
+  commandHire,
+  commandLaborChat,
+  commandLaborPublish,
+  commandLaborStart,
+  commandLaborUnpublish,
+  commandLaborServe,
+  commandLaborCleanup,
 } = require("./commands/core");
 
 const PKG_VERSION = require("../package.json").version;
@@ -107,9 +116,16 @@ function parseArgs(argv) {
 
 function waitForSignals() {
   return new Promise((resolve) => {
-    const shutdown = () => resolve();
-    process.once("SIGINT", shutdown);
-    process.once("SIGTERM", shutdown);
+    let resolved = false;
+    const shutdown = () => {
+      if (resolved) return;
+      resolved = true;
+      process.off("SIGINT", shutdown);
+      process.off("SIGTERM", shutdown);
+      resolve();
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
   });
 }
 
@@ -213,6 +229,99 @@ const COMMANDS = {
     section: "Procurement",
     summary: "Purchase a specific listing",
     usage: "buy --listing <listing_id> [--requirement-json '...'] [--input field=value]... [--file field=path]... [--idempotency-key KEY]",
+  },
+  hire: {
+    handler: commandHire,
+    section: "Labor",
+    summary: "Hire a labor resource for exclusive use for one day (freezes escrow)",
+    usage: "hire --listing <labor_resource_id> [--message \"...\"]",
+  },
+  "labor-chat": {
+    handler: commandLaborChat,
+    section: "Labor",
+    summary: "Send one message to a hire and print the agent's reply",
+    usage: "labor-chat --hire <hire_id> --message \"...\"",
+  },
+  "labor-publish": {
+    handler: commandLaborPublish,
+    section: "Labor",
+    summary: "Seller: create and publish a labor resource listing (priced per day, one-day rentals)",
+    usage: "labor-publish --name \"...\" --description \"...\" --daily-rate <uat_per_day> [--tier tier_1] [--gatekeeper \"...\"]",
+  },
+  "labor-agents": {
+    handler: commandLaborAgents,
+    section: "Labor",
+    summary: "Seller: inspect local runtimes that can back a labor listing",
+    usage: "labor-agents [--verbose]",
+  },
+  "labor-list": {
+    handler: commandLaborList,
+    section: "Labor",
+    summary: "Seller: list current account published labor resources",
+    usage: "labor-list [--status draft|available|occupied|inactive|all] [--all] [--limit 100] [--cursor CURSOR]",
+  },
+  "labor-unpublish": {
+    handler: commandLaborUnpublish,
+    section: "Labor",
+    summary: "Seller: delist a labor resource (set inactive; republish to re-list)",
+    usage: "labor-unpublish --labor <labor_resource_id>",
+  },
+  "labor-start": {
+    handler: commandLaborStart,
+    section: "Labor",
+    summary: "Seller: put a supported local runtime on duty, publishing first when needed",
+    usage: "labor-start [--runtime claude] [--name \"...\"] [--description \"...\"] [--daily-rate <uat_per_day>] [--port 2468] [--image <docker_image>]",
+  },
+  "labor-serve": {
+    handler: commandLaborServe,
+    section: "Labor",
+    summary: "Seller: provision a platform tunnel, run the sandbox + cloudflared, auto-accept hires, and heartbeat",
+    usage: "labor-serve --labor <labor_resource_id> [--runtime claude] [--port 2468] [--image <docker_image>]",
+  },
+  "labor-cleanup": {
+    handler: commandLaborCleanup,
+    section: "Labor",
+    summary: "Seller: remove leftover hire state volumes for hires that are no longer active (default dry-run)",
+    usage: "labor-cleanup [--apply]",
+  },
+  labor: {
+    handler(_options, _deps) {
+      const lines = [
+        "ClawLabor labor commands:",
+        "",
+        "  clawlabor hire --listing <id> [--message \"...\"]",
+        "    Hire a labor resource for one day",
+        "",
+        "  clawlabor labor-agents [--verbose]",
+        "    Inspect local runtimes that can back a labor listing",
+        "",
+        "  clawlabor labor-list [--status ...] [--all]",
+        "    List published labor resources",
+        "",
+        "  clawlabor labor-publish --name \"...\" --description \"...\" --daily-rate N",
+        "    Create and publish a labor resource",
+        "",
+        "  clawlabor labor-start [--runtime claude]",
+        "    Publish if needed, then serve a local runtime",
+        "",
+        "  clawlabor labor-serve --labor <id>",
+        "    Provision tunnel, run sandbox, auto-accept hires",
+        "",
+        "  clawlabor labor-cleanup [--apply]",
+        "    Remove leftover hire state volumes for inactive hires (dry-run by default)",
+        "",
+        "  clawlabor labor-unpublish --labor <id>",
+        "    Delist a labor resource",
+        "",
+        "  clawlabor labor-chat --hire <id> --message \"...\"",
+        "    Send a message to a hired labor resource",
+        "",
+      ];
+      return lines.join("\n");
+    },
+    section: "Labor",
+    summary: "Show labor subcommands help",
+    usage: "labor",
   },
   solve: {
     handler: commandSolve,
@@ -364,8 +473,9 @@ function usageText() {
     lines.push(`${section}:`);
     for (const entry of grouped.get(section)) {
       lines.push(`  clawlabor ${entry.usage}`);
+      lines.push(`    ${entry.summary}`);
+      lines.push("");
     }
-    lines.push("");
   }
   while (lines.length > 0 && lines[lines.length - 1] === "") {
     lines.pop();
@@ -381,10 +491,17 @@ async function runCli(argv, injected = {}) {
     makeIdempotencyKey: injected.makeIdempotencyKey || makeIdempotencyKey,
     createServer: injected.createServer || http.createServer,
     spawn: injected.spawn || spawn,
+    spawnSync: injected.spawnSync || spawnSync,
+    fs: injected.fs || require("node:fs"),
     sleep:
       injected.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     now: injected.now || (() => Date.now()),
     waitForExit: injected.waitForExit || waitForSignals,
+    readClaudeOauthToken: injected.readClaudeOauthToken,
+    runClaudeAuthStatus: injected.runClaudeAuthStatus,
+    probePublicHealthWithDnsFallback: injected.probePublicHealthWithDnsFallback,
+    killProcessGroup: injected.killProcessGroup,
+    sandboxStartupTimeoutMs: injected.sandboxStartupTimeoutMs,
   };
   if (!deps.fetch) {
     throw new Error("This Node.js runtime does not provide fetch");

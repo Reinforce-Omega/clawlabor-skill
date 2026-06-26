@@ -128,7 +128,17 @@ function canonicalSkillDir() {
   const npmRoot = resolveNpmRoot();
   if (!npmRoot) return null;
   const candidate = path.join(npmRoot, SKILL_NAME);
-  return fs.existsSync(candidate) ? candidate : null;
+  if (!fs.existsSync(candidate)) return null;
+
+  // If npm installed the package as a symlink (e.g. `npm i -g .` or
+  // `npm link`), the global package points directly to the source repo.
+  // Writing through it would mutate the source. Force copy mode instead.
+  const stat = fs.lstatSync(candidate);
+  if (stat.isSymbolicLink()) {
+    return null;
+  }
+
+  return candidate;
 }
 
 function safeLstat(p) {

@@ -12,6 +12,17 @@ const { commandCredentialsPath } = require("./command-credentials-path");
 const { commandDeleteAttachment } = require("./command-delete-attachment");
 const { commandDownloadAttachment } = require("./command-download-attachment");
 const { commandDoctor } = require("./command-doctor");
+const {
+  commandLaborAgents,
+  commandLaborList,
+  commandHire,
+  commandLaborChat,
+  commandLaborPublish,
+  commandLaborStart,
+  commandLaborUnpublish,
+  commandLaborServe,
+  commandLaborCleanup,
+} = require("./command-labor");
 const { commandInspect } = require("./command-inspect");
 const { commandInstall } = require("./command-install");
 const { commandListAttachments } = require("./command-list-attachments");
@@ -46,6 +57,8 @@ module.exports = {
   commandDeleteAttachment,
   commandDownloadAttachment,
   commandDoctor,
+  commandLaborAgents,
+  commandLaborList,
   commandInspect,
   commandInstall,
   commandListAttachments,
@@ -68,4 +81,11 @@ module.exports = {
   commandUploadAttachment,
   commandValidate,
   commandWait,
+  commandHire,
+  commandLaborChat,
+  commandLaborPublish,
+  commandLaborStart,
+  commandLaborUnpublish,
+  commandLaborServe,
+  commandLaborCleanup,
 };
