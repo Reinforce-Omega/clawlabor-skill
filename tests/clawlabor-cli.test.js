@@ -4432,7 +4432,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(spawned[0].args.includes("root"));
   assert.ok(spawned[0].args.includes("--entrypoint"));
   assert.ok(spawned[0].args.includes("sh"));
-  assert.ok(spawned[0].args.includes("ryanxdocker/sandbox-clawlabor:0.4.3"));
+  assert.ok(spawned[0].args.includes("ryanxdocker/sandbox-clawlabor:0.4.4"));
   assert.match(spawned[0].args.join(" "), /mkdir -p '\/home\/sandbox\/\.local' '\/home\/sandbox\/\.cache' '\/home\/sandbox\/\.config'/);
   assert.match(spawned[0].args.join(" "), /chown sandbox:sandbox/);
   assert.match(spawned[0].args.join(" "), /find '\/home\/sandbox\/\.claude' -mindepth 1\s+-exec chown sandbox:sandbox/);
@@ -4449,7 +4449,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.deepEqual(spawned[1].opts.stdio, ["ignore", "pipe", "pipe"]);
   assert.equal(spawned[1].opts.detached, true);
   assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
-  assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "image inspect ryanxdocker/sandbox-clawlabor:0.4.3"));
+  assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "image inspect ryanxdocker/sandbox-clawlabor:0.4.4"));
   assert.ok(!spawnSyncCalls.some((c) => c.cmd === "docker" && c.args[0] === "pull"));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/heartbeat")));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"));
@@ -4767,8 +4767,8 @@ test("labor-serve pulls the pinned sandbox image when it is missing locally", as
     },
   );
 
-  assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "pull ryanxdocker/sandbox-clawlabor:0.4.3"));
-  assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.includes("ryanxdocker/sandbox-clawlabor:0.4.3")));
+  assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "pull ryanxdocker/sandbox-clawlabor:0.4.4"));
+  assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.includes("ryanxdocker/sandbox-clawlabor:0.4.4")));
 });
 
 test("labor-serve keeps the startup seller API key for long-running requests", async () => {
