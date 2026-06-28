@@ -53,7 +53,7 @@ const PLAN_MONTHLY_COST_UAT = {
 const DEFAULT_DAILY_TOKEN_CAP = 1_000_000; // 1M tokens/day
 const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const SANDBOX_STARTUP_TIMEOUT_MS = 180_000;
-const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.3";
+const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.4";
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
 const NANO_FACTOR = 1e9;
 
@@ -986,12 +986,13 @@ async function commandLaborServe(options, deps) {
     return null;
   }
 
-  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, cleanedUpRef }) {
+  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef }) {
     if (cleanedUpRef.value) return;
     cleanedUpRef.value = true;
     stdout(`Shutting down hire ${hireId} runtime...`);
 
     stdout("Stopping Cloudflare tunnel...");
+    tunnel = tunnelRuntime?.currentTunnel ? tunnelRuntime.currentTunnel() : tunnel;
     terminateProcessGroup(tunnel, "SIGTERM", deps);
     await forceKillProcess(tunnel, 3000, deps);
 
@@ -1072,9 +1073,10 @@ async function commandLaborServe(options, deps) {
     let tunnelGraceNoticePrinted = false;
     let healingSandbox = false;
     let tunnelAvailability = null;
+    let tunnelRuntime = null;
 
     async function cleanupCurrentHire() {
-      await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, cleanedUpRef });
+      await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef });
     }
     activeCleanupCurrentHire = cleanupCurrentHire;
     activeStopCleanupPromise = null;
@@ -1238,7 +1240,7 @@ async function commandLaborServe(options, deps) {
       throw new Error(`Sandbox did not become locally healthy within ${tunnelAvailabilityTimeoutSeconds(sandboxStartupTimeoutMs)}s: ${localHealthUrl}`);
     }
 
-    const tunnelRuntime = startCloudflareTunnel({
+    tunnelRuntime = startCloudflareTunnel({
       spawn,
       stdout,
       tunnelToken: tunnel_token,
