@@ -4,6 +4,7 @@ const https = require("node:https");
 const CLOUDFLARE_RESOLVERS = ["1.1.1.1", "1.0.0.1"];
 const TUNNEL_LOG_LINE_LIMIT = 12;
 const TUNNEL_AVAILABILITY_TIMEOUT_MS = 180_000;
+const DEFAULT_CLOUDFLARED_PROTOCOL = "http2";
 
 function tunnelAvailabilityTimeoutSeconds(timeoutMs = TUNNEL_AVAILABILITY_TIMEOUT_MS) {
   return Math.ceil(timeoutMs / 1000);
@@ -78,6 +79,13 @@ function appendLogLines(buffer, chunk, limit = TUNNEL_LOG_LINE_LIMIT) {
   }
 }
 
+function cloudflaredArgs(tunnelToken, protocol = DEFAULT_CLOUDFLARED_PROTOCOL) {
+  const args = ["tunnel", "--no-autoupdate", "--grace-period=3s"];
+  if (protocol) args.push("--protocol", protocol);
+  args.push("run", "--token", tunnelToken);
+  return args;
+}
+
 function formatRecentLogs(buffer) {
   if (!buffer.length) return "";
   return `\nRecent cloudflared logs:\n${buffer.map((line) => `   ${line}`).join("\n")}\n`;
@@ -146,16 +154,26 @@ function startCloudflareTunnel({
 }) {
   stdout(`${logPrefix} Starting Cloudflare tunnel...`);
   const logs = [];
-  const state = { exited: false, exitSummary: null };
-  const tunnel = spawn(
-    "cloudflared",
-    ["tunnel", "--no-autoupdate", "--grace-period=3s", "run", "--token", tunnelToken],
-    { stdio: ["ignore", "pipe", "pipe"], detached: true },
-  );
+  const state = { exited: false, exitSummary: null, protocol: DEFAULT_CLOUDFLARED_PROTOCOL };
+  let currentTunnel = null;
 
-  tunnel.stdout?.on("data", (chunk) => appendLogLines(logs, chunk));
-  tunnel.stderr?.on("data", (chunk) => appendLogLines(logs, chunk));
-  if (tunnel.stdout && tunnel.stderr && typeof tunnel.once === "function") {
+  function spawnTunnel(protocol = DEFAULT_CLOUDFLARED_PROTOCOL) {
+    const tunnel = spawn(
+      "cloudflared",
+      cloudflaredArgs(tunnelToken, protocol),
+      { stdio: ["ignore", "pipe", "pipe"], detached: true },
+    );
+    currentTunnel = tunnel;
+    state.exited = false;
+    state.exitSummary = null;
+    state.protocol = protocol || "auto";
+    return tunnel;
+  }
+
+  function attachHandlers(tunnel) {
+    tunnel.stdout?.on("data", (chunk) => appendLogLines(logs, chunk));
+    tunnel.stderr?.on("data", (chunk) => appendLogLines(logs, chunk));
+    if (!tunnel.stdout || !tunnel.stderr || typeof tunnel.once !== "function") return;
     tunnel.once("error", (err) => {
       state.exited = true;
       state.exitSummary = `cloudflared failed to start: ${(err && err.message) || err || "unknown error"}`;
@@ -164,6 +182,10 @@ function startCloudflareTunnel({
       }
     });
     tunnel.once("exit", (code, signal) => {
+      const isCurrent = currentTunnel === tunnel;
+      if (!isCurrent) {
+        return;
+      }
       state.exited = true;
       state.exitSummary = `cloudflared exited${code === null || code === undefined ? "" : ` with code ${code}`}${signal ? ` (${signal})` : ""}`;
       if (!cleanedUpRef.value && !isStopRequested()) {
@@ -172,7 +194,9 @@ function startCloudflareTunnel({
     });
   }
 
-  return { tunnel, logs, state };
+  attachHandlers(spawnTunnel());
+
+  return { tunnel: currentTunnel, currentTunnel: () => currentTunnel, logs, state };
 }
 
 function createSandboxHealthProbe({ deps, sandboxToken, timeoutMs }) {
@@ -205,6 +229,7 @@ module.exports = {
   createSandboxHealthProbe,
   formatRecentLogs,
   formatTunnelUnavailableWarning,
+  cloudflaredArgs,
   probePublicHealthWithDnsFallback,
   startCloudflareTunnel,
 };
