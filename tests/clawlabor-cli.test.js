@@ -4735,7 +4735,8 @@ test("labor-serve keeps heartbeat healthy during the tunnel availability grace p
     },
   );
 
-  assert.deepEqual(heartbeatBodies, [{ healthy: true }]);
+  assert.deepEqual(heartbeatBodies.slice(0, 1), [{ healthy: true }]);
+  assert.equal(heartbeatBodies.at(-1).error?.reason, "seller_shutdown");
   assert.match(out.join("\n"), /allowing up to 180s/);
   assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
@@ -4816,12 +4817,13 @@ test("labor-serve reports tunnel error after tunnel restart budget is exhausted"
   );
 
   assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 4);
-  assert.equal(heartbeatBodies.length, 4);
+  assert.equal(heartbeatBodies.length, 5);
   assert.deepEqual(heartbeatBodies.slice(0, 3), [{ healthy: true }, { healthy: true }, { healthy: true }]);
   assert.equal(heartbeatBodies[3].healthy, false);
   assert.equal(heartbeatBodies[3].error.reason, "tunnel_unreachable");
   assert.match(heartbeatBodies[3].error.detail, /Public tunnel health check failed/);
   assert.ok(heartbeatBodies[3].error.recent_cloudflared_logs.includes("cf still unavailable"));
+  assert.equal(heartbeatBodies[4].error.reason, "seller_shutdown");
   assert.match(out.join("\n"), /restarting Cloudflare tunnel \(3\/3\)/);
   assert.match(out.join("\n"), /more than 180s; reporting OFFLINE/);
 });
@@ -4899,7 +4901,8 @@ test("labor-serve restarts cloudflared before reporting tunnel offline", async (
   );
 
   assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 2);
-  assert.deepEqual(heartbeatBodies, [{ healthy: true }, { healthy: true }]);
+  assert.deepEqual(heartbeatBodies.slice(0, 2), [{ healthy: true }, { healthy: true }]);
+  assert.equal(heartbeatBodies.at(-1).error?.reason, "seller_shutdown");
   assert.match(out.join("\n"), /restarting Cloudflare tunnel \(1\/3\)/);
   assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
@@ -6635,6 +6638,11 @@ test("labor-serve keeps the hire state volume on Ctrl+C while hire is still acti
     !calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"),
     "Ctrl+C must not DELETE hires/serve while still active",
   );
+  const heartbeatBodies = calls
+    .filter((c) => c.url.endsWith("/labor/hires/hire-1/heartbeat") && c.options.method === "POST")
+    .map((c) => JSON.parse(c.options.body));
+  assert.equal(heartbeatBodies.at(-1).healthy, false);
+  assert.equal(heartbeatBodies.at(-1).error.reason, "seller_shutdown");
   assert.ok(
     !spawnSyncCalls.some((c) => c.cmd === "docker" && c.args[0] === "volume" && c.args[1] === "rm"),
     "Ctrl+C must not remove the hire state volume",
