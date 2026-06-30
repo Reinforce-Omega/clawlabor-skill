@@ -28,6 +28,7 @@ const {
 } = require("../runtime/commands/labor-tunnel");
 const {
   forceKillProcess,
+  sandboxUserCommand,
 } = require("../runtime/commands/labor-sandbox");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
@@ -4160,6 +4161,10 @@ test("labor-agents reports concise local runtime inventory by default", async ()
     label: "Seller Team (team)",
     plan: "team",
   });
+  assert.deepEqual(parsed.host.codex, {
+    provider: "codex",
+    status: "auth_not_found",
+  });
   assert.deepEqual(parsed.agents.map((agent) => agent.runtime), ["claude", "codex", "opencode"]);
   const claude = parsed.agents[0];
   assert.equal(claude.status, "ready_to_serve");
@@ -4185,9 +4190,59 @@ test("labor-agents reports concise local runtime inventory by default", async ()
   assert.equal(codex.can_serve, false);
   assert.equal(codex.next_action.type, "finish_runtime_setup");
   assert.equal(codex.next_action.ready, false);
-  assert.deepEqual(codex.next_action.blocked_by, ["candidate_not_wired_to_labor_serve"]);
-  assert.match(codex.next_action.steps.join(" "), /publish-only/);
+  assert.deepEqual(codex.next_action.blocked_by, ["codex_auth"]);
+  assert.match(codex.next_action.steps.join(" "), /codex login/);
   assert.equal(codex.next_action.diagnostics_command, "clawlabor labor-agents --verbose");
+});
+
+function fakeJwt(payload) {
+  const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode(payload)}.`;
+}
+
+test("labor-agents reports Codex ChatGPT plan from local JWT claims", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  const codexAuth = JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: {
+      id_token: fakeJwt({
+        "https://api.openai.com/auth": {
+          chatgpt_account_id: "acct-123",
+          chatgpt_plan_type: "team",
+          chatgpt_subscription_active_start: "2026-06-30T11:25:28+00:00",
+          chatgpt_subscription_active_until: "2026-07-30T11:25:28+00:00",
+          chatgpt_subscription_last_checked: "2026-06-30T11:33:03+00:00",
+          organizations: [
+            { id: "org-1", title: "Reinforce-omega", is_default: true },
+          ],
+        },
+      }),
+    },
+  });
+  await runCli(["labor-agents"], {
+    ...laborAgentsDeps(fetch, out),
+    env: { ...BASE_ENV, HOME: "/tmp/home" },
+    fs: {
+      existsSync: (p) => ["/tmp/home/.codex/auth.json", "/tmp/home/.codex/config.toml"].includes(p),
+      readFileSync: (p) => {
+        assert.equal(p, "/tmp/home/.codex/auth.json");
+        return codexAuth;
+      },
+    },
+  });
+
+  const parsed = JSON.parse(out.join(""));
+  assert.deepEqual(parsed.host.codex, {
+    provider: "codex",
+    label: "ChatGPT Business",
+    plan: "business",
+    subscription_active_until: "2026-07-30T11:25:28+00:00",
+  });
+  const codex = parsed.agents.find((agent) => agent.runtime === "codex");
+  assert.equal(codex.status, "ready_to_serve");
+  assert.equal(codex.suggested_daily_rate_uat, 17);
+  assert.match(codex.publish_command, /Codex Labor \(business plan\)/);
 });
 
 test("labor-agents shows auth failure instead of null account fields", async () => {
@@ -4387,7 +4442,7 @@ test("labor-agents --verbose keeps diagnostic detail", async () => {
   assert.equal(codex.present_on_path, true);
   assert.equal(codex.ready_to_publish, true);
   assert.equal(codex.ready_to_serve, false);
-  assert.equal(codex.serve_status, "candidate_not_wired_to_labor_serve");
+  assert.equal(codex.serve_status, "needs_codex_auth");
   const opencode = parsed.agents[2];
   assert.equal(opencode.ready_to_publish, true);
   assert.equal(opencode.ready_to_serve, false);
@@ -4557,8 +4612,8 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.match(spawned[0].args.join(" "), /chown sandbox:sandbox/);
   assert.match(spawned[0].args.join(" "), /find '\/home\/sandbox\/\.claude' -mindepth 1\s+-exec chown sandbox:sandbox/);
   assert.match(spawned[0].args.join(" "), /'\/home\/sandbox\/\.claude'/);
-  assert.match(spawned[0].args.join(" "), /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor install-agent 'claude'/);
-  assert.match(spawned[0].args.join(" "), /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor server/);
+  assert.match(spawned[0].args.join(" "), /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor install-agent 'claude'/);
+  assert.match(spawned[0].args.join(" "), /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor server/);
   assert.match(spawned[0].args.join(" "), /sandbox-clawlabor server --token='SBX'/);
   assert.ok(!spawned[0].args.includes("oauth-token-123"));
   assert.equal(spawned[1].cmd, "cloudflared");
@@ -5974,21 +6029,22 @@ test("labor-publish blocks a duplicate active listing for the same runtime", asy
   );
 });
 
-test("labor-publish rejects runtimes without serve support (codex)", async () => {
-  const { fetch } = recordingFetch([]);
-  await assert.rejects(
-    () => runCli(
-      ["labor-publish", "--runtime", "codex", "--name", "Codex bot", "--description", "rented codex",
-       "--daily-rate", "240"],
-      {
-        env: BASE_ENV,
-        fetch,
-        stdout: () => {},
-        runClaudeAuthStatus: async () => ({ ok: false }),
-      },
-    ),
-    /has no labor-serve support yet/,
+test("labor-publish --runtime codex creates a resource without host account", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-codex", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-codex", { status: 200, body: JSON.stringify({ id: "labor-codex", name: "Codex bot", status: "available" }) }),
+  ]);
+  await runCli(
+    ["labor-publish", "--runtime", "codex", "--name", "Codex bot", "--description", "rented codex", "--daily-rate", "240"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
   );
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  const body = JSON.parse(create.options.body);
+  assert.equal(body.runtime, "codex");
+  assert.equal(body.daily_rate_uat, 240);
+  assert.equal("host_account_provider" in body, false);
 });
 
 test("labor-list defaults to current seller resources", async () => {
@@ -6310,7 +6366,12 @@ test("labor-unpublish delists a resource (sets it inactive)", async () => {
 // --- opencode runtime: per-runtime sandbox credential seam (Task 1) ---
 const {
   formatLogTimestamp,
+  codexAuthPath,
+  codexConfigPath,
+  codexHomePath,
+  decodeJwtPayload,
   opencodeAuthPath,
+  resolveCodexChatGptAccount,
   resolveRuntimeSandboxCredentials,
   runtimeStateInitCommand,
   runtimeStateMounts,
@@ -6319,6 +6380,64 @@ const {
 test("opencodeAuthPath honors XDG_DATA_HOME then HOME", () => {
   assert.equal(opencodeAuthPath({ XDG_DATA_HOME: "/x" }), "/x/opencode/auth.json");
   assert.equal(opencodeAuthPath({ HOME: "/home/u" }), "/home/u/.local/share/opencode/auth.json");
+});
+
+test("codexAuthPath honors HOME", () => {
+  assert.equal(codexAuthPath({ HOME: "/home/u" }), "/home/u/.codex/auth.json");
+});
+
+test("codexConfigPath honors HOME", () => {
+  assert.equal(codexConfigPath({ HOME: "/home/u" }), "/home/u/.codex/config.toml");
+});
+
+test("codex paths prefer CODEX_HOME over HOME", () => {
+  assert.equal(codexHomePath({ CODEX_HOME: "/custom/codex", HOME: "/home/u" }), "/custom/codex");
+  assert.equal(codexAuthPath({ CODEX_HOME: "/custom/codex", HOME: "/home/u" }), "/custom/codex/auth.json");
+  assert.equal(codexConfigPath({ CODEX_HOME: "/custom/codex", HOME: "/home/u" }), "/custom/codex/config.toml");
+});
+
+test("decodeJwtPayload decodes base64url payloads", () => {
+  assert.deepEqual(decodeJwtPayload(fakeJwt({ sub: "user-1" })), { sub: "user-1" });
+});
+
+test("resolveCodexChatGptAccount returns api_key_auth for API login", () => {
+  const account = resolveCodexChatGptAccount({
+    env: { HOME: "/home/u" },
+    fs: {
+      existsSync: () => true,
+      readFileSync: () => JSON.stringify({ auth_mode: "api" }),
+    },
+  });
+  assert.deepEqual(account, {
+    provider: "codex",
+    logged_in: false,
+    status: "api_key_auth",
+    auth_mode: "api",
+  });
+});
+
+test("resolveCodexChatGptAccount reads ChatGPT plan from id_token claims", () => {
+  const token = fakeJwt({
+    "https://api.openai.com/auth": {
+      chatgpt_account_id: "acct-123",
+      chatgpt_plan_type: "pro",
+      organizations: [
+        { id: "org-1", title: "Codex Org", is_default: true },
+      ],
+    },
+  });
+  const account = resolveCodexChatGptAccount({
+    env: { HOME: "/home/u" },
+    fs: {
+      existsSync: () => true,
+      readFileSync: () => JSON.stringify({ auth_mode: "chatgpt", tokens: { id_token: token } }),
+    },
+  });
+  assert.equal(account.provider, "codex");
+  assert.equal(account.logged_in, true);
+  assert.equal(account.source, "local_jwt_claim");
+  assert.equal(account.plan, "pro");
+  assert.equal(account.label, "ChatGPT Pro");
 });
 
 test("runtimeStateMounts uses one hire-scoped volume source for every runtime", () => {
@@ -6344,6 +6463,14 @@ test("runtimeStateInitCommand fixes hire volume ownership before agent startup",
   assert.match(command, /find '\/home\/sandbox\/\.claude' -mindepth 1\s+-exec chown sandbox:sandbox/);
 });
 
+test("sandboxUserCommand exposes installed agent binaries on PATH", () => {
+  const command = sandboxUserCommand("codex --version");
+
+  assert.match(command, /^setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox /);
+  assert.match(command, /PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:/);
+  assert.match(command, / codex --version$/);
+});
+
 test("resolveRuntimeSandboxCredentials: claude returns oauth env, no mounts", async () => {
   const creds = await resolveRuntimeSandboxCredentials("claude", {
     env: {},
@@ -6367,10 +6494,37 @@ test("resolveRuntimeSandboxCredentials: opencode mounts auth.json read-only when
   }]);
 });
 
+test("resolveRuntimeSandboxCredentials: codex mounts auth.json read-only when present", async () => {
+  const creds = await resolveRuntimeSandboxCredentials("codex", {
+    env: { HOME: "/home/seller" },
+    fs: { existsSync: (p) => ["/home/seller/.codex/auth.json", "/home/seller/.codex/config.toml"].includes(p) },
+  });
+  assert.deepEqual(creds.env, {});
+  assert.deepEqual(creds.mounts, [
+    {
+      host: "/home/seller/.codex/auth.json",
+      container: "/home/sandbox/.codex/auth.json",
+      ro: true,
+    },
+    {
+      host: "/home/seller/.codex/config.toml",
+      container: "/home/sandbox/.codex/config.toml",
+      ro: true,
+    },
+  ]);
+});
+
 test("resolveRuntimeSandboxCredentials: opencode missing auth throws actionable error", async () => {
   await assert.rejects(
     resolveRuntimeSandboxCredentials("opencode", { env: { HOME: "/home/seller" }, fs: { existsSync: () => false } }),
     /opencode auth login/,
+  );
+});
+
+test("resolveRuntimeSandboxCredentials: codex missing auth throws actionable error", async () => {
+  await assert.rejects(
+    resolveRuntimeSandboxCredentials("codex", { env: { HOME: "/home/seller" }, fs: { existsSync: () => false } }),
+    /codex login/,
   );
 });
 
@@ -6413,8 +6567,8 @@ test("labor-serve --runtime opencode mounts auth.json ro and installs opencode",
   assert.match(joined, /chown sandbox:sandbox/);
   assert.match(joined, /find '\/home\/sandbox\/\.local\/share\/opencode' -mindepth 1 ! -path '\/home\/sandbox\/\.local\/share\/opencode\/auth\.json' -exec chown sandbox:sandbox/);
   assert.match(joined, /'\/home\/sandbox\/\.local\/share\/opencode'/);
-  assert.match(joined, /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor install-agent 'opencode'/);
-  assert.match(joined, /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor server/);
+  assert.match(joined, /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor install-agent 'opencode'/);
+  assert.match(joined, /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor server/);
   assert.match(joined, /sandbox-clawlabor server --token='-SBX'/);
   assert.equal(dockerRun.args.includes("CLAUDE_CODE_OAUTH_TOKEN"), false);
 });
