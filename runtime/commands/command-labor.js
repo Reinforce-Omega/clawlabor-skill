@@ -58,6 +58,23 @@ const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests
 const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 const NANO_FACTOR = 1e9;
 
+function formatLogTimestamp(now = Date.now) {
+  return new Date(now()).toISOString();
+}
+
+function createTimestampedStdout(stdout, now = Date.now) {
+  const write = stdout || (() => {});
+  return (text) => {
+    const timestamp = formatLogTimestamp(now);
+    const linePrefix = `[${timestamp}] `;
+    const formatted = String(text)
+      .split("\n")
+      .map((line) => (line ? `${linePrefix}${line}` : line))
+      .join("\n");
+    write(formatted);
+  };
+}
+
 function processAlive(pid) {
   if (!pid || Number.isNaN(pid)) return false;
   try {
@@ -896,7 +913,7 @@ async function commandLaborServe(options, deps) {
   const spawn = deps.spawn || require("child_process").spawn;
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const now = deps.now || (() => Date.now());
-  const stdout = deps.stdout || (() => {});
+  const stdout = createTimestampedStdout(deps.stdout, now);
   const sandboxStartupTimeoutMs = deps.sandboxStartupTimeoutMs || SANDBOX_STARTUP_TIMEOUT_MS;
   const sellerApiKey = resolveApiKey(deps.env);
 

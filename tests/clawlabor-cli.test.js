@@ -4457,6 +4457,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/heartbeat")));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "DELETE"));
+  assert.match(out[0], /^\[\d{4}-\d{2}-\d{2}T/);
 });
 
 test("labor-serve suppresses captured cloudflared logs during the tunnel grace period", async () => {
