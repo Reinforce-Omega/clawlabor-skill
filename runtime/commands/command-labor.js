@@ -10,13 +10,16 @@ const {
 const { apiBase, envWithApiKey, request, requestJson, resolveApiKey } = require("../http");
 const { numberOption, positiveNumberOption, requiredOption, tokenCountOption } = require("../options");
 const {
-  dockerContainerRunning,
+  dockerContainerState,
+  dockerListHireContainers,
   dockerListHireStateVolumes,
   dockerName,
+  removeContainerByName,
   dockerRemoveVolume,
   dockerVolumeExists,
   ensureDockerImage,
   forceKillProcess,
+  hireIdFromContainerName,
   hireIdFromVolumeName,
   hireStateVolumeName,
   removeContainerByNameAsync,
@@ -26,6 +29,7 @@ const {
   sandboxUserCommand,
   shellQuote,
   startSandboxContainer,
+  startContainerByName,
   stopContainerByName,
   terminateChild,
   terminateProcessGroup,
@@ -55,7 +59,50 @@ const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const SANDBOX_STARTUP_TIMEOUT_MS = 180_000;
 const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.4";
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
+const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 const NANO_FACTOR = 1e9;
+const CLAUDE_CODE_INSTALL_HINT = "Install Claude Code CLI, not Claude Desktop. See https://docs.anthropic.com/en/docs/claude-code/quickstart or run `npm install -g @anthropic-ai/claude-code`, then run `claude auth login`.";
+
+function formatLogTimestamp(now = Date.now) {
+  const parts = new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "shortOffset",
+  }).formatToParts(new Date(now()));
+  const valueByType = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  const offset = formatLogTimezoneOffset(valueByType.timeZoneName);
+  return `${valueByType.year}-${valueByType.month}-${valueByType.day} ${valueByType.hour}:${valueByType.minute}:${valueByType.second} ${offset}`;
+}
+
+function formatLogTimezoneOffset(timeZoneName) {
+  if (!timeZoneName || timeZoneName === "GMT") return "GMT+00:00";
+  const match = /^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(timeZoneName);
+  if (!match) return timeZoneName;
+  const [, sign, hour, minute = "00"] = match;
+  return `GMT${sign}${hour.padStart(2, "0")}:${minute}`;
+}
+
+function createTimestampedStdout(stdout, now = Date.now) {
+  const write = stdout || (() => {});
+  return (text) => {
+    const timestamp = formatLogTimestamp(now);
+    const linePrefix = `[${timestamp}] `;
+    const formatted = String(text)
+      .split("\n")
+      .map((line) => (line ? `${linePrefix}${line}` : line))
+      .join("\n");
+    write(formatted);
+  };
+}
 
 function processAlive(pid) {
   if (!pid || Number.isNaN(pid)) return false;
@@ -444,7 +491,8 @@ async function claudeRuntimeAgent(deps) {
       version: claude.version,
       detail: claude.status === "pass"
         ? "Claude Code CLI is available"
-        : "Install Claude Code before publishing this labor runtime",
+        : CLAUDE_CODE_INSTALL_HINT,
+      next: claude.status === "pass" ? null : CLAUDE_CODE_INSTALL_HINT,
     },
     {
       name: "claude_code_oauth",
@@ -895,7 +943,7 @@ async function commandLaborServe(options, deps) {
   const spawn = deps.spawn || require("child_process").spawn;
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const now = deps.now || (() => Date.now());
-  const stdout = deps.stdout || (() => {});
+  const stdout = createTimestampedStdout(deps.stdout, now);
   const sandboxStartupTimeoutMs = deps.sandboxStartupTimeoutMs || SANDBOX_STARTUP_TIMEOUT_MS;
   const sellerApiKey = resolveApiKey(deps.env);
 
@@ -908,6 +956,7 @@ async function commandLaborServe(options, deps) {
   const sellerDeps = { ...deps, env: envWithApiKey(deps.env, sellerApiKey) };
   const stop = deps.waitForExit ? deps.waitForExit() : new Promise(() => {});
   let stopRequested = false;
+  let shutdownRequested = false;
   let stopNoticePrinted = false;
   stdout(`[2/7] Resolving ${runtime} sandbox credentials...`);
   const sandboxCreds = await resolveRuntimeSandboxCredentials(runtime, deps);
@@ -949,6 +998,7 @@ async function commandLaborServe(options, deps) {
 
   function requestStop() {
     stopRequested = true;
+    shutdownRequested = true;
     if (!stopNoticePrinted) {
       stopNoticePrinted = true;
       stdout("\nReceived shutdown signal; stopping local serve/tunnel...");
@@ -986,7 +1036,7 @@ async function commandLaborServe(options, deps) {
     return null;
   }
 
-  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef }) {
+  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef, preserveContainer = false }) {
     if (cleanedUpRef.value) return;
     cleanedUpRef.value = true;
     stdout(`Shutting down hire ${hireId} runtime...`);
@@ -998,11 +1048,19 @@ async function commandLaborServe(options, deps) {
 
     if (ownsContainer) {
       stdout("Stopping sandbox container...");
-      terminateChild(container);
-      await forceKillProcess(container, 2000, deps);
+      if (container) {
+        terminateChild(container);
+        await forceKillProcess(container, 2000, deps);
+      } else {
+        stopContainerByName(containerName, deps);
+      }
 
-      stdout("Removing docker container...");
-      await removeContainerByNameAsync({ spawn, containerName });
+      if (preserveContainer) {
+        stdout("Sandbox container stopped and preserved for this active hire; rerun labor-start to resume with the same container filesystem.");
+      } else {
+        stdout("Removing docker container...");
+        await removeContainerByNameAsync({ spawn, containerName });
+      }
     } else {
       stdout("Leaving existing sandbox container running for the active hire.");
     }
@@ -1054,14 +1112,41 @@ async function commandLaborServe(options, deps) {
       logPrefix: "[6/7]",
     });
 
-    let container = null;
-    let ownsContainer = false;
-    if (dockerContainerRunning(containerName, deps) && await probeHealth(localHealthUrl)) {
-      stdout(`[6/7] Reusing existing sandbox container ${containerName}.`);
-    } else {
-      container = spawnSandboxContainer();
-      ownsContainer = true;
+    async function ensureSandboxContainerRunning() {
+      const state = dockerContainerState(containerName, deps);
+      if (state === "running") {
+        if (await probeHealth(localHealthUrl)) {
+          stdout(`[6/7] Reusing existing sandbox container ${containerName}.`);
+          return { container: null, ownsContainer: true };
+        }
+        stdout(`[6/7] Existing sandbox container ${containerName} is running but unhealthy; restarting it.`);
+        if (restartContainerByName(containerName, deps)) {
+          await interruptibleSleep(2000);
+          if (await probeHealth(localHealthUrl)) {
+            stdout(`[6/7] Existing sandbox container ${containerName} recovered after restart.`);
+            return { container: null, ownsContainer: true };
+          }
+        }
+        stdout(`[6/7] Removing unhealthy sandbox container ${containerName}; container filesystem may be lost.`);
+        removeContainerByName(containerName, deps);
+      } else if (state) {
+        stdout(`[6/7] Resuming stopped sandbox container ${containerName} (${state}).`);
+        if (startContainerByName(containerName, deps)) {
+          for (let i = 0; i < 15; i += 1) {
+            await interruptibleSleep(1000);
+            if (await probeHealth(localHealthUrl)) {
+              stdout(`[6/7] Resumed sandbox container ${containerName}.`);
+              return { container: null, ownsContainer: true };
+            }
+          }
+        }
+        stdout(`[6/7] Stopped sandbox container ${containerName} did not become healthy; removing it and rebuilding.`);
+        removeContainerByName(containerName, deps);
+      }
+      return { container: spawnSandboxContainer(), ownsContainer: true };
     }
+
+    let { container, ownsContainer } = await ensureSandboxContainerRunning();
     const cleanedUpRef = { value: false };
     let tunnel = null;
     let tunnelLogs = [];
@@ -1074,9 +1159,19 @@ async function commandLaborServe(options, deps) {
     let healingSandbox = false;
     let tunnelAvailability = null;
     let tunnelRuntime = null;
+    let tunnelRestartAttempts = 0;
 
     async function cleanupCurrentHire() {
-      await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef });
+      await cleanupRuntime({
+        hireId,
+        containerName,
+        container,
+        ownsContainer,
+        tunnel,
+        tunnelRuntime,
+        cleanedUpRef,
+        preserveContainer: shutdownRequested && hireRunning,
+      });
     }
     activeCleanupCurrentHire = cleanupCurrentHire;
     activeStopCleanupPromise = null;
@@ -1090,8 +1185,8 @@ async function commandLaborServe(options, deps) {
           return false;
         }
 
-        const running = dockerContainerRunning(containerName, deps);
-        if (running) {
+        const state = dockerContainerState(containerName, deps);
+        if (state === "running") {
           stdout(`\n⚠️  Sandbox container is unhealthy; restarting ${containerName}.\n`);
           if (restartContainerByName(containerName, deps)) {
             await interruptibleSleep(2000);
@@ -1101,7 +1196,18 @@ async function commandLaborServe(options, deps) {
             }
           }
           stdout(`Sandbox container restart did not recover; rebuilding ${containerName}.`);
-          stopContainerByName(containerName, deps);
+          removeContainerByName(containerName, deps);
+        } else if (state) {
+          stdout(`\n⚠️  Sandbox container ${containerName} is stopped (${state}); starting it for the active hire.\n`);
+          if (startContainerByName(containerName, deps)) {
+            await interruptibleSleep(2000);
+            if (await probeHealth(localHealthUrl)) {
+              stdout("Sandbox container recovered after start.");
+              return true;
+            }
+          }
+          stdout(`Sandbox container start did not recover; rebuilding ${containerName}.`);
+          removeContainerByName(containerName, deps);
         } else {
           stdout(`\n⚠️  Sandbox container ${containerName} is not running; rebuilding it for the active hire.\n`);
         }
@@ -1150,6 +1256,22 @@ async function commandLaborServe(options, deps) {
       }
     }
 
+    async function reportHireInterrupted() {
+      const error = {
+        reason: "seller_shutdown",
+        detail: "Seller stopped the local labor runtime while this hire is still active.",
+      };
+      try {
+        await withTimeout(
+          requestJson(sellerDeps, "POST", `/labor/hires/${hireId}/heartbeat`, { body: { healthy: false, error } }),
+          LABOR_CONTROL_TIMEOUT_MS,
+          "hire shutdown heartbeat",
+        );
+      } catch (_err) {
+        /* best effort */
+      }
+    }
+
     async function reportTunnelUnavailable() {
       if (!(await activeHireStillPresent(hireId))) {
         hireRunning = false;
@@ -1158,6 +1280,22 @@ async function commandLaborServe(options, deps) {
       if (warnedTunnelDown) return;
       warnedTunnelDown = true;
       stdout(formatTunnelUnavailableWarning({ publicHealthUrl, laborId, tunnelState, tunnelLogs }));
+    }
+
+    async function restartTunnelAfterTimeout() {
+      if (!tunnelRuntime || typeof tunnelRuntime.restart !== "function") return false;
+      if (tunnelRestartAttempts >= MAX_TUNNEL_RESTART_ATTEMPTS) return false;
+      tunnelRestartAttempts += 1;
+      stdout(
+        `Public tunnel unreachable for more than ${tunnelAvailabilityTimeoutSeconds()}s; ` +
+          `restarting Cloudflare tunnel (${tunnelRestartAttempts}/${MAX_TUNNEL_RESTART_ATTEMPTS}).`,
+      );
+      tunnel = await tunnelRuntime.restart("public tunnel unreachable");
+      tunnelAvailability.reset();
+      tunnelGraceNoticePrinted = false;
+      tunnelTimeoutReported = false;
+      warnedTunnelDown = false;
+      return true;
     }
 
     async function heartbeatOnce() {
@@ -1179,15 +1317,21 @@ async function commandLaborServe(options, deps) {
               );
             }
           } else if (hireRunning) {
-            if (!tunnelTimeoutReported) {
-              tunnelTimeoutReported = true;
-              await reportTunnelUnavailable();
-              stdout(
-                `\n⚠️  Public tunnel has been unreachable for more than ` +
-                  `${tunnelAvailabilityTimeoutSeconds()}s; reporting OFFLINE to the platform.\n`,
-              );
+            if (await restartTunnelAfterTimeout()) {
+              healthy = true;
+              heartbeatBody = { healthy: true };
+              tunnelAvailability.markUnavailable();
+            } else {
+              if (!tunnelTimeoutReported) {
+                tunnelTimeoutReported = true;
+                await reportTunnelUnavailable();
+                stdout(
+                  `\n⚠️  Public tunnel has been unreachable for more than ` +
+                    `${tunnelAvailabilityTimeoutSeconds()}s; reporting OFFLINE to the platform.\n`,
+                );
+              }
+              heartbeatBody = { healthy: false, error: tunnelAvailability.failurePayload() };
             }
-            heartbeatBody = { healthy: false, error: tunnelAvailability.failurePayload() };
           }
         } else {
           warnedTunnelDown = false;
@@ -1213,6 +1357,7 @@ async function commandLaborServe(options, deps) {
         tunnelAvailability.reset();
         tunnelTimeoutReported = false;
         tunnelGraceNoticePrinted = false;
+        tunnelRestartAttempts = 0;
         heartbeatBody = { healthy: true };
       }
 
@@ -1246,6 +1391,10 @@ async function commandLaborServe(options, deps) {
       tunnelToken: tunnel_token,
       cleanedUpRef,
       isStopRequested: () => stopRequested,
+      stopTunnel: async (child) => {
+        terminateProcessGroup(child, "SIGTERM", deps);
+        await forceKillProcess(child, 3000, deps);
+      },
       logPrefix: "[7/7]",
     });
     tunnel = tunnelRuntime.tunnel;
@@ -1312,10 +1461,11 @@ async function commandLaborServe(options, deps) {
       // Ctrl+C path: the hire is still ACTIVE on the platform. Do NOT call
       // DELETE /labor/hires/<id>/serve — that would release the platform-side
       // tunnel and drop the hire's sandbox record while the buyer's hire is
-      // still live. Just leave it; the platform will mark the sandbox
-      // unhealthy via missing heartbeats and notify the seller to recover.
-      // The hire's named state volume is also preserved so the seller can
-      // resume with the same agent state on the next `labor-serve`.
+      // still live. Report an unhealthy heartbeat instead so buyers see the
+      // hire go offline immediately while the platform keeps the recovery
+      // record. The hire's named state volume is also preserved so the seller
+      // can resume with the same agent state on the next `labor-serve`.
+      await reportHireInterrupted();
       stdout(`Hire ${hireId} interrupted while still active; leaving platform record and state volume intact.`);
     } else {
       stdout(`Notifying platform of hire ${hireId} shutdown...`);
@@ -1405,7 +1555,8 @@ async function commandLaborServe(options, deps) {
 async function commandLaborCleanup(_options, deps, flags) {
   const dryRun = !(flags && flags.has && flags.has("apply"));
   const volumes = dockerListHireStateVolumes(deps);
-  if (volumes.length === 0) {
+  const containers = dockerListHireContainers(deps);
+  if (volumes.length === 0 && containers.length === 0) {
     return JSON.stringify(
       { action: "labor-cleanup", mode: dryRun ? "dry-run" : "apply", checked: 0, kept: [], removed: [], failed: [] },
       null,
@@ -1452,21 +1603,35 @@ async function commandLaborCleanup(_options, deps, flags) {
   const kept = [];
   const removed = [];
   const failed = [];
+  for (const containerName of containers) {
+    const hireId = hireIdFromContainerName(containerName);
+    if (!hireId) continue;
+    if (activeHireIds.has(hireId)) {
+      kept.push({ type: "container", container: containerName, reason: "active-hire" });
+      continue;
+    }
+    if (dryRun) {
+      removed.push({ type: "container", container: containerName, hire_id: hireId, dry_run: true });
+      continue;
+    }
+    removeContainerByName(containerName, deps);
+    removed.push({ type: "container", container: containerName, hire_id: hireId });
+  }
   for (const volume of volumes) {
     const hireId = hireIdFromVolumeName(volume);
     if (!hireId) continue;
     if (activeHireIds.has(hireId)) {
-      kept.push({ volume, reason: "active-hire" });
+      kept.push({ type: "volume", volume, reason: "active-hire" });
       continue;
     }
     if (dryRun) {
-      removed.push({ volume, hire_id: hireId, dry_run: true });
+      removed.push({ type: "volume", volume, hire_id: hireId, dry_run: true });
       continue;
     }
     if (dockerRemoveVolume(volume, deps)) {
-      removed.push({ volume, hire_id: hireId });
+      removed.push({ type: "volume", volume, hire_id: hireId });
     } else {
-      failed.push({ volume, hire_id: hireId, reason: "docker volume rm failed (in use?)" });
+      failed.push({ type: "volume", volume, hire_id: hireId, reason: "docker volume rm failed (in use?)" });
     }
   }
 
@@ -1474,7 +1639,7 @@ async function commandLaborCleanup(_options, deps, flags) {
     {
       action: "labor-cleanup",
       mode: dryRun ? "dry-run" : "apply",
-      checked: volumes.length,
+      checked: volumes.length + containers.length,
       active_hires: Array.from(activeHireIds),
       kept,
       removed,
@@ -1504,4 +1669,5 @@ module.exports = {
   resolveRuntimeSandboxCredentials,
   hireStateVolumeName,
   hireIdFromVolumeName,
+  formatLogTimestamp,
 };
