@@ -42,12 +42,16 @@ function sandboxUserCommand(command) {
 }
 
 function dockerContainerRunning(name, deps = {}) {
+  return dockerContainerState(name, deps) === "running";
+}
+
+function dockerContainerState(name, deps = {}) {
   const run = deps.spawnSync || spawnSync;
-  const result = run("docker", ["inspect", "-f", "{{.State.Running}}", name], {
+  const result = run("docker", ["inspect", "-f", "{{.State.Status}}", name], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });
-  return result.status === 0 && String(result.stdout || "").trim() === "true";
+  return result.status === 0 ? String(result.stdout || "").trim() : null;
 }
 
 function hireStateVolumeName(hireId) {
@@ -72,7 +76,17 @@ function dockerRemoveVolume(name, deps = {}) {
 
 function stopContainerByName(name, deps = {}) {
   const run = deps.spawnSync || spawnSync;
+  run("docker", ["stop", name], { stdio: "ignore" });
+}
+
+function removeContainerByName(name, deps = {}) {
+  const run = deps.spawnSync || spawnSync;
   run("docker", ["rm", "-f", name], { stdio: "ignore" });
+}
+
+function startContainerByName(name, deps = {}) {
+  const run = deps.spawnSync || spawnSync;
+  return run("docker", ["start", name], { stdio: "ignore" }).status === 0;
 }
 
 function restartContainerByName(name, deps = {}) {
@@ -201,7 +215,7 @@ function startSandboxContainer({
   return spawn(
     "docker",
     [
-      "run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
+      "run", "-d", "--name", containerName, "-p", `127.0.0.1:${port}:2468`,
       // Start as root only long enough to repair fresh volume ownership;
       // agent install and the long-running server run as sandbox below.
       "-u", "root",
@@ -237,8 +251,27 @@ function dockerListHireStateVolumes(deps = {}) {
     .filter((line) => line.startsWith("clawlabor-hire-") && line.endsWith("-state"));
 }
 
+function dockerListHireContainers(deps = {}) {
+  const run = deps.spawnSync || spawnSync;
+  const result = run(
+    "docker",
+    ["ps", "-a", "--filter", "name=clawlabor-hire-", "--format", "{{.Names}}"],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+  );
+  if (result.status !== 0) return [];
+  return String(result.stdout || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("clawlabor-hire-"));
+}
+
 function hireIdFromVolumeName(volumeName) {
   const m = /^clawlabor-hire-(.+)-state$/.exec(volumeName);
+  return m ? m[1] : null;
+}
+
+function hireIdFromContainerName(containerName) {
+  const m = /^clawlabor-hire-(.+)$/.exec(containerName);
   return m ? m[1] : null;
 }
 
@@ -249,10 +282,13 @@ module.exports = {
   runtimeStateInitCommand,
   sandboxUserCommand,
   dockerContainerRunning,
+  dockerContainerState,
   hireStateVolumeName,
   dockerVolumeExists,
   dockerRemoveVolume,
   stopContainerByName,
+  removeContainerByName,
+  startContainerByName,
   restartContainerByName,
   terminateChild,
   terminateProcessGroup,
@@ -262,6 +298,8 @@ module.exports = {
   ensureDockerImage,
   removeContainerByNameAsync,
   startSandboxContainer,
+  dockerListHireContainers,
   dockerListHireStateVolumes,
   hireIdFromVolumeName,
+  hireIdFromContainerName,
 };

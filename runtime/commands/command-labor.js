@@ -10,13 +10,16 @@ const {
 const { apiBase, envWithApiKey, request, requestJson, resolveApiKey } = require("../http");
 const { numberOption, positiveNumberOption, requiredOption, tokenCountOption } = require("../options");
 const {
-  dockerContainerRunning,
+  dockerContainerState,
+  dockerListHireContainers,
   dockerListHireStateVolumes,
   dockerName,
+  removeContainerByName,
   dockerRemoveVolume,
   dockerVolumeExists,
   ensureDockerImage,
   forceKillProcess,
+  hireIdFromContainerName,
   hireIdFromVolumeName,
   hireStateVolumeName,
   removeContainerByNameAsync,
@@ -26,6 +29,7 @@ const {
   sandboxUserCommand,
   shellQuote,
   startSandboxContainer,
+  startContainerByName,
   stopContainerByName,
   terminateChild,
   terminateProcessGroup,
@@ -926,6 +930,7 @@ async function commandLaborServe(options, deps) {
   const sellerDeps = { ...deps, env: envWithApiKey(deps.env, sellerApiKey) };
   const stop = deps.waitForExit ? deps.waitForExit() : new Promise(() => {});
   let stopRequested = false;
+  let shutdownRequested = false;
   let stopNoticePrinted = false;
   stdout(`[2/7] Resolving ${runtime} sandbox credentials...`);
   const sandboxCreds = await resolveRuntimeSandboxCredentials(runtime, deps);
@@ -967,6 +972,7 @@ async function commandLaborServe(options, deps) {
 
   function requestStop() {
     stopRequested = true;
+    shutdownRequested = true;
     if (!stopNoticePrinted) {
       stopNoticePrinted = true;
       stdout("\nReceived shutdown signal; stopping local serve/tunnel...");
@@ -1004,7 +1010,7 @@ async function commandLaborServe(options, deps) {
     return null;
   }
 
-  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef }) {
+  async function cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef, preserveContainer = false }) {
     if (cleanedUpRef.value) return;
     cleanedUpRef.value = true;
     stdout(`Shutting down hire ${hireId} runtime...`);
@@ -1016,11 +1022,19 @@ async function commandLaborServe(options, deps) {
 
     if (ownsContainer) {
       stdout("Stopping sandbox container...");
-      terminateChild(container);
-      await forceKillProcess(container, 2000, deps);
+      if (container) {
+        terminateChild(container);
+        await forceKillProcess(container, 2000, deps);
+      } else {
+        stopContainerByName(containerName, deps);
+      }
 
-      stdout("Removing docker container...");
-      await removeContainerByNameAsync({ spawn, containerName });
+      if (preserveContainer) {
+        stdout("Sandbox container stopped and preserved for this active hire; rerun labor-start to resume with the same container filesystem.");
+      } else {
+        stdout("Removing docker container...");
+        await removeContainerByNameAsync({ spawn, containerName });
+      }
     } else {
       stdout("Leaving existing sandbox container running for the active hire.");
     }
@@ -1072,14 +1086,41 @@ async function commandLaborServe(options, deps) {
       logPrefix: "[6/7]",
     });
 
-    let container = null;
-    let ownsContainer = false;
-    if (dockerContainerRunning(containerName, deps) && await probeHealth(localHealthUrl)) {
-      stdout(`[6/7] Reusing existing sandbox container ${containerName}.`);
-    } else {
-      container = spawnSandboxContainer();
-      ownsContainer = true;
+    async function ensureSandboxContainerRunning() {
+      const state = dockerContainerState(containerName, deps);
+      if (state === "running") {
+        if (await probeHealth(localHealthUrl)) {
+          stdout(`[6/7] Reusing existing sandbox container ${containerName}.`);
+          return { container: null, ownsContainer: true };
+        }
+        stdout(`[6/7] Existing sandbox container ${containerName} is running but unhealthy; restarting it.`);
+        if (restartContainerByName(containerName, deps)) {
+          await interruptibleSleep(2000);
+          if (await probeHealth(localHealthUrl)) {
+            stdout(`[6/7] Existing sandbox container ${containerName} recovered after restart.`);
+            return { container: null, ownsContainer: true };
+          }
+        }
+        stdout(`[6/7] Removing unhealthy sandbox container ${containerName}; container filesystem may be lost.`);
+        removeContainerByName(containerName, deps);
+      } else if (state) {
+        stdout(`[6/7] Resuming stopped sandbox container ${containerName} (${state}).`);
+        if (startContainerByName(containerName, deps)) {
+          for (let i = 0; i < 15; i += 1) {
+            await interruptibleSleep(1000);
+            if (await probeHealth(localHealthUrl)) {
+              stdout(`[6/7] Resumed sandbox container ${containerName}.`);
+              return { container: null, ownsContainer: true };
+            }
+          }
+        }
+        stdout(`[6/7] Stopped sandbox container ${containerName} did not become healthy; removing it and rebuilding.`);
+        removeContainerByName(containerName, deps);
+      }
+      return { container: spawnSandboxContainer(), ownsContainer: true };
     }
+
+    let { container, ownsContainer } = await ensureSandboxContainerRunning();
     const cleanedUpRef = { value: false };
     let tunnel = null;
     let tunnelLogs = [];
@@ -1095,7 +1136,16 @@ async function commandLaborServe(options, deps) {
     let tunnelRestartAttempts = 0;
 
     async function cleanupCurrentHire() {
-      await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef });
+      await cleanupRuntime({
+        hireId,
+        containerName,
+        container,
+        ownsContainer,
+        tunnel,
+        tunnelRuntime,
+        cleanedUpRef,
+        preserveContainer: shutdownRequested && hireRunning,
+      });
     }
     activeCleanupCurrentHire = cleanupCurrentHire;
     activeStopCleanupPromise = null;
@@ -1109,8 +1159,8 @@ async function commandLaborServe(options, deps) {
           return false;
         }
 
-        const running = dockerContainerRunning(containerName, deps);
-        if (running) {
+        const state = dockerContainerState(containerName, deps);
+        if (state === "running") {
           stdout(`\n⚠️  Sandbox container is unhealthy; restarting ${containerName}.\n`);
           if (restartContainerByName(containerName, deps)) {
             await interruptibleSleep(2000);
@@ -1120,7 +1170,18 @@ async function commandLaborServe(options, deps) {
             }
           }
           stdout(`Sandbox container restart did not recover; rebuilding ${containerName}.`);
-          stopContainerByName(containerName, deps);
+          removeContainerByName(containerName, deps);
+        } else if (state) {
+          stdout(`\n⚠️  Sandbox container ${containerName} is stopped (${state}); starting it for the active hire.\n`);
+          if (startContainerByName(containerName, deps)) {
+            await interruptibleSleep(2000);
+            if (await probeHealth(localHealthUrl)) {
+              stdout("Sandbox container recovered after start.");
+              return true;
+            }
+          }
+          stdout(`Sandbox container start did not recover; rebuilding ${containerName}.`);
+          removeContainerByName(containerName, deps);
         } else {
           stdout(`\n⚠️  Sandbox container ${containerName} is not running; rebuilding it for the active hire.\n`);
         }
@@ -1451,7 +1512,8 @@ async function commandLaborServe(options, deps) {
 async function commandLaborCleanup(_options, deps, flags) {
   const dryRun = !(flags && flags.has && flags.has("apply"));
   const volumes = dockerListHireStateVolumes(deps);
-  if (volumes.length === 0) {
+  const containers = dockerListHireContainers(deps);
+  if (volumes.length === 0 && containers.length === 0) {
     return JSON.stringify(
       { action: "labor-cleanup", mode: dryRun ? "dry-run" : "apply", checked: 0, kept: [], removed: [], failed: [] },
       null,
@@ -1498,21 +1560,35 @@ async function commandLaborCleanup(_options, deps, flags) {
   const kept = [];
   const removed = [];
   const failed = [];
+  for (const containerName of containers) {
+    const hireId = hireIdFromContainerName(containerName);
+    if (!hireId) continue;
+    if (activeHireIds.has(hireId)) {
+      kept.push({ type: "container", container: containerName, reason: "active-hire" });
+      continue;
+    }
+    if (dryRun) {
+      removed.push({ type: "container", container: containerName, hire_id: hireId, dry_run: true });
+      continue;
+    }
+    removeContainerByName(containerName, deps);
+    removed.push({ type: "container", container: containerName, hire_id: hireId });
+  }
   for (const volume of volumes) {
     const hireId = hireIdFromVolumeName(volume);
     if (!hireId) continue;
     if (activeHireIds.has(hireId)) {
-      kept.push({ volume, reason: "active-hire" });
+      kept.push({ type: "volume", volume, reason: "active-hire" });
       continue;
     }
     if (dryRun) {
-      removed.push({ volume, hire_id: hireId, dry_run: true });
+      removed.push({ type: "volume", volume, hire_id: hireId, dry_run: true });
       continue;
     }
     if (dockerRemoveVolume(volume, deps)) {
-      removed.push({ volume, hire_id: hireId });
+      removed.push({ type: "volume", volume, hire_id: hireId });
     } else {
-      failed.push({ volume, hire_id: hireId, reason: "docker volume rm failed (in use?)" });
+      failed.push({ type: "volume", volume, hire_id: hireId, reason: "docker volume rm failed (in use?)" });
     }
   }
 
@@ -1520,7 +1596,7 @@ async function commandLaborCleanup(_options, deps, flags) {
     {
       action: "labor-cleanup",
       mode: dryRun ? "dry-run" : "apply",
-      checked: volumes.length,
+      checked: volumes.length + containers.length,
       active_hires: Array.from(activeHireIds),
       kept,
       removed,

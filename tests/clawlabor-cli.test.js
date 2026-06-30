@@ -4451,6 +4451,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(spawned[1].args.includes("http2"));
   assert.deepEqual(spawned[1].opts.stdio, ["ignore", "pipe", "pipe"]);
   assert.equal(spawned[1].opts.detached, true);
+  assert.equal(spawned[0].args.includes("--rm"), false);
   assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
   assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "image inspect ryanxdocker/sandbox-clawlabor:0.4.4"));
   assert.ok(!spawnSyncCalls.some((c) => c.cmd === "docker" && c.args[0] === "pull"));
@@ -5371,7 +5372,7 @@ test("labor-serve reuses a running hire container instead of starting a replacem
       readClaudeOauthToken: () => "oauth-token-123",
       spawnSync: (cmd, args) => {
         if (cmd === "docker" && args.includes("inspect")) {
-          return { status: 0, stdout: "true\n" };
+          return { status: 0, stdout: "running\n" };
         }
         return spawnSync(cmd, args);
       },
@@ -5387,8 +5388,70 @@ test("labor-serve reuses a running hire container instead of starting a replacem
 
   assert.ok(out.some((line) => line.includes("Reusing existing sandbox container clawlabor-hire-hire-1")));
   assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.includes("run")), false);
-  assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"), false);
+  assert.ok(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
   assert.ok(spawned.some((child) => child.cmd === "cloudflared"));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
+});
+
+test("labor-serve resumes a stopped hire container to preserve container filesystem", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const spawned = [];
+  const spawnSyncCalls = [];
+  const out = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        spawnSyncCalls.push({ cmd, args });
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0, stdout: "" };
+        if (cmd === "docker" && args[0] === "inspect") return { status: 0, stdout: "exited\n" };
+        if (cmd === "docker" && args[0] === "start") return { status: 0, stdout: "" };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = { cmd, args, opts, kills: [], kill(signal) { this.kills.push(signal || "SIGTERM"); } };
+        spawned.push(child);
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.ok(spawnSyncCalls.some((call) => call.cmd === "docker" && call.args.join(" ") === "start clawlabor-hire-hire-1"));
+  assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.includes("run")), false);
+  assert.ok(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
+  assert.ok(out.some((line) => line.includes("Resuming stopped sandbox container clawlabor-hire-hire-1")));
+  assert.ok(out.some((line) => line.includes("Resumed sandbox container clawlabor-hire-hire-1")));
   assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
 });
 
@@ -5551,6 +5614,8 @@ test("labor-serve Ctrl+C stops local runtime and marks the labor seat offline", 
     "Ctrl+C must not DELETE the hire's serve record while the hire is still active",
   );
   assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
+  assert.equal(children.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"), false);
+  assert.ok(out.some((line) => line.includes("preserved for this active hire")), out.join("\n"));
 });
 
 test("labor-start publishes missing Claude labor then serves it", async () => {
@@ -6590,6 +6655,9 @@ test("labor-cleanup defaults to dry-run and lists stale volumes that would be re
           stderr: "",
         };
       }
+      if (cmd === "docker" && args[0] === "ps" && args.includes("--format")) {
+        return { status: 0, stdout: "", stderr: "" };
+      }
       return { status: 1, stdout: "", stderr: "" };
     },
   });
@@ -6629,6 +6697,9 @@ test("labor-cleanup --apply removes stale volumes via docker volume rm", async (
       if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
         return { status: 0, stdout: "clawlabor-hire-hire-stale-state\n", stderr: "" };
       }
+      if (cmd === "docker" && args[0] === "ps" && args.includes("--format")) {
+        return { status: 0, stdout: "", stderr: "" };
+      }
       if (cmd === "docker" && args[0] === "volume" && args[1] === "rm") {
         removed.push(args[2]);
         return { status: 0, stdout: "", stderr: "" };
@@ -6641,6 +6712,54 @@ test("labor-cleanup --apply removes stale volumes via docker volume rm", async (
   const result = JSON.parse(out[0]);
   assert.equal(result.mode, "apply");
   assert.deepEqual(result.removed.map((r) => r.volume), ["clawlabor-hire-hire-stale-state"]);
+});
+
+test("labor-cleanup --apply removes stale preserved hire containers", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{ id: "labor-9", seller_agent_id: "seller-1", name: "L", status: "available" }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1" }) }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: { status: 200, body: '{"items":[{"id":"hire-active","status":"active"}]}' },
+    },
+  ]);
+
+  const removed = [];
+  const out = [];
+  await runCli(["labor-cleanup", "--apply"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+    spawnSync: (cmd, args) => {
+      if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "docker" && args[0] === "ps" && args.includes("--format")) {
+        return {
+          status: 0,
+          stdout: ["clawlabor-hire-hire-active", "clawlabor-hire-hire-stale", ""].join("\n"),
+          stderr: "",
+        };
+      }
+      if (cmd === "docker" && args[0] === "rm" && args[1] === "-f") {
+        removed.push(args[2]);
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    },
+  });
+
+  assert.deepEqual(removed, ["clawlabor-hire-hire-stale"]);
+  const result = JSON.parse(out[0]);
+  assert.equal(result.mode, "apply");
+  assert.deepEqual(result.kept.map((r) => r.container), ["clawlabor-hire-hire-active"]);
+  assert.deepEqual(result.removed.map((r) => r.container).filter(Boolean), ["clawlabor-hire-hire-stale"]);
 });
 
 test("labor-cleanup aborts when active hire lookup fails so live hires are safe", async () => {
@@ -6668,6 +6787,13 @@ test("labor-cleanup aborts when active hire lookup fails so live hires are safe"
       spawnSync: (cmd, args) => {
         if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
           return { status: 0, stdout: "clawlabor-hire-hire-stale-state\n", stderr: "" };
+        }
+        if (cmd === "docker" && args[0] === "ps" && args.includes("--format")) {
+          return { status: 0, stdout: "clawlabor-hire-hire-stale\n", stderr: "" };
+        }
+        if (cmd === "docker" && args[0] === "rm" && args[1] === "-f") {
+          removed.push(args[2]);
+          return { status: 0 };
         }
         if (cmd === "docker" && args[0] === "volume" && args[1] === "rm") {
           removed.push(args[2]);
