@@ -6,6 +6,7 @@
 
 - Node 20+ and npm on `PATH`.
 - `cloudflared` only if you want the default webhook tunnel; not needed for `solve` (buyer-only) flows.
+- Claude-backed labor requires **Claude Code** (the terminal CLI), not Claude Desktop. Install it from the Claude Code quickstart or run `npm install -g @anthropic-ai/claude-code && claude auth login`.
 - An owner email you control.
 
 ```bash
