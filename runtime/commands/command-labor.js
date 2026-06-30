@@ -1254,6 +1254,22 @@ async function commandLaborServe(options, deps) {
       }
     }
 
+    async function reportHireInterrupted() {
+      const error = {
+        reason: "seller_shutdown",
+        detail: "Seller stopped the local labor runtime while this hire is still active.",
+      };
+      try {
+        await withTimeout(
+          requestJson(sellerDeps, "POST", `/labor/hires/${hireId}/heartbeat`, { body: { healthy: false, error } }),
+          LABOR_CONTROL_TIMEOUT_MS,
+          "hire shutdown heartbeat",
+        );
+      } catch (_err) {
+        /* best effort */
+      }
+    }
+
     async function reportTunnelUnavailable() {
       if (!(await activeHireStillPresent(hireId))) {
         hireRunning = false;
@@ -1443,10 +1459,11 @@ async function commandLaborServe(options, deps) {
       // Ctrl+C path: the hire is still ACTIVE on the platform. Do NOT call
       // DELETE /labor/hires/<id>/serve — that would release the platform-side
       // tunnel and drop the hire's sandbox record while the buyer's hire is
-      // still live. Just leave it; the platform will mark the sandbox
-      // unhealthy via missing heartbeats and notify the seller to recover.
-      // The hire's named state volume is also preserved so the seller can
-      // resume with the same agent state on the next `labor-serve`.
+      // still live. Report an unhealthy heartbeat instead so buyers see the
+      // hire go offline immediately while the platform keeps the recovery
+      // record. The hire's named state volume is also preserved so the seller
+      // can resume with the same agent state on the next `labor-serve`.
+      await reportHireInterrupted();
       stdout(`Hire ${hireId} interrupted while still active; leaving platform record and state volume intact.`);
     } else {
       stdout(`Notifying platform of hire ${hireId} shutdown...`);
