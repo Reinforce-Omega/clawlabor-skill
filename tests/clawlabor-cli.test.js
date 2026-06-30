@@ -26,6 +26,9 @@ const {
   cloudflaredArgs,
   startCloudflareTunnel,
 } = require("../runtime/commands/labor-tunnel");
+const {
+  forceKillProcess,
+} = require("../runtime/commands/labor-sandbox");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 
@@ -4448,12 +4451,14 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(spawned[1].args.includes("http2"));
   assert.deepEqual(spawned[1].opts.stdio, ["ignore", "pipe", "pipe"]);
   assert.equal(spawned[1].opts.detached, true);
+  assert.equal(spawned[0].args.includes("--rm"), false);
   assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
   assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "image inspect ryanxdocker/sandbox-clawlabor:0.4.4"));
   assert.ok(!spawnSyncCalls.some((c) => c.cmd === "docker" && c.args[0] === "pull"));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/heartbeat")));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "DELETE"));
+  assert.match(out[0], /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} GMT[+-]\d{2}:\d{2}\]/);
 });
 
 test("labor-serve suppresses captured cloudflared logs during the tunnel grace period", async () => {
@@ -4565,6 +4570,98 @@ test("cloudflared tunnel uses http2 by default", async () => {
   assert.match(out.join("\n"), /Starting Cloudflare tunnel/);
 });
 
+test("labor serve log timestamps use the local timezone", () => {
+  const previousTZ = process.env.TZ;
+  process.env.TZ = "Asia/Shanghai";
+  try {
+    assert.equal(formatLogTimestamp(() => Date.UTC(2026, 5, 30, 7, 15, 30)), "2026-06-30 15:15:30 GMT+08:00");
+  } finally {
+    if (previousTZ === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = previousTZ;
+    }
+  }
+});
+
+test("cloudflared tunnel runtime can restart the current process", async () => {
+  const spawned = [];
+  const stopped = [];
+  const out = [];
+  const runtime = startCloudflareTunnel({
+    spawn: (cmd, args, opts) => {
+      const child = new EventEmitter();
+      child.cmd = cmd;
+      child.args = args;
+      child.opts = opts;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      spawned.push(child);
+      return child;
+    },
+    stdout: (text) => out.push(text),
+    tunnelToken: "TT",
+    cleanedUpRef: { value: false },
+    isStopRequested: () => false,
+    stopTunnel: async (child) => stopped.push(child),
+  });
+
+  const first = runtime.currentTunnel();
+  await runtime.restart("test restart");
+
+  assert.equal(stopped[0], first);
+  assert.equal(spawned.length, 2);
+  assert.equal(runtime.currentTunnel(), spawned[1]);
+  assert.match(out.join("\n"), /Restarting Cloudflare tunnel \(test restart\)/);
+});
+
+test("cloudflared tunnel restart does not spawn after shutdown is requested", async () => {
+  const spawned = [];
+  const out = [];
+  let stopping = false;
+  const runtime = startCloudflareTunnel({
+    spawn: (cmd, args, opts) => {
+      const child = new EventEmitter();
+      child.cmd = cmd;
+      child.args = args;
+      child.opts = opts;
+      child.exitCode = null;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      spawned.push(child);
+      return child;
+    },
+    stdout: (text) => out.push(text),
+    tunnelToken: "TT",
+    cleanedUpRef: { value: false },
+    isStopRequested: () => stopping,
+    stopTunnel: async () => {
+      stopping = true;
+    },
+  });
+
+  const first = runtime.currentTunnel();
+  const restarted = await runtime.restart("test shutdown race");
+
+  assert.equal(restarted, first);
+  assert.equal(runtime.currentTunnel(), first);
+  assert.equal(spawned.length, 1);
+  assert.doesNotMatch(out.join("\n"), /Restarting Cloudflare tunnel \(test shutdown race\)/);
+});
+
+test("forceKillProcess resolves even when a child never emits exit", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  const signals = [];
+  child.kill = (signal) => signals.push(signal);
+
+  await forceKillProcess(child, 1);
+
+  assert.deepEqual(signals, ["SIGKILL"]);
+});
+
 test("cloudflaredArgs keeps the protocol flag before run", () => {
   assert.deepEqual(cloudflaredArgs("TT"), [
     "tunnel",
@@ -4643,10 +4740,12 @@ test("labor-serve keeps heartbeat healthy during the tunnel availability grace p
   assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
 
-test("labor-serve reports tunnel error after the availability timeout", async () => {
+test("labor-serve reports tunnel error after tunnel restart budget is exhausted", async () => {
   const stop = deferred();
   const heartbeatBodies = [];
   let nowMs = 0;
+  let heartbeatCount = 0;
+  const spawned = [];
   const { fetch } = recordingFetch([
     matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
     {
@@ -4667,8 +4766,9 @@ test("labor-serve reports tunnel error after the availability timeout", async ()
       match: ({ url, options }) =>
         options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
       respond: ({ options }) => {
+        heartbeatCount += 1;
         heartbeatBodies.push(JSON.parse(options.body));
-        stop.resolve();
+        if (heartbeatCount >= 4) stop.resolve();
         return { status: 204, body: "" };
       },
     },
@@ -4692,16 +4792,22 @@ test("labor-serve reports tunnel error after the availability timeout", async ()
         child.cmd = cmd;
         child.args = args;
         child.opts = opts;
+        child.exitCode = null;
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
-        child.kill = function kill() {};
+        child.kill = function kill(signal) {
+          this.killedWith = signal || "SIGTERM";
+          this.exitCode = 0;
+          this.emit("exit", 0, null);
+        };
+        spawned.push(child);
         if (cmd === "cloudflared") {
           queueMicrotask(() => child.stderr.emit("data", Buffer.from("cf still unavailable\n")));
         }
         return child;
       },
       sleep: async () => {
-        nowMs = 181_000;
+        nowMs += 181_000;
       },
       waitForExit: () => stop.promise,
       probePublicHealthWithDnsFallback: async () => false,
@@ -4709,12 +4815,93 @@ test("labor-serve reports tunnel error after the availability timeout", async ()
     },
   );
 
-  assert.equal(heartbeatBodies.length, 1);
-  assert.equal(heartbeatBodies[0].healthy, false);
-  assert.equal(heartbeatBodies[0].error.reason, "tunnel_unreachable");
-  assert.match(heartbeatBodies[0].error.detail, /Public tunnel health check failed/);
-  assert.deepEqual(heartbeatBodies[0].error.recent_cloudflared_logs, ["cf still unavailable"]);
+  assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 4);
+  assert.equal(heartbeatBodies.length, 4);
+  assert.deepEqual(heartbeatBodies.slice(0, 3), [{ healthy: true }, { healthy: true }, { healthy: true }]);
+  assert.equal(heartbeatBodies[3].healthy, false);
+  assert.equal(heartbeatBodies[3].error.reason, "tunnel_unreachable");
+  assert.match(heartbeatBodies[3].error.detail, /Public tunnel health check failed/);
+  assert.ok(heartbeatBodies[3].error.recent_cloudflared_logs.includes("cf still unavailable"));
+  assert.match(out.join("\n"), /restarting Cloudflare tunnel \(3\/3\)/);
   assert.match(out.join("\n"), /more than 180s; reporting OFFLINE/);
+});
+
+test("labor-serve restarts cloudflared before reporting tunnel offline", async () => {
+  const stop = deferred();
+  const heartbeatBodies = [];
+  const spawned = [];
+  let nowMs = 0;
+  let heartbeatCount = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => String(url).startsWith("https://")
+        ? { status: 503, body: "down" }
+        : { status: 200, body: '{"status":"ok"}' },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: ({ options }) => {
+        heartbeatCount += 1;
+        heartbeatBodies.push(JSON.parse(options.body));
+        if (heartbeatCount >= 2) stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.exitCode = null;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill(signal) {
+          this.killedWith = signal || "SIGTERM";
+          this.exitCode = 0;
+          this.emit("exit", 0, null);
+        };
+        spawned.push(child);
+        return child;
+      },
+      sleep: async (ms) => {
+        if (ms === 60000) nowMs = 181_000;
+      },
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+      now: () => nowMs,
+    },
+  );
+
+  assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 2);
+  assert.deepEqual(heartbeatBodies, [{ healthy: true }, { healthy: true }]);
+  assert.match(out.join("\n"), /restarting Cloudflare tunnel \(1\/3\)/);
+  assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
 
 test("labor-serve pulls the pinned sandbox image when it is missing locally", async () => {
@@ -4918,7 +5105,7 @@ test("labor-serve uses Cloudflare DNS fallback before marking a public tunnel of
 });
 
 test("labor-serve treats public health fallback exceptions as unhealthy", async () => {
-  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  const stop = deferred();
   let hirePolls = 0;
   let nowMs = 0;
   const { fetch: apiFetch, calls } = recordingFetch([
@@ -4940,8 +5127,15 @@ test("labor-serve treats public health fallback exceptions as unhealthy", async 
       body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
     }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
-    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
-    stopAfterHireTeardown,
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: () => {
+        stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
   ]);
 
   await runCli(
@@ -4971,7 +5165,7 @@ test("labor-serve treats public health fallback exceptions as unhealthy", async 
   const heartbeat = calls.find((call) =>
     call.options.method === "POST" && call.url.endsWith("/labor/hires/hire-1/heartbeat"),
   );
-  assert.equal(JSON.parse(heartbeat.options.body).healthy, false);
+  assert.equal(JSON.parse(heartbeat.options.body).healthy, true);
 });
 
 test("labor-serve starts cloudflared only after sandbox local health is ready", async () => {
@@ -5192,7 +5386,7 @@ test("labor-serve reuses a running hire container instead of starting a replacem
       readClaudeOauthToken: () => "oauth-token-123",
       spawnSync: (cmd, args) => {
         if (cmd === "docker" && args.includes("inspect")) {
-          return { status: 0, stdout: "true\n" };
+          return { status: 0, stdout: "running\n" };
         }
         return spawnSync(cmd, args);
       },
@@ -5208,8 +5402,70 @@ test("labor-serve reuses a running hire container instead of starting a replacem
 
   assert.ok(out.some((line) => line.includes("Reusing existing sandbox container clawlabor-hire-hire-1")));
   assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.includes("run")), false);
-  assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"), false);
+  assert.ok(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
   assert.ok(spawned.some((child) => child.cmd === "cloudflared"));
+  assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
+});
+
+test("labor-serve resumes a stopped hire container to preserve container filesystem", async () => {
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  let hirePolls = 0;
+  const spawned = [];
+  const spawnSyncCalls = [];
+  const out = [];
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (text) => out.push(text),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        spawnSyncCalls.push({ cmd, args });
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0, stdout: "" };
+        if (cmd === "docker" && args[0] === "inspect") return { status: 0, stdout: "exited\n" };
+        if (cmd === "docker" && args[0] === "start") return { status: 0, stdout: "" };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = { cmd, args, opts, kills: [], kill(signal) { this.kills.push(signal || "SIGTERM"); } };
+        spawned.push(child);
+        return child;
+      },
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.ok(spawnSyncCalls.some((call) => call.cmd === "docker" && call.args.join(" ") === "start clawlabor-hire-hire-1"));
+  assert.equal(spawned.some((child) => child.cmd === "docker" && child.args.includes("run")), false);
+  assert.ok(spawned.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
+  assert.ok(out.some((line) => line.includes("Resuming stopped sandbox container clawlabor-hire-hire-1")));
+  assert.ok(out.some((line) => line.includes("Resumed sandbox container clawlabor-hire-hire-1")));
   assert.ok(calls.some((call) => call.url.endsWith("/labor/hires/hire-1/heartbeat")));
 });
 
@@ -5372,6 +5628,8 @@ test("labor-serve Ctrl+C stops local runtime and marks the labor seat offline", 
     "Ctrl+C must not DELETE the hire's serve record while the hire is still active",
   );
   assert.ok(calls.some((call) => call.url.endsWith("/labor/labor-9/serve") && call.options.method === "DELETE"));
+  assert.equal(children.some((child) => child.cmd === "docker" && child.args.join(" ") === "rm -f clawlabor-hire-hire-1"), false);
+  assert.ok(out.some((line) => line.includes("preserved for this active hire")), out.join("\n"));
 });
 
 test("labor-start publishes missing Claude labor then serves it", async () => {
@@ -5931,6 +6189,7 @@ test("labor-unpublish delists a resource (sets it inactive)", async () => {
 
 // --- opencode runtime: per-runtime sandbox credential seam (Task 1) ---
 const {
+  formatLogTimestamp,
   opencodeAuthPath,
   resolveRuntimeSandboxCredentials,
   runtimeStateInitCommand,
@@ -6411,6 +6670,9 @@ test("labor-cleanup defaults to dry-run and lists stale volumes that would be re
           stderr: "",
         };
       }
+      if (cmd === "docker" && args[0] === "ps" && args.includes("--format")) {
+        return { status: 0, stdout: "", stderr: "" };
+      }
       return { status: 1, stdout: "", stderr: "" };
     },
   });
@@ -6450,6 +6712,9 @@ test("labor-cleanup --apply removes stale volumes via docker volume rm", async (
       if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
         return { status: 0, stdout: "clawlabor-hire-hire-stale-state\n", stderr: "" };
       }
+      if (cmd === "docker" && args[0] === "ps" && args.includes("--format")) {
+        return { status: 0, stdout: "", stderr: "" };
+      }
       if (cmd === "docker" && args[0] === "volume" && args[1] === "rm") {
         removed.push(args[2]);
         return { status: 0, stdout: "", stderr: "" };
@@ -6462,6 +6727,54 @@ test("labor-cleanup --apply removes stale volumes via docker volume rm", async (
   const result = JSON.parse(out[0]);
   assert.equal(result.mode, "apply");
   assert.deepEqual(result.removed.map((r) => r.volume), ["clawlabor-hire-hire-stale-state"]);
+});
+
+test("labor-cleanup --apply removes stale preserved hire containers", async () => {
+  const { fetch } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", {
+      status: 200,
+      body: JSON.stringify({
+        items: [{ id: "labor-9", seller_agent_id: "seller-1", name: "L", status: "available" }],
+        next_cursor: null,
+      }),
+    }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1" }) }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: { status: 200, body: '{"items":[{"id":"hire-active","status":"active"}]}' },
+    },
+  ]);
+
+  const removed = [];
+  const out = [];
+  await runCli(["labor-cleanup", "--apply"], {
+    env: BASE_ENV,
+    fetch,
+    stdout: (t) => out.push(t),
+    spawnSync: (cmd, args) => {
+      if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "docker" && args[0] === "ps" && args.includes("--format")) {
+        return {
+          status: 0,
+          stdout: ["clawlabor-hire-hire-active", "clawlabor-hire-hire-stale", ""].join("\n"),
+          stderr: "",
+        };
+      }
+      if (cmd === "docker" && args[0] === "rm" && args[1] === "-f") {
+        removed.push(args[2]);
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    },
+  });
+
+  assert.deepEqual(removed, ["clawlabor-hire-hire-stale"]);
+  const result = JSON.parse(out[0]);
+  assert.equal(result.mode, "apply");
+  assert.deepEqual(result.kept.map((r) => r.container), ["clawlabor-hire-hire-active"]);
+  assert.deepEqual(result.removed.map((r) => r.container).filter(Boolean), ["clawlabor-hire-hire-stale"]);
 });
 
 test("labor-cleanup aborts when active hire lookup fails so live hires are safe", async () => {
@@ -6489,6 +6802,13 @@ test("labor-cleanup aborts when active hire lookup fails so live hires are safe"
       spawnSync: (cmd, args) => {
         if (cmd === "docker" && args[0] === "volume" && args[1] === "ls") {
           return { status: 0, stdout: "clawlabor-hire-hire-stale-state\n", stderr: "" };
+        }
+        if (cmd === "docker" && args[0] === "ps" && args.includes("--format")) {
+          return { status: 0, stdout: "clawlabor-hire-hire-stale\n", stderr: "" };
+        }
+        if (cmd === "docker" && args[0] === "rm" && args[1] === "-f") {
+          removed.push(args[2]);
+          return { status: 0 };
         }
         if (cmd === "docker" && args[0] === "volume" && args[1] === "rm") {
           removed.push(args[2]);
