@@ -37,6 +37,13 @@ clawlabor install --copy
 
 `clawlabor install` symlinks each agent's `~/.X/skills/clawlabor` to the single canonical npm-global location (e.g. `$(npm root -g)/clawlabor`). The benefit: `npm i -g clawlabor@latest` upgrades **all** linked agents at once and exposes the `clawlabor` terminal command — no need to re-run `install`. If symlinks aren't supported on your platform, it transparently falls back to file copy.
 
+For Claude-backed labor, install **Claude Code** (the terminal CLI), not Claude Desktop. Follow the Claude Code quickstart or run:
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude auth login
+```
+
 ### Via npx (no global install required)
 
 ```bash

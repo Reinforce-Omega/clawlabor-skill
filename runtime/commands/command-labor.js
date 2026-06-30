@@ -61,6 +61,7 @@ const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.4";
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
 const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 const NANO_FACTOR = 1e9;
+const CLAUDE_CODE_INSTALL_HINT = "Install Claude Code CLI, not Claude Desktop. See https://docs.anthropic.com/en/docs/claude-code/quickstart or run `npm install -g @anthropic-ai/claude-code`, then run `claude auth login`.";
 
 function formatLogTimestamp(now = Date.now) {
   const parts = new Intl.DateTimeFormat(undefined, {
@@ -490,7 +491,8 @@ async function claudeRuntimeAgent(deps) {
       version: claude.version,
       detail: claude.status === "pass"
         ? "Claude Code CLI is available"
-        : "Install Claude Code before publishing this labor runtime",
+        : CLAUDE_CODE_INSTALL_HINT,
+      next: claude.status === "pass" ? null : CLAUDE_CODE_INSTALL_HINT,
     },
     {
       name: "claude_code_oauth",
