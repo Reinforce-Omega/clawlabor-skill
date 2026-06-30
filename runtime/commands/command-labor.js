@@ -294,6 +294,27 @@ function missingRequirementNames(agent) {
     .map((item) => item.name);
 }
 
+function failedRequirements(agent) {
+  return (agent.requirements || [])
+    .filter((item) => item && item.status !== "pass");
+}
+
+function requirementSetupSteps(agent) {
+  return failedRequirements(agent)
+    .map((item) => item.next || item.detail)
+    .filter(Boolean);
+}
+
+function serveStatusStep(agent) {
+  if (agent.serve_status === "candidate_not_wired_to_labor_serve") {
+    return `${agent.name} is publish-only in this CLI version. Use a runtime with a start_command, such as claude or opencode.`;
+  }
+  if (agent.serve_status === "not_installed") {
+    return `Install ${agent.name}, then rerun \`clawlabor labor-agents\`.`;
+  }
+  return null;
+}
+
 function compactHostAccount(account) {
   if (!account || !account.logged_in) {
     return { provider: "claude", status: "not_logged_in" };
@@ -317,7 +338,8 @@ function nanoToUatDisplay(nano) {
 }
 
 function summarizeLaborAgent(agent, existingLaborByRuntime) {
-  const missing = missingRequirementNames(agent);
+  const failed = failedRequirements(agent);
+  const missing = failed.map((item) => item.name);
   const existing = existingLaborByRuntime[agent.runtime] || null;
   const publishCommand = agent.publish_command_template;
   const summary = {
@@ -354,6 +376,21 @@ function summarizeLaborAgent(agent, existingLaborByRuntime) {
       }
     }
     summary.start_command = startParts.join(" ");
+    summary.next_action = {
+      type: "start_labor",
+      ready: true,
+      command: summary.start_command,
+    };
+  } else {
+    const setupSteps = requirementSetupSteps(agent);
+    const statusStep = serveStatusStep(agent);
+    summary.next_action = {
+      type: agent.ready_to_publish ? "finish_runtime_setup" : "install_runtime",
+      ready: false,
+      blocked_by: missing.length > 0 ? missing : [agent.serve_status || "runtime_not_serveable"],
+      steps: setupSteps.length > 0 ? setupSteps : [statusStep || "Run `clawlabor labor-agents --verbose` for diagnostics."],
+      diagnostics_command: "clawlabor labor-agents --verbose",
+    };
   }
   return summary;
 }
@@ -472,6 +509,9 @@ async function claudeRuntimeAgent(deps) {
       detail: docker.status === "pass"
         ? "Docker CLI is available"
         : "Install/start Docker Desktop before running labor-serve",
+      next: docker.status === "pass"
+        ? null
+        : "Install Docker Desktop, start it, then rerun `clawlabor labor-agents`.",
     },
     {
       name: "cloudflared",
@@ -481,6 +521,9 @@ async function claudeRuntimeAgent(deps) {
       detail: cloudflared.status === "pass"
         ? "cloudflared is available"
         : "Install cloudflared before running labor-serve",
+      next: cloudflared.status === "pass"
+        ? null
+        : "Install cloudflared (`brew install cloudflared` on macOS), then rerun `clawlabor labor-agents`.",
     },
   ];
   const claudeRequirements = [
@@ -553,13 +596,16 @@ async function commandLaborAgents(_options, deps, flags) {
           status: codex.status,
           command: "codex --version",
           version: codex.version,
-          detail: codex.status === "pass"
-            ? "Codex CLI is installed locally; Clawlabor labor-serve is not wired to start Codex-backed sandbox sessions yet"
-            : codex.on_path
-              ? "Codex CLI is on PATH but failed to run; repair the local Codex install before publishing a Codex-backed labor runtime"
-              : "Install Codex CLI before publishing a Codex-backed labor runtime",
-          error: codex.error,
-        },
+      detail: codex.status === "pass"
+        ? "Codex CLI is installed locally; Clawlabor labor-serve is not wired to start Codex-backed sandbox sessions yet"
+        : codex.on_path
+          ? "Codex CLI is on PATH but failed to run; repair the local Codex install before publishing a Codex-backed labor runtime"
+          : "Install Codex CLI before publishing a Codex-backed labor runtime",
+      next: codex.status === "pass"
+        ? "Codex is publish-only in this CLI version. Use `--runtime claude` or `--runtime opencode` for labor-start."
+        : "Install or repair Codex CLI, then rerun `clawlabor labor-agents`.",
+      error: codex.error,
+    },
       ],
       publishName: "Codex Labor",
     }),
@@ -582,20 +628,24 @@ async function commandLaborAgents(_options, deps, flags) {
           status: opencode.status,
           command: "opencode --version",
           version: opencode.version,
-          detail: opencode.status === "pass"
-            ? "OpenCode CLI is installed locally"
-            : opencode.on_path
-              ? "OpenCode CLI is on PATH but failed to run; repair the local OpenCode install before publishing an OpenCode-backed labor runtime"
-              : "Install OpenCode CLI before publishing an OpenCode-backed labor runtime",
-          error: opencode.error,
-        },
+      detail: opencode.status === "pass"
+        ? "OpenCode CLI is installed locally"
+        : opencode.on_path
+          ? "OpenCode CLI is on PATH but failed to run; repair the local OpenCode install before publishing an OpenCode-backed labor runtime"
+          : "Install OpenCode CLI before publishing an OpenCode-backed labor runtime",
+      next: opencode.status === "pass"
+        ? null
+        : "Install or repair OpenCode CLI, then rerun `clawlabor labor-agents`.",
+      error: opencode.error,
+    },
         {
           name: "opencode_auth",
           status: opencodeAuthPresent ? "pass" : "fail",
-          detail: opencodeAuthPresent
-            ? "OpenCode auth.json found; labor-serve will mount it read-only into the sandbox"
-            : "Run `opencode auth login` so labor-serve can pass your provider credentials into the sandbox",
-        },
+      detail: opencodeAuthPresent
+        ? "OpenCode auth.json found; labor-serve will mount it read-only into the sandbox"
+        : "Run `opencode auth login` so labor-serve can pass your provider credentials into the sandbox",
+      next: opencodeAuthPresent ? null : "Run `opencode auth login`, then rerun `clawlabor labor-agents`.",
+    },
       ],
       publishName: "OpenCode Labor",
     }),

@@ -4172,12 +4172,22 @@ test("labor-agents reports concise local runtime inventory by default", async ()
   // start_command converges publish+serve into one command (serve_command removed).
   assert.equal(claude.serve_command, undefined);
   assert.equal(claude.start_command, "clawlabor labor-start --runtime claude");
+  assert.deepEqual(claude.next_action, {
+    type: "start_labor",
+    ready: true,
+    command: "clawlabor labor-start --runtime claude",
+  });
   assert.equal(claude.path, undefined);
   assert.equal(claude.requirements, undefined);
   const codex = parsed.agents[1];
   assert.equal(codex.status, "publish_only");
   assert.equal(codex.can_publish, true);
   assert.equal(codex.can_serve, false);
+  assert.equal(codex.next_action.type, "finish_runtime_setup");
+  assert.equal(codex.next_action.ready, false);
+  assert.deepEqual(codex.next_action.blocked_by, ["candidate_not_wired_to_labor_serve"]);
+  assert.match(codex.next_action.steps.join(" "), /publish-only/);
+  assert.equal(codex.next_action.diagnostics_command, "clawlabor labor-agents --verbose");
 });
 
 test("labor-agents shows auth failure instead of null account fields", async () => {
@@ -4258,6 +4268,83 @@ test("labor-agents gives a complete publish command before a labor exists", asyn
   // agent can fire it off without lookups. Claude has no suggested token cap.
   assert.match(claude.start_command, /^clawlabor labor-start --runtime claude --daily-rate \d+$/);
   assert.equal(claude.start_command.includes("<"), false);
+  assert.equal(claude.next_action.type, "start_labor");
+  assert.equal(claude.next_action.command, claude.start_command);
+});
+
+test("labor-agents gives setup steps when Claude is installed but not ready to start", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      readClaudeOauthToken: () => null,
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          authMethod: "claude.ai",
+          apiProvider: "firstParty",
+          email: "seller@example.com",
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents.find((agent) => agent.runtime === "claude");
+  assert.equal(claude.status, "publish_only");
+  assert.equal(claude.can_publish, true);
+  assert.equal(claude.can_serve, false);
+  assert.deepEqual(claude.needs, ["claude_code_oauth"]);
+  assert.equal(claude.next_action.type, "finish_runtime_setup");
+  assert.equal(claude.next_action.ready, false);
+  assert.deepEqual(claude.next_action.blocked_by, ["claude_code_oauth"]);
+  assert.match(claude.next_action.steps.join(" "), /claude setup-token/);
+  assert.match(claude.next_action.steps.join(" "), /clawlabor labor-start --runtime claude/);
+});
+
+test("labor-agents gives first-run setup steps when Claude, Docker, and cloudflared are missing", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      readClaudeOauthToken: () => null,
+      runClaudeAuthStatus: async () => ({ ok: false, account: { loggedIn: false } }),
+      spawnSync: (cmd, args) => {
+        const tool = cmd === "sh" ? args[3] : cmd;
+        const missing = new Set(["claude", "docker", "cloudflared"]);
+        const status = missing.has(tool) ? 1 : 0;
+        return {
+          status,
+          stdout: status === 0 ? `${tool} version ok` : "",
+          stderr: status === 0 ? "" : `${tool}: command not found`,
+        };
+      },
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents.find((agent) => agent.runtime === "claude");
+  assert.equal(claude.status, "not_installed");
+  assert.equal(claude.can_publish, false);
+  assert.equal(claude.can_serve, false);
+  assert.deepEqual(claude.needs, ["claude_cli", "claude_code_oauth", "docker", "cloudflared"]);
+  assert.equal(claude.next_action.type, "install_runtime");
+  assert.deepEqual(claude.next_action.blocked_by, ["claude_cli", "claude_code_oauth", "docker", "cloudflared"]);
+  const steps = claude.next_action.steps.join("\n");
+  assert.match(steps, /Install Claude Code CLI/);
+  assert.match(steps, /not Claude Desktop/);
+  assert.match(steps, /@anthropic-ai\/claude-code/);
+  assert.match(steps, /Install Docker Desktop/);
+  assert.match(steps, /Install cloudflared/);
+  assert.equal(claude.next_action.diagnostics_command, "clawlabor labor-agents --verbose");
 });
 
 test("labor-agents --verbose keeps diagnostic detail", async () => {
