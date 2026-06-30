@@ -4458,7 +4458,7 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/heartbeat")));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/hires/hire-1/serve") && c.options.method === "DELETE"));
   assert.ok(calls.some((c) => c.url.endsWith("/labor/labor-9/serve") && c.options.method === "DELETE"));
-  assert.match(out[0], /^\[\d{4}-\d{2}-\d{2}T/);
+  assert.match(out[0], /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} GMT[+-]\d{2}:\d{2}\]/);
 });
 
 test("labor-serve suppresses captured cloudflared logs during the tunnel grace period", async () => {
@@ -4568,6 +4568,20 @@ test("cloudflared tunnel uses http2 by default", async () => {
   assert.equal(runtime.currentTunnel(), spawned[0]);
   assert.equal(runtime.state.protocol, "http2");
   assert.match(out.join("\n"), /Starting Cloudflare tunnel/);
+});
+
+test("labor serve log timestamps use the local timezone", () => {
+  const previousTZ = process.env.TZ;
+  process.env.TZ = "Asia/Shanghai";
+  try {
+    assert.equal(formatLogTimestamp(() => Date.UTC(2026, 5, 30, 7, 15, 30)), "2026-06-30 15:15:30 GMT+08:00");
+  } finally {
+    if (previousTZ === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = previousTZ;
+    }
+  }
 });
 
 test("cloudflared tunnel runtime can restart the current process", async () => {
@@ -6175,6 +6189,7 @@ test("labor-unpublish delists a resource (sets it inactive)", async () => {
 
 // --- opencode runtime: per-runtime sandbox credential seam (Task 1) ---
 const {
+  formatLogTimestamp,
   opencodeAuthPath,
   resolveRuntimeSandboxCredentials,
   runtimeStateInitCommand,

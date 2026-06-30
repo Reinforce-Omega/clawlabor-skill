@@ -63,7 +63,31 @@ const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 const NANO_FACTOR = 1e9;
 
 function formatLogTimestamp(now = Date.now) {
-  return new Date(now()).toISOString();
+  const parts = new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "shortOffset",
+  }).formatToParts(new Date(now()));
+  const valueByType = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  const offset = formatLogTimezoneOffset(valueByType.timeZoneName);
+  return `${valueByType.year}-${valueByType.month}-${valueByType.day} ${valueByType.hour}:${valueByType.minute}:${valueByType.second} ${offset}`;
+}
+
+function formatLogTimezoneOffset(timeZoneName) {
+  if (!timeZoneName || timeZoneName === "GMT") return "GMT+00:00";
+  const match = /^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(timeZoneName);
+  if (!match) return timeZoneName;
+  const [, sign, hour, minute = "00"] = match;
+  return `GMT${sign}${hour.padStart(2, "0")}:${minute}`;
 }
 
 function createTimestampedStdout(stdout, now = Date.now) {
@@ -1626,4 +1650,5 @@ module.exports = {
   resolveRuntimeSandboxCredentials,
   hireStateVolumeName,
   hireIdFromVolumeName,
+  formatLogTimestamp,
 };
