@@ -10,13 +10,14 @@
  * - Hermes:      ~/.hermes/skills/clawlabor/
  *
  * Usage:
- *   npx --yes clawlabor install            # Install for all detected platforms
- *   npx --yes clawlabor install --claude    # Install for Claude Code only
- *   npx --yes clawlabor install --openclaw  # Install for OpenClaw only
- *   npx --yes clawlabor install --codex     # Install for Codex CLI only
- *   npx --yes clawlabor install --hermes    # Install for Hermes only
- *   npx --yes clawlabor install --project   # Install in current project's agent skill dirs
- *   npx --yes clawlabor install --uninstall # Remove from all platforms
+ *   npm i -g clawlabor@latest              # Install the terminal CLI globally
+ *   clawlabor install                      # Link all detected runtime skill dirs
+ *   clawlabor install --claude             # Install for Claude Code only
+ *   clawlabor install --openclaw           # Install for OpenClaw only
+ *   clawlabor install --codex              # Install for Codex CLI only
+ *   clawlabor install --hermes             # Install for Hermes only
+ *   clawlabor install --project            # Install in current project's agent skill dirs
+ *   clawlabor install --uninstall          # Remove from all platforms
  */
 
 const fs = require("fs");
@@ -254,15 +255,20 @@ function runInstaller(rawArgs = process.argv.slice(2)) {
 ClawLabor Skill Installer
 
 Usage:
-  npx --yes clawlabor install                     Install for all detected platforms
-  npx --yes clawlabor install --claude            Install for Claude Code only
-  npx --yes clawlabor install --openclaw          Install for OpenClaw only
-  npx --yes clawlabor install --codex             Install for Codex CLI only
-  npx --yes clawlabor install --hermes            Install for Hermes only
-  npx --yes clawlabor install --project           Install in current project's .claude/.openclaw/.codex/.hermes skill dirs
-  npx --yes clawlabor install --project --codex   Install in current project's .codex/skills/ only
-  npx --yes clawlabor install --uninstall         Remove from all platforms
-  npx --yes clawlabor install --help              Show this help
+  npm i -g clawlabor@latest                       Install the terminal CLI globally
+  clawlabor install                               Link all detected runtime skill dirs
+  clawlabor install --claude                      Install for Claude Code only
+  clawlabor install --openclaw                    Install for OpenClaw only
+  clawlabor install --codex                       Install for Codex CLI only
+  clawlabor install --hermes                      Install for Hermes only
+  clawlabor install --project                     Install in current project's .claude/.openclaw/.codex/.hermes skill dirs
+  clawlabor install --project --codex             Install in current project's .codex/skills/ only
+  clawlabor install --copy                        Copy files instead of symlinking to the global package
+  clawlabor install --uninstall                   Remove from all platforms
+  clawlabor install --help                        Show this help
+
+When installed globally, runtime skill dirs are symlinked to the npm-global
+package so \`npm i -g clawlabor@latest\` updates all linked runtimes.
 
 (Legacy GitHub installer remains supported via:
   npx --yes github:Reinforce-Omega/clawlabor-skill [...flags])
