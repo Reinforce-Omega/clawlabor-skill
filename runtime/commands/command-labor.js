@@ -55,6 +55,7 @@ const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const SANDBOX_STARTUP_TIMEOUT_MS = 180_000;
 const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.4";
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
+const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 const NANO_FACTOR = 1e9;
 
 function processAlive(pid) {
@@ -1074,6 +1075,7 @@ async function commandLaborServe(options, deps) {
     let healingSandbox = false;
     let tunnelAvailability = null;
     let tunnelRuntime = null;
+    let tunnelRestartAttempts = 0;
 
     async function cleanupCurrentHire() {
       await cleanupRuntime({ hireId, containerName, container, ownsContainer, tunnel, tunnelRuntime, cleanedUpRef });
@@ -1160,6 +1162,22 @@ async function commandLaborServe(options, deps) {
       stdout(formatTunnelUnavailableWarning({ publicHealthUrl, laborId, tunnelState, tunnelLogs }));
     }
 
+    async function restartTunnelAfterTimeout() {
+      if (!tunnelRuntime || typeof tunnelRuntime.restart !== "function") return false;
+      if (tunnelRestartAttempts >= MAX_TUNNEL_RESTART_ATTEMPTS) return false;
+      tunnelRestartAttempts += 1;
+      stdout(
+        `Public tunnel unreachable for more than ${tunnelAvailabilityTimeoutSeconds()}s; ` +
+          `restarting Cloudflare tunnel (${tunnelRestartAttempts}/${MAX_TUNNEL_RESTART_ATTEMPTS}).`,
+      );
+      tunnel = await tunnelRuntime.restart("public tunnel unreachable");
+      tunnelAvailability.reset();
+      tunnelGraceNoticePrinted = false;
+      tunnelTimeoutReported = false;
+      warnedTunnelDown = false;
+      return true;
+    }
+
     async function heartbeatOnce() {
       let healthy = await probeHealth(publicHealthUrl, { publicTunnel: true });
       let heartbeatBody = { healthy };
@@ -1179,15 +1197,21 @@ async function commandLaborServe(options, deps) {
               );
             }
           } else if (hireRunning) {
-            if (!tunnelTimeoutReported) {
-              tunnelTimeoutReported = true;
-              await reportTunnelUnavailable();
-              stdout(
-                `\n⚠️  Public tunnel has been unreachable for more than ` +
-                  `${tunnelAvailabilityTimeoutSeconds()}s; reporting OFFLINE to the platform.\n`,
-              );
+            if (await restartTunnelAfterTimeout()) {
+              healthy = true;
+              heartbeatBody = { healthy: true };
+              tunnelAvailability.markUnavailable();
+            } else {
+              if (!tunnelTimeoutReported) {
+                tunnelTimeoutReported = true;
+                await reportTunnelUnavailable();
+                stdout(
+                  `\n⚠️  Public tunnel has been unreachable for more than ` +
+                    `${tunnelAvailabilityTimeoutSeconds()}s; reporting OFFLINE to the platform.\n`,
+                );
+              }
+              heartbeatBody = { healthy: false, error: tunnelAvailability.failurePayload() };
             }
-            heartbeatBody = { healthy: false, error: tunnelAvailability.failurePayload() };
           }
         } else {
           warnedTunnelDown = false;
@@ -1213,6 +1237,7 @@ async function commandLaborServe(options, deps) {
         tunnelAvailability.reset();
         tunnelTimeoutReported = false;
         tunnelGraceNoticePrinted = false;
+        tunnelRestartAttempts = 0;
         heartbeatBody = { healthy: true };
       }
 
@@ -1246,6 +1271,10 @@ async function commandLaborServe(options, deps) {
       tunnelToken: tunnel_token,
       cleanedUpRef,
       isStopRequested: () => stopRequested,
+      stopTunnel: async (child) => {
+        terminateProcessGroup(child, "SIGTERM", deps);
+        await forceKillProcess(child, 3000, deps);
+      },
       logPrefix: "[7/7]",
     });
     tunnel = tunnelRuntime.tunnel;

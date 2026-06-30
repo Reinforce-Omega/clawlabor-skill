@@ -4565,6 +4565,38 @@ test("cloudflared tunnel uses http2 by default", async () => {
   assert.match(out.join("\n"), /Starting Cloudflare tunnel/);
 });
 
+test("cloudflared tunnel runtime can restart the current process", async () => {
+  const spawned = [];
+  const stopped = [];
+  const out = [];
+  const runtime = startCloudflareTunnel({
+    spawn: (cmd, args, opts) => {
+      const child = new EventEmitter();
+      child.cmd = cmd;
+      child.args = args;
+      child.opts = opts;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      spawned.push(child);
+      return child;
+    },
+    stdout: (text) => out.push(text),
+    tunnelToken: "TT",
+    cleanedUpRef: { value: false },
+    isStopRequested: () => false,
+    stopTunnel: async (child) => stopped.push(child),
+  });
+
+  const first = runtime.currentTunnel();
+  await runtime.restart("test restart");
+
+  assert.equal(stopped[0], first);
+  assert.equal(spawned.length, 2);
+  assert.equal(runtime.currentTunnel(), spawned[1]);
+  assert.match(out.join("\n"), /Restarting Cloudflare tunnel \(test restart\)/);
+});
+
 test("cloudflaredArgs keeps the protocol flag before run", () => {
   assert.deepEqual(cloudflaredArgs("TT"), [
     "tunnel",
@@ -4643,10 +4675,12 @@ test("labor-serve keeps heartbeat healthy during the tunnel availability grace p
   assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
 
-test("labor-serve reports tunnel error after the availability timeout", async () => {
+test("labor-serve reports tunnel error after tunnel restart budget is exhausted", async () => {
   const stop = deferred();
   const heartbeatBodies = [];
   let nowMs = 0;
+  let heartbeatCount = 0;
+  const spawned = [];
   const { fetch } = recordingFetch([
     matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
     {
@@ -4667,8 +4701,9 @@ test("labor-serve reports tunnel error after the availability timeout", async ()
       match: ({ url, options }) =>
         options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
       respond: ({ options }) => {
+        heartbeatCount += 1;
         heartbeatBodies.push(JSON.parse(options.body));
-        stop.resolve();
+        if (heartbeatCount >= 4) stop.resolve();
         return { status: 204, body: "" };
       },
     },
@@ -4692,16 +4727,22 @@ test("labor-serve reports tunnel error after the availability timeout", async ()
         child.cmd = cmd;
         child.args = args;
         child.opts = opts;
+        child.exitCode = null;
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
-        child.kill = function kill() {};
+        child.kill = function kill(signal) {
+          this.killedWith = signal || "SIGTERM";
+          this.exitCode = 0;
+          this.emit("exit", 0, null);
+        };
+        spawned.push(child);
         if (cmd === "cloudflared") {
           queueMicrotask(() => child.stderr.emit("data", Buffer.from("cf still unavailable\n")));
         }
         return child;
       },
       sleep: async () => {
-        nowMs = 181_000;
+        nowMs += 181_000;
       },
       waitForExit: () => stop.promise,
       probePublicHealthWithDnsFallback: async () => false,
@@ -4709,12 +4750,93 @@ test("labor-serve reports tunnel error after the availability timeout", async ()
     },
   );
 
-  assert.equal(heartbeatBodies.length, 1);
-  assert.equal(heartbeatBodies[0].healthy, false);
-  assert.equal(heartbeatBodies[0].error.reason, "tunnel_unreachable");
-  assert.match(heartbeatBodies[0].error.detail, /Public tunnel health check failed/);
-  assert.deepEqual(heartbeatBodies[0].error.recent_cloudflared_logs, ["cf still unavailable"]);
+  assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 4);
+  assert.equal(heartbeatBodies.length, 4);
+  assert.deepEqual(heartbeatBodies.slice(0, 3), [{ healthy: true }, { healthy: true }, { healthy: true }]);
+  assert.equal(heartbeatBodies[3].healthy, false);
+  assert.equal(heartbeatBodies[3].error.reason, "tunnel_unreachable");
+  assert.match(heartbeatBodies[3].error.detail, /Public tunnel health check failed/);
+  assert.ok(heartbeatBodies[3].error.recent_cloudflared_logs.includes("cf still unavailable"));
+  assert.match(out.join("\n"), /restarting Cloudflare tunnel \(3\/3\)/);
   assert.match(out.join("\n"), /more than 180s; reporting OFFLINE/);
+});
+
+test("labor-serve restarts cloudflared before reporting tunnel offline", async () => {
+  const stop = deferred();
+  const heartbeatBodies = [];
+  const spawned = [];
+  let nowMs = 0;
+  let heartbeatCount = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => String(url).startsWith("https://")
+        ? { status: 503, body: "down" }
+        : { status: 200, body: '{"status":"ok"}' },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: ({ options }) => {
+        heartbeatCount += 1;
+        heartbeatBodies.push(JSON.parse(options.body));
+        if (heartbeatCount >= 2) stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.exitCode = null;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill(signal) {
+          this.killedWith = signal || "SIGTERM";
+          this.exitCode = 0;
+          this.emit("exit", 0, null);
+        };
+        spawned.push(child);
+        return child;
+      },
+      sleep: async (ms) => {
+        if (ms === 60000) nowMs = 181_000;
+      },
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+      now: () => nowMs,
+    },
+  );
+
+  assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 2);
+  assert.deepEqual(heartbeatBodies, [{ healthy: true }, { healthy: true }]);
+  assert.match(out.join("\n"), /restarting Cloudflare tunnel \(1\/3\)/);
+  assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
 
 test("labor-serve pulls the pinned sandbox image when it is missing locally", async () => {
@@ -4918,7 +5040,7 @@ test("labor-serve uses Cloudflare DNS fallback before marking a public tunnel of
 });
 
 test("labor-serve treats public health fallback exceptions as unhealthy", async () => {
-  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  const stop = deferred();
   let hirePolls = 0;
   let nowMs = 0;
   const { fetch: apiFetch, calls } = recordingFetch([
@@ -4940,8 +5062,15 @@ test("labor-serve treats public health fallback exceptions as unhealthy", async 
       body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
     }),
     matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
-    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
-    stopAfterHireTeardown,
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: () => {
+        stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
   ]);
 
   await runCli(
@@ -4971,7 +5100,7 @@ test("labor-serve treats public health fallback exceptions as unhealthy", async 
   const heartbeat = calls.find((call) =>
     call.options.method === "POST" && call.url.endsWith("/labor/hires/hire-1/heartbeat"),
   );
-  assert.equal(JSON.parse(heartbeat.options.body).healthy, false);
+  assert.equal(JSON.parse(heartbeat.options.body).healthy, true);
 });
 
 test("labor-serve starts cloudflared only after sandbox local health is ready", async () => {

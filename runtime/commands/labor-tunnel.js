@@ -150,6 +150,7 @@ function startCloudflareTunnel({
   tunnelToken,
   cleanedUpRef,
   isStopRequested,
+  stopTunnel,
   logPrefix = "[7/7]",
 }) {
   stdout(`${logPrefix} Starting Cloudflare tunnel...`);
@@ -196,7 +197,20 @@ function startCloudflareTunnel({
 
   attachHandlers(spawnTunnel());
 
-  return { tunnel: currentTunnel, currentTunnel: () => currentTunnel, logs, state };
+  async function restart(reason = "public tunnel unreachable") {
+    const previousTunnel = currentTunnel;
+    if (stopTunnel) {
+      await stopTunnel(previousTunnel);
+    } else if (previousTunnel && typeof previousTunnel.kill === "function") {
+      try { previousTunnel.kill("SIGTERM"); } catch (_err) { /* noop */ }
+    }
+    stdout(`Restarting Cloudflare tunnel (${reason})...`);
+    const nextTunnel = spawnTunnel(state.protocol === "auto" ? DEFAULT_CLOUDFLARED_PROTOCOL : state.protocol);
+    attachHandlers(nextTunnel);
+    return nextTunnel;
+  }
+
+  return { tunnel: currentTunnel, currentTunnel: () => currentTunnel, logs, state, restart };
 }
 
 function createSandboxHealthProbe({ deps, sandboxToken, timeoutMs }) {
