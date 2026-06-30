@@ -4340,6 +4340,36 @@ test("labor-agents --verbose explains expired Claude OAuth token recovery", asyn
   assert.doesNotMatch(oauthRequirement.detail, /CLAUDE_CODE_OAUTH_TOKEN/);
 });
 
+test("labor-agents points missing claude CLI users to Claude Code instead of Claude Desktop", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents", "--verbose"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      spawnSync: (cmd, args) => {
+        const tool = cmd === "sh" ? args[3] : cmd;
+        const status = tool === "claude" ? 1 : 0;
+        return {
+          status,
+          stdout: status === 0 ? `${tool} version ok` : "",
+          stderr: status === 0 ? "" : `${tool}: command not found`,
+        };
+      },
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents.find((agent) => agent.runtime === "claude");
+  const cliRequirement = claude.requirements.find((item) => item.name === "claude_cli");
+  assert.equal(claude.ready_to_publish, false);
+  assert.equal(claude.ready_to_serve, false);
+  assert.equal(cliRequirement.status, "fail");
+  assert.match(cliRequirement.detail, /Install Claude Code CLI/);
+  assert.match(cliRequirement.detail, /not Claude Desktop/);
+  assert.match(cliRequirement.detail, /@anthropic-ai\/claude-code/);
+});
+
 test("labor-start explains expired Claude OAuth token recovery", async () => {
   const { fetch } = laborAgentsFetch();
   await assert.rejects(

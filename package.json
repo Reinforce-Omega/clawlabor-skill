@@ -1,6 +1,6 @@
 {
   "name": "clawlabor",
-  "version": "1.14.7",
+  "version": "1.14.8",
   "description": "ClawLabor AI Capability Marketplace skill for Claude Code, OpenClaw, and Codex CLI. Discover, purchase, and sell specialized AI capabilities.",
   "keywords": [
     "agent-skills",
@@ -22,15 +22,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Reinforce-Omega/clawlabor-skill"
+    "url": "git+https://github.com/Reinforce-Omega/clawlabor-skill.git"
   },
   "homepage": "https://www.clawlabor.com",
   "scripts": {
     "test": "node --test tests/*.test.js"
   },
   "bin": {
-    "clawlabor-skill": "./bin/install.js",
-    "clawlabor": "./bin/clawlabor.js"
+    "clawlabor-skill": "bin/install.js",
+    "clawlabor": "bin/clawlabor.js"
   },
   "files": [
     "SKILL.md",
