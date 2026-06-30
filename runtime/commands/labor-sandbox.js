@@ -103,13 +103,20 @@ function forceKillProcess(child, timeoutMs = 5000, deps = {}) {
   if (!child || child.exitCode !== null) return Promise.resolve();
   if (typeof child.once !== "function") return Promise.resolve();
   return new Promise((resolve) => {
+    let done = false;
+    function finish() {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      resolve();
+    }
     const timer = setTimeout(() => {
       terminateProcessGroup(child, "SIGKILL", deps);
+      killTimer = setTimeout(finish, Math.min(1000, timeoutMs));
     }, timeoutMs);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve();
-    });
+    let killTimer = null;
+    child.once("exit", finish);
   });
 }
 

@@ -26,6 +26,9 @@ const {
   cloudflaredArgs,
   startCloudflareTunnel,
 } = require("../runtime/commands/labor-tunnel");
+const {
+  forceKillProcess,
+} = require("../runtime/commands/labor-sandbox");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 
@@ -4595,6 +4598,52 @@ test("cloudflared tunnel runtime can restart the current process", async () => {
   assert.equal(spawned.length, 2);
   assert.equal(runtime.currentTunnel(), spawned[1]);
   assert.match(out.join("\n"), /Restarting Cloudflare tunnel \(test restart\)/);
+});
+
+test("cloudflared tunnel restart does not spawn after shutdown is requested", async () => {
+  const spawned = [];
+  const out = [];
+  let stopping = false;
+  const runtime = startCloudflareTunnel({
+    spawn: (cmd, args, opts) => {
+      const child = new EventEmitter();
+      child.cmd = cmd;
+      child.args = args;
+      child.opts = opts;
+      child.exitCode = null;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      spawned.push(child);
+      return child;
+    },
+    stdout: (text) => out.push(text),
+    tunnelToken: "TT",
+    cleanedUpRef: { value: false },
+    isStopRequested: () => stopping,
+    stopTunnel: async () => {
+      stopping = true;
+    },
+  });
+
+  const first = runtime.currentTunnel();
+  const restarted = await runtime.restart("test shutdown race");
+
+  assert.equal(restarted, first);
+  assert.equal(runtime.currentTunnel(), first);
+  assert.equal(spawned.length, 1);
+  assert.doesNotMatch(out.join("\n"), /Restarting Cloudflare tunnel \(test shutdown race\)/);
+});
+
+test("forceKillProcess resolves even when a child never emits exit", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  const signals = [];
+  child.kill = (signal) => signals.push(signal);
+
+  await forceKillProcess(child, 1);
+
+  assert.deepEqual(signals, ["SIGKILL"]);
 });
 
 test("cloudflaredArgs keeps the protocol flag before run", () => {

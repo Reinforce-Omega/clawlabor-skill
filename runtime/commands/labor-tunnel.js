@@ -204,6 +204,7 @@ function startCloudflareTunnel({
     } else if (previousTunnel && typeof previousTunnel.kill === "function") {
       try { previousTunnel.kill("SIGTERM"); } catch (_err) { /* noop */ }
     }
+    if (cleanedUpRef.value || isStopRequested()) return currentTunnel;
     stdout(`Restarting Cloudflare tunnel (${reason})...`);
     const nextTunnel = spawnTunnel(state.protocol === "auto" ? DEFAULT_CLOUDFLARED_PROTOCOL : state.protocol);
     attachHandlers(nextTunnel);
