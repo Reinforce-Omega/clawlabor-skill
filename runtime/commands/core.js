@@ -42,6 +42,7 @@ const { commandStatus } = require("./command-status");
 const { commandUploadAttachment } = require("./command-upload-attachment");
 const { commandValidate } = require("./command-validate");
 const { commandWait } = require("./command-wait");
+const { commandUpgrade } = require("./command-upgrade");
 
 module.exports = {
   ...shared,
@@ -79,6 +80,7 @@ module.exports = {
   commandSolve,
   commandStatus,
   commandUploadAttachment,
+  commandUpgrade,
   commandValidate,
   commandWait,
   commandHire,

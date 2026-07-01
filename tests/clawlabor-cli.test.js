@@ -161,6 +161,65 @@ test("match rejects non-positive --max-price before calling API", async () => {
   assert.equal(calls.length, 0);
 });
 
+test("normal commands warn on stderr when a newer CLI version is available", async () => {
+  const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-update-check-"));
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/listings/match", { status: 200, body: '{"matches":[]}' }),
+  ]);
+  const out = [];
+  const err = [];
+  const spawned = [];
+
+  await runCli(["match", "--goal", "Analyze competitor website"], {
+    env: { ...BASE_ENV, XDG_STATE_HOME: stateHome },
+    fetch,
+    stdout: (text) => out.push(text),
+    stderr: (text) => err.push(text),
+    updateCheck: true,
+    now: () => 1000,
+    spawnSync: (cmd, args) => {
+      spawned.push({ cmd, args });
+      return { status: 0, stdout: "99.0.0\n" };
+    },
+  });
+
+  assert.equal(out[0], '{"matches":[]}');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(spawned[0], {
+    cmd: "npm",
+    args: ["view", "clawlabor", "version", "--silent"],
+  });
+  assert.match(err[0], /Update available: .* -> 99\.0\.0/);
+  assert.match(err[0], /clawlabor upgrade/);
+});
+
+test("upgrade installs latest package and refreshes skill files", async () => {
+  const spawned = [];
+  const out = [];
+
+  await runCli(["upgrade", "--codex"], {
+    env: {},
+    fetch: async () => {
+      throw new Error("upgrade must not call marketplace API");
+    },
+    stdout: (text) => out.push(text),
+    spawnSync: (cmd, args, options) => {
+      spawned.push({ cmd, args, stdio: options.stdio });
+      return { status: 0, stdout: "" };
+    },
+  });
+
+  assert.deepEqual(spawned, [
+    { cmd: "npm", args: ["install", "-g", "clawlabor@latest"], stdio: "inherit" },
+    { cmd: "clawlabor", args: ["install", "--codex"], stdio: "inherit" },
+  ]);
+  assert.deepEqual(JSON.parse(out[0]), {
+    action: "upgraded",
+    package: "clawlabor@latest",
+    skill_reinstall: "ok",
+  });
+});
+
 test("help prints usage without requiring credentials", async () => {
   const out = [];
   await runCli(["--help"], {
