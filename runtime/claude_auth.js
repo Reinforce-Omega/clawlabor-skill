@@ -3,6 +3,15 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
+// Anthropic OAuth constants. client_id is a public OAuth identifier (not a
+// secret — security relies on PKCE + authorization code). This is the same
+// value Claude Code and pi-ai use, hardcoded for the same reason they do:
+// it's a stable public value bound to the Claude Code product.
+const ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const REFRESH_SAFETY_MARGIN_MS = 5 * 60 * 1000;
+const REFRESH_TIMEOUT_MS = 30_000;
+
 function claudeCredentialsPaths(env = process.env) {
   const home = env.HOME || os.homedir();
   return [
@@ -68,6 +77,78 @@ function readClaudeOauthToken(env = process.env, now = Date.now(), deps = {}) {
   return null;
 }
 
+// --- OAuth token refresh ---
+
+function readRefreshTokenFromCredentials(data) {
+  const oauth = data && data.claudeAiOauth;
+  const token = oauth && oauth.refreshToken;
+  if (typeof token !== "string" || token.length === 0) return null;
+  return token;
+}
+
+async function refreshClaudeOauthToken(refreshToken, deps = {}) {
+  const fetchFn = deps.fetch || (typeof fetch !== "undefined" ? fetch : null);
+  if (!fetchFn) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REFRESH_TIMEOUT_MS);
+    const response = await fetchFn(ANTHROPIC_OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        client_id: ANTHROPIC_OAUTH_CLIENT_ID,
+        refresh_token: refreshToken,
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!response.ok) return null;
+    const data = await response.json();
+    if (!data.access_token) return null;
+    return {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token || refreshToken,
+      expiresAt: Date.now() + (data.expires_in || 3600) * 1000 - REFRESH_SAFETY_MARGIN_MS,
+    };
+  } catch (_err) {
+    return null;
+  }
+}
+
+function writeCredentialsToPath(filePath, credentials) {
+  try {
+    const existing = readJsonFile(filePath) || {};
+    existing.claudeAiOauth = {
+      ...(existing.claudeAiOauth && typeof existing.claudeAiOauth === "object" ? existing.claudeAiOauth : {}),
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      expiresAt: credentials.expiresAt,
+    };
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, JSON.stringify(existing, null, 2) + "\n", { mode: 0o600 });
+    try { fs.chmodSync(filePath, 0o600); } catch (_err) { /* best effort */ }
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+// Update the Claude Code keychain entry so Claude Code's own copy of the
+// (rotated) refresh token stays valid after we refresh on its behalf.
+function writeClaudeCodeKeychainCredentials(env = process.env, payload) {
+  if (process.platform !== "darwin") return false;
+  if (typeof payload !== "string" || payload.length === 0) return false;
+  const securityBin = env.CLAWLABOR_SECURITY_BIN || "security";
+  const account = env.USER || os.userInfo().username;
+  const result = spawnSync(
+    securityBin,
+    ["add-generic-password", "-U", "-s", "Claude Code-credentials", "-a", account, "-w", payload],
+    { env, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+  );
+  return result.status === 0;
+}
+
 function parseClaudeAuthStatus(raw) {
   if (!raw || typeof raw !== "string") return null;
   try {
@@ -121,6 +202,51 @@ async function resolveClaudeCodeOauthToken(deps = {}) {
     if (token) return { token, source: "credentials" };
   }
 
+  // Access token expired or missing — try OAuth refresh using stored refresh token.
+  const refreshTokenFn = deps.refreshClaudeOauthToken || refreshClaudeOauthToken;
+  for (const file of claudeCredentialsPaths(env)) {
+    const data = readJsonFile(file);
+    if (!data) continue;
+    const refreshToken = readRefreshTokenFromCredentials(data);
+    if (!refreshToken) continue;
+    const refreshed = await refreshTokenFn(refreshToken, deps);
+    if (!refreshed) continue;
+    if (writeCredentialsToPath(file, refreshed)) {
+      return { token: refreshed.accessToken, source: "refreshed" };
+    }
+  }
+
+  // Try keychain for refresh token (macOS only). On success, write the rotated
+  // tokens back to the keychain too — Claude Code reads the keychain first, and
+  // leaving the old refresh token there could invalidate its own login.
+  const readKeychain = deps.readClaudeCodeKeychainCredentials || readClaudeCodeKeychainCredentials;
+  const writeKeychain = deps.writeClaudeCodeKeychainCredentials || writeClaudeCodeKeychainCredentials;
+  const keychainRaw = readKeychain(env);
+  if (keychainRaw) {
+    try {
+      const data = JSON.parse(keychainRaw);
+      const refreshToken = readRefreshTokenFromCredentials(data);
+      if (refreshToken) {
+        const refreshed = await refreshTokenFn(refreshToken, deps);
+        if (refreshed) {
+          const [primaryPath] = claudeCredentialsPaths(env);
+          if (writeCredentialsToPath(primaryPath, refreshed)) {
+            data.claudeAiOauth = {
+              ...(data.claudeAiOauth && typeof data.claudeAiOauth === "object" ? data.claudeAiOauth : {}),
+              accessToken: refreshed.accessToken,
+              refreshToken: refreshed.refreshToken,
+              expiresAt: refreshed.expiresAt,
+            };
+            // Best effort: the file copy above is already enough for clawlabor itself.
+            writeKeychain(env, JSON.stringify(data));
+            return { token: refreshed.accessToken, source: "refreshed_from_keychain" };
+          }
+        }
+      }
+    } catch (_err) { /* ignore */ }
+  }
+
+  // Last resort: spawn `claude auth status` to trigger indirect refresh.
   const authStatus = deps.runClaudeAuthStatus || runClaudeAuthStatus;
   const status = await authStatus(env);
 
@@ -186,7 +312,11 @@ module.exports = {
   parseClaudeAuthStatus,
   readClaudeCodeKeychainCredentials,
   readClaudeOauthToken,
+  readRefreshTokenFromCredentials,
+  refreshClaudeOauthToken,
   resolveClaudeCodeAccount,
   resolveClaudeCodeOauthToken,
   runClaudeAuthStatus,
+  writeClaudeCodeKeychainCredentials,
+  writeCredentialsToPath,
 };

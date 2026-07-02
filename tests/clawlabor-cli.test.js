@@ -20,7 +20,11 @@ const {
   isExpired,
   readClaudeCodeKeychainCredentials,
   readClaudeOauthToken,
+  readRefreshTokenFromCredentials,
+  refreshClaudeOauthToken,
   resolveClaudeCodeOauthToken,
+  writeClaudeCodeKeychainCredentials,
+  writeCredentialsToPath,
 } = require("../runtime/claude_auth");
 const {
   cloudflaredArgs,
@@ -6402,6 +6406,218 @@ test("resolveClaudeCodeOauthToken never runs claude setup-token", async () => {
   assert.equal(result.token, null);
   assert.equal(result.authStatusOk, true);
   assert.deepEqual(calls, [["auth", "status"]]);
+});
+
+test("resolveClaudeCodeOauthToken refreshes expired token using stored refresh token", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-refresh-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  const credentialsFile = path.join(credentialsDir, ".credentials.json");
+  fs.writeFileSync(credentialsFile, JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "expired-access-token",
+      refreshToken: "valid-refresh-token",
+      expiresAt: Date.now() - 60_000,
+    },
+  }));
+
+  const refreshCalls = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    readClaudeOauthToken: null,
+    refreshClaudeOauthToken: async (refreshToken) => {
+      refreshCalls.push(refreshToken);
+      return {
+        accessToken: "new-access-token",
+        refreshToken: "rotated-refresh-token",
+        expiresAt: Date.now() + 3600_000,
+      };
+    },
+    readClaudeCodeKeychainCredentials: () => null,
+    runClaudeAuthStatus: async () => { throw new Error("should not be reached"); },
+  });
+
+  assert.equal(result.token, "new-access-token");
+  assert.equal(result.source, "refreshed");
+  assert.deepEqual(refreshCalls, ["valid-refresh-token"]);
+
+  // Verify credentials file was updated with new tokens.
+  const updated = JSON.parse(fs.readFileSync(credentialsFile, "utf8"));
+  assert.equal(updated.claudeAiOauth.accessToken, "new-access-token");
+  assert.equal(updated.claudeAiOauth.refreshToken, "rotated-refresh-token");
+});
+
+test("resolveClaudeCodeOauthToken falls back to claude auth status when refresh fails", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-refresh-fail-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, ".credentials.json"), JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "expired-access-token",
+      refreshToken: "invalid-refresh-token",
+      expiresAt: Date.now() - 60_000,
+    },
+  }));
+
+  const authStatusCalls = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    readClaudeOauthToken: null,
+    refreshClaudeOauthToken: async () => null,
+    readClaudeCodeKeychainCredentials: () => null,
+    runClaudeAuthStatus: async () => {
+      authStatusCalls.push("called");
+      return { ok: true };
+    },
+  });
+
+  assert.equal(authStatusCalls.length, 1);
+  assert.equal(result.token, null);
+  assert.equal(result.authStatusOk, true);
+});
+
+test("resolveClaudeCodeOauthToken uses valid token from credentials without refresh", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-no-refresh-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, ".credentials.json"), JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "fresh-access-token",
+      refreshToken: "unused-refresh-token",
+      expiresAt: Date.now() + 3600_000,
+    },
+  }));
+
+  const refreshCalls = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    refreshClaudeOauthToken: async () => { refreshCalls.push("should-not-be-called"); return null; },
+    readClaudeCodeKeychainCredentials: () => null,
+    runClaudeAuthStatus: async () => { throw new Error("should not be reached"); },
+  });
+
+  assert.equal(result.token, "fresh-access-token");
+  assert.equal(result.source, "credentials");
+  assert.equal(refreshCalls.length, 0);
+});
+
+test("resolveClaudeCodeOauthToken writes refreshed keychain credentials back to the keychain", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-keychain-writeback-"));
+  const keychainWrites = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    readClaudeCodeKeychainCredentials: () => JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "expired-keychain-token",
+        refreshToken: "keychain-refresh-token",
+        expiresAt: Date.now() - 60_000,
+        scopes: ["user:inference", "user:profile"],
+        subscriptionType: "max",
+      },
+    }),
+    refreshClaudeOauthToken: async () => ({
+      accessToken: "new-access-token",
+      refreshToken: "rotated-refresh-token",
+      expiresAt: Date.now() + 3600_000,
+    }),
+    writeClaudeCodeKeychainCredentials: (_env, payload) => {
+      keychainWrites.push(payload);
+      return true;
+    },
+    runClaudeAuthStatus: async () => { throw new Error("should not be reached"); },
+  });
+
+  assert.equal(result.token, "new-access-token");
+  assert.equal(result.source, "refreshed_from_keychain");
+  assert.equal(keychainWrites.length, 1);
+  const written = JSON.parse(keychainWrites[0]);
+  assert.equal(written.claudeAiOauth.accessToken, "new-access-token");
+  assert.equal(written.claudeAiOauth.refreshToken, "rotated-refresh-token");
+  // Claude Code's own keychain payload fields must survive the write-back.
+  assert.deepEqual(written.claudeAiOauth.scopes, ["user:inference", "user:profile"]);
+  assert.equal(written.claudeAiOauth.subscriptionType, "max");
+
+  // The credentials file copy is still written alongside the keychain.
+  const fileCopy = JSON.parse(fs.readFileSync(path.join(home, ".claude", ".credentials.json"), "utf8"));
+  assert.equal(fileCopy.claudeAiOauth.accessToken, "new-access-token");
+});
+
+test("resolveClaudeCodeOauthToken keychain write-back failure is best-effort", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-keychain-besteffort-"));
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    readClaudeCodeKeychainCredentials: () => JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "expired-keychain-token",
+        refreshToken: "keychain-refresh-token",
+        expiresAt: Date.now() - 60_000,
+      },
+    }),
+    refreshClaudeOauthToken: async () => ({
+      accessToken: "new-access-token",
+      refreshToken: "rotated-refresh-token",
+      expiresAt: Date.now() + 3600_000,
+    }),
+    writeClaudeCodeKeychainCredentials: () => false,
+    runClaudeAuthStatus: async () => { throw new Error("should not be reached"); },
+  });
+
+  assert.equal(result.token, "new-access-token");
+  assert.equal(result.source, "refreshed_from_keychain");
+});
+
+test("writeClaudeCodeKeychainCredentials runs security add-generic-password", () => {
+  if (process.platform !== "darwin") return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-security-stub-"));
+  const argsFile = path.join(dir, "args.txt");
+  const stub = path.join(dir, "security-stub");
+  fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\n`, { mode: 0o755 });
+
+  const ok = writeClaudeCodeKeychainCredentials(
+    { CLAWLABOR_SECURITY_BIN: stub, USER: "testuser" },
+    '{"claudeAiOauth":{"accessToken":"t"}}',
+  );
+
+  assert.equal(ok, true);
+  const args = fs.readFileSync(argsFile, "utf8").trimEnd().split("\n");
+  assert.deepEqual(args, [
+    "add-generic-password",
+    "-U",
+    "-s",
+    "Claude Code-credentials",
+    "-a",
+    "testuser",
+    "-w",
+    '{"claudeAiOauth":{"accessToken":"t"}}',
+  ]);
+});
+
+test("writeCredentialsToPath preserves extra claudeAiOauth fields", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-creds-merge-"));
+  const file = path.join(dir, ".credentials.json");
+  fs.writeFileSync(file, JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: 1,
+      scopes: ["user:inference"],
+      subscriptionType: "max",
+    },
+  }));
+
+  const ok = writeCredentialsToPath(file, {
+    accessToken: "new-access",
+    refreshToken: "new-refresh",
+    expiresAt: 2,
+  });
+
+  assert.equal(ok, true);
+  const updated = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(updated.claudeAiOauth.accessToken, "new-access");
+  assert.equal(updated.claudeAiOauth.refreshToken, "new-refresh");
+  assert.equal(updated.claudeAiOauth.expiresAt, 2);
+  assert.deepEqual(updated.claudeAiOauth.scopes, ["user:inference"]);
+  assert.equal(updated.claudeAiOauth.subscriptionType, "max");
 });
 
 test("labor-unpublish delists a resource (sets it inactive)", async () => {
