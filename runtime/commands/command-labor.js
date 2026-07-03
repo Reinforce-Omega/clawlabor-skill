@@ -47,7 +47,8 @@ const LABOR_STATUSES = new Set(["draft", "available", "occupied", "inactive", "a
 const ACTIVE_LABOR_RESOURCE_STATUSES = new Set(["draft", "available", "occupied"]);
 const DEFAULT_DAILY_RATE_UAT = 50;
 const PLAN_MONTHLY_COST_UAT = {
-  pro: 20 * 10, // $20/month = 200 UAT/month
+  pro: 40 * 10, // $40/month = 400 UAT/month
+  business: 50 * 10, // $50/month = 500 UAT/month
   team: 50 * 10, // $50/month = 500 UAT/month
   enterprise: 200 * 10, // $200/month = 2000 UAT/month
 };
@@ -179,6 +180,107 @@ function opencodeAuthPath(env) {
   return path.join(base, "opencode", "auth.json");
 }
 
+function codexHomePath(env) {
+  const path = require("path");
+  const os = require("os");
+  return (env && env.CODEX_HOME) || path.join((env && env.HOME) || os.homedir(), ".codex");
+}
+
+function codexAuthPath(env) {
+  const path = require("path");
+  return path.join(codexHomePath(env), "auth.json");
+}
+
+function codexConfigPath(env) {
+  const path = require("path");
+  return path.join(codexHomePath(env), "config.toml");
+}
+
+function decodeJwtPayload(token) {
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length < 2 || !parts[1]) return null;
+  try {
+    const normalized = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+  } catch (_err) {
+    return null;
+  }
+}
+
+function codexAuthClaimFromToken(token) {
+  const claims = decodeJwtPayload(token);
+  if (!claims || typeof claims !== "object") return null;
+  const auth = claims["https://api.openai.com/auth"];
+  return auth && typeof auth === "object" ? auth : null;
+}
+
+function displayCodexPlan(rawPlan) {
+  if (!rawPlan) return null;
+  return String(rawPlan).toLowerCase() === "team" ? "business" : String(rawPlan).toLowerCase();
+}
+
+function displayCodexLabel(rawPlan) {
+  const plan = displayCodexPlan(rawPlan);
+  if (!plan) return "ChatGPT";
+  return `ChatGPT ${plan.charAt(0).toUpperCase()}${plan.slice(1)}`;
+}
+
+function resolveCodexChatGptAccount(deps) {
+  const fs = deps.fs || require("fs");
+  const authPath = codexAuthPath(deps.env);
+  if (!fs.existsSync(authPath) || typeof fs.readFileSync !== "function") {
+    return {
+      provider: "codex",
+      logged_in: false,
+      status: "auth_not_found",
+      auth_path: authPath,
+    };
+  }
+  try {
+    const authJson = JSON.parse(fs.readFileSync(authPath, "utf8"));
+    if (authJson.auth_mode !== "chatgpt") {
+      return {
+        provider: "codex",
+        logged_in: false,
+        status: authJson.auth_mode === "api" ? "api_key_auth" : "not_chatgpt_auth",
+        auth_mode: authJson.auth_mode || null,
+      };
+    }
+    const authClaim =
+      codexAuthClaimFromToken(authJson.tokens && authJson.tokens.id_token) ||
+      codexAuthClaimFromToken(authJson.tokens && authJson.tokens.access_token);
+    if (!authClaim) {
+      return {
+        provider: "codex",
+        logged_in: false,
+        status: "missing_chatgpt_claim",
+        auth_mode: "chatgpt",
+      };
+    }
+    return {
+      provider: "codex",
+      logged_in: true,
+      source: "local_jwt_claim",
+      auth_mode: "chatgpt",
+      plan: displayCodexPlan(authClaim.chatgpt_plan_type),
+      label: displayCodexLabel(authClaim.chatgpt_plan_type),
+      subscription_active_start: authClaim.chatgpt_subscription_active_start || null,
+      subscription_active_until: authClaim.chatgpt_subscription_active_until || null,
+      subscription_last_checked: authClaim.chatgpt_subscription_last_checked || null,
+    };
+  } catch (err) {
+    return {
+      provider: "codex",
+      logged_in: false,
+      status: "auth_read_failed",
+      auth_path: authPath,
+      error: err.message,
+    };
+  }
+}
+
 // What to inject into the per-hire `docker run` so the runtime can authenticate.
 // Returns { env: {NAME: value}, mounts: [{host, container, ro}] }. Throws a clear
 // error if the runtime's local credentials are missing. Never reads secret content.
@@ -202,6 +304,24 @@ async function resolveRuntimeSandboxCredentials(runtime, deps) {
     return {
       env: {},
       mounts: [{ host: authPath, container: "/home/sandbox/.local/share/opencode/auth.json", ro: true }],
+    };
+  }
+  if (runtime === "codex") {
+    const fs = deps.fs || require("fs");
+    const authPath = codexAuthPath(deps.env);
+    if (!fs.existsSync(authPath)) {
+      throw new Error(`labor-serve --runtime codex needs local Codex credentials at ${authPath}. Run \`codex login\` first.`);
+    }
+    const configPath = codexConfigPath(deps.env);
+    if (!fs.existsSync(configPath)) {
+      throw new Error(`labor-serve --runtime codex needs local Codex config at ${configPath}. Run \`codex login\` first, then verify \`codex --version\` works.`);
+    }
+    return {
+      env: {},
+      mounts: [
+        { host: authPath, container: "/home/sandbox/.codex/auth.json", ro: true },
+        { host: configPath, container: "/home/sandbox/.codex/config.toml", ro: true },
+      ],
     };
   }
   throw new Error(`labor-serve does not support --runtime ${runtime}`);
@@ -294,15 +414,54 @@ function missingRequirementNames(agent) {
     .map((item) => item.name);
 }
 
-function compactHostAccount(account) {
+function failedRequirements(agent) {
+  return (agent.requirements || [])
+    .filter((item) => item && item.status !== "pass");
+}
+
+function requirementSetupSteps(agent) {
+  return failedRequirements(agent)
+    .map((item) => item.next || item.detail)
+    .filter(Boolean);
+}
+
+function serveStatusStep(agent) {
+  if (agent.serve_status === "candidate_not_wired_to_labor_serve") {
+    return `${agent.name} is publish-only in this CLI version. Use a runtime with a start_command, such as claude or opencode.`;
+  }
+  if (agent.serve_status === "not_installed") {
+    return `Install ${agent.name}, then rerun \`clawlabor labor-agents\`.`;
+  }
+  return null;
+}
+
+function compactHostAccount(account, provider = "claude") {
   if (!account || !account.logged_in) {
-    return { provider: "claude", status: "not_logged_in" };
+    return {
+      provider: account && account.provider ? account.provider : provider,
+      status: account && account.status ? account.status : "not_logged_in",
+    };
   }
   const compact = {
     provider: account.provider,
     label: account.label || account.email || account.org_name || null,
     plan: account.plan || null,
   };
+  if (account.provider !== "codex" && account.source) {
+    compact.source = account.source;
+  }
+  if (account.provider !== "codex" && account.auth_mode) {
+    compact.auth_mode = account.auth_mode;
+  }
+  if (account.provider !== "codex" && account.subscription_active_start) {
+    compact.subscription_active_start = account.subscription_active_start;
+  }
+  if (account.subscription_active_until) {
+    compact.subscription_active_until = account.subscription_active_until;
+  }
+  if (account.provider !== "codex" && account.subscription_last_checked) {
+    compact.subscription_last_checked = account.subscription_last_checked;
+  }
   if (account.quota) {
     compact.quota = account.quota;
   }
@@ -317,7 +476,8 @@ function nanoToUatDisplay(nano) {
 }
 
 function summarizeLaborAgent(agent, existingLaborByRuntime) {
-  const missing = missingRequirementNames(agent);
+  const failed = failedRequirements(agent);
+  const missing = failed.map((item) => item.name);
   const existing = existingLaborByRuntime[agent.runtime] || null;
   const publishCommand = agent.publish_command_template;
   const summary = {
@@ -354,6 +514,21 @@ function summarizeLaborAgent(agent, existingLaborByRuntime) {
       }
     }
     summary.start_command = startParts.join(" ");
+    summary.next_action = {
+      type: "start_labor",
+      ready: true,
+      command: summary.start_command,
+    };
+  } else {
+    const setupSteps = requirementSetupSteps(agent);
+    const statusStep = serveStatusStep(agent);
+    summary.next_action = {
+      type: agent.ready_to_publish ? "finish_runtime_setup" : "install_runtime",
+      ready: false,
+      blocked_by: missing.length > 0 ? missing : [agent.serve_status || "runtime_not_serveable"],
+      steps: setupSteps.length > 0 ? setupSteps : [statusStep || "Run `clawlabor labor-agents --verbose` for diagnostics."],
+      diagnostics_command: "clawlabor labor-agents --verbose",
+    };
   }
   return summary;
 }
@@ -472,6 +647,9 @@ async function claudeRuntimeAgent(deps) {
       detail: docker.status === "pass"
         ? "Docker CLI is available"
         : "Install/start Docker Desktop before running labor-serve",
+      next: docker.status === "pass"
+        ? null
+        : "Install Docker Desktop, start it, then rerun `clawlabor labor-agents`.",
     },
     {
       name: "cloudflared",
@@ -481,6 +659,9 @@ async function claudeRuntimeAgent(deps) {
       detail: cloudflared.status === "pass"
         ? "cloudflared is available"
         : "Install cloudflared before running labor-serve",
+      next: cloudflared.status === "pass"
+        ? null
+        : "Install cloudflared (`brew install cloudflared` on macOS), then rerun `clawlabor labor-agents`.",
     },
   ];
   const claudeRequirements = [
@@ -532,37 +713,58 @@ async function commandLaborAgents(_options, deps, flags) {
     await currentSellerLaborResources(deps, marketplaceAgent),
   );
   const claudeAgent = await claudeRuntimeAgent(deps);
+  const codexAccount = resolveCodexChatGptAccount(deps);
   const codex = commandProbe(deps, "codex");
   const opencode = commandProbe(deps, "opencode");
+  const fs = deps.fs || require("fs");
+  const codexAuthPresent = codex.status === "pass" && fs.existsSync(codexAuthPath(deps.env));
+  const codexConfigPresent = codex.status === "pass" && fs.existsSync(codexConfigPath(deps.env));
+  const codexReadyToServe = codexAuthPresent && codexConfigPresent;
   const opencodeAuthPresent = opencode.status === "pass" && (deps.fs || require("fs")).existsSync(opencodeAuthPath(deps.env));
+  const codexAgent = runtimeAgent({
+    id: "codex-sandbox",
+    name: "Codex Sandbox",
+    runtime: "codex",
+    command: "codex",
+    probe: codex,
+    readyToServe: codexReadyToServe,
+    serveStatus: codexReadyToServe
+      ? "ready_to_serve"
+      : codex.status === "pass"
+      ? "needs_codex_auth"
+      : "not_installed",
+    requirements: [
+      {
+        name: "codex_cli",
+        status: codex.status,
+        command: "codex --version",
+        version: codex.version,
+        detail: codex.status === "pass"
+          ? "Codex CLI is installed locally"
+          : codex.on_path
+            ? "Codex CLI is on PATH but failed to run; repair the local Codex install before publishing a Codex-backed labor runtime"
+            : "Install Codex CLI before publishing a Codex-backed labor runtime",
+        next: codex.status === "pass"
+          ? null
+          : "Install or repair Codex CLI, then rerun `clawlabor labor-agents`.",
+        error: codex.error,
+      },
+      {
+        name: "codex_auth",
+        status: codexReadyToServe ? "pass" : "fail",
+        detail: codexReadyToServe
+          ? "Codex auth.json and config.toml found; labor-serve will mount them read-only into the sandbox"
+          : "Run `codex login` so labor-serve can pass your Codex credentials into the sandbox",
+        next: codexReadyToServe ? null : "Run `codex login`, then rerun `clawlabor labor-agents`.",
+      },
+    ],
+    publishName: "Codex Labor",
+    hostAccount: codexAccount,
+    hostPlan: codexAccount.plan,
+  });
   const agents = [
     claudeAgent,
-    runtimeAgent({
-      id: "codex-sandbox",
-      name: "Codex Sandbox",
-      runtime: "codex",
-      command: "codex",
-      probe: codex,
-      readyToServe: false,
-      serveStatus: codex.status === "pass"
-        ? "candidate_not_wired_to_labor_serve"
-        : "not_installed",
-      requirements: [
-        {
-          name: "codex_cli",
-          status: codex.status,
-          command: "codex --version",
-          version: codex.version,
-          detail: codex.status === "pass"
-            ? "Codex CLI is installed locally; Clawlabor labor-serve is not wired to start Codex-backed sandbox sessions yet"
-            : codex.on_path
-              ? "Codex CLI is on PATH but failed to run; repair the local Codex install before publishing a Codex-backed labor runtime"
-              : "Install Codex CLI before publishing a Codex-backed labor runtime",
-          error: codex.error,
-        },
-      ],
-      publishName: "Codex Labor",
-    }),
+    codexAgent,
     runtimeAgent({
       id: "opencode-sandbox",
       name: "OpenCode Sandbox",
@@ -582,20 +784,24 @@ async function commandLaborAgents(_options, deps, flags) {
           status: opencode.status,
           command: "opencode --version",
           version: opencode.version,
-          detail: opencode.status === "pass"
-            ? "OpenCode CLI is installed locally"
-            : opencode.on_path
-              ? "OpenCode CLI is on PATH but failed to run; repair the local OpenCode install before publishing an OpenCode-backed labor runtime"
-              : "Install OpenCode CLI before publishing an OpenCode-backed labor runtime",
-          error: opencode.error,
-        },
+      detail: opencode.status === "pass"
+        ? "OpenCode CLI is installed locally"
+        : opencode.on_path
+          ? "OpenCode CLI is on PATH but failed to run; repair the local OpenCode install before publishing an OpenCode-backed labor runtime"
+          : "Install OpenCode CLI before publishing an OpenCode-backed labor runtime",
+      next: opencode.status === "pass"
+        ? null
+        : "Install or repair OpenCode CLI, then rerun `clawlabor labor-agents`.",
+      error: opencode.error,
+    },
         {
           name: "opencode_auth",
           status: opencodeAuthPresent ? "pass" : "fail",
-          detail: opencodeAuthPresent
-            ? "OpenCode auth.json found; labor-serve will mount it read-only into the sandbox"
-            : "Run `opencode auth login` so labor-serve can pass your provider credentials into the sandbox",
-        },
+      detail: opencodeAuthPresent
+        ? "OpenCode auth.json found; labor-serve will mount it read-only into the sandbox"
+        : "Run `opencode auth login` so labor-serve can pass your provider credentials into the sandbox",
+      next: opencodeAuthPresent ? null : "Run `opencode auth login`, then rerun `clawlabor labor-agents`.",
+    },
       ],
       publishName: "OpenCode Labor",
     }),
@@ -618,6 +824,7 @@ async function commandLaborAgents(_options, deps, flags) {
       account: compactMarketplaceAgent(marketplaceAgent),
       host: {
         claude: compactHostAccount(claudeAgent.host_account),
+        codex: compactHostAccount(codexAgent.host_account, "codex"),
       },
       agents: agents.map((agent) => summarizeLaborAgent(agent, existingLabor)),
       next_actions: [
@@ -742,8 +949,8 @@ async function commandLaborPublish(options, deps) {
   }
   const dailyTokenCap = tokenCountOption(options, "daily-token-cap");
   const runtime = options.runtime || "claude";
-  if (!["claude", "opencode"].includes(runtime)) {
-    throw new Error(`labor-publish supports --runtime claude or opencode; ${runtime} has no labor-serve support yet.`);
+  if (!["claude", "codex", "opencode"].includes(runtime)) {
+    throw new Error(`labor-publish supports --runtime claude, codex, or opencode; ${runtime} has no labor-serve support yet.`);
   }
   if (dailyTokenCap !== undefined && runtime !== "opencode") {
     throw new Error(
@@ -831,6 +1038,7 @@ async function commandLaborStart(options, deps) {
   if (!laborId) {
     const defaults = {
       claude: { name: "Claude Code Labor", description: "Claude Code Labor backed by the local Claude Code Sandbox runtime." },
+      codex: { name: "Codex Labor", description: "Codex Labor backed by the local Codex Sandbox runtime." },
       opencode: { name: "OpenCode Labor", description: "OpenCode Labor backed by the local OpenCode Sandbox runtime." },
     }[runtime] || { name: `${runtime} Labor`, description: `${runtime} Labor backed by the local sandbox runtime.` };
     const publishOptions = {
@@ -1662,7 +1870,12 @@ module.exports = {
   commandLaborServe,
   commandLaborCleanup,
   parseSseChunks,
+  codexAuthPath,
+  codexConfigPath,
+  codexHomePath,
+  decodeJwtPayload,
   opencodeAuthPath,
+  resolveCodexChatGptAccount,
   runtimeStateMounts,
   runtimeStateInitCommand,
   sandboxUserCommand,

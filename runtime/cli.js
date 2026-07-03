@@ -53,6 +53,7 @@ const {
   commandStatus,
   commandUploadAttachment,
   commandValidate,
+  commandUpgrade,
   commandWait,
   commandLaborAgents,
   commandLaborList,
@@ -74,6 +75,7 @@ const {
 } = require("./commands/core");
 
 const PKG_VERSION = require("../package.json").version;
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const TERMINAL_ORDER_STATES = new Set([
   "pending_confirmation",
   "completed",
@@ -129,6 +131,79 @@ function waitForSignals() {
   });
 }
 
+function compareVersions(a, b) {
+  const partsA = String(a).split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const partsB = String(b).split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const len = Math.max(partsA.length, partsB.length);
+  for (let i = 0; i < len; i += 1) {
+    const delta = (partsA[i] || 0) - (partsB[i] || 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
+
+function shouldSkipUpdateCheck(argv, env) {
+  const first = argv[0];
+  if (!first || first === "--help" || first === "-h" || first === "help") return true;
+  if (first === "--version" || first === "-v" || first === "version") return true;
+  if (first === "commands" || first === "upgrade") return true;
+  return env.CI === "true" ||
+    env.CLAWLABOR_DISABLE_UPDATE_CHECK === "1" ||
+    env.CLAWLABOR_SKIP_UPDATE_CHECK === "1" ||
+    env.NO_UPDATE_NOTIFIER === "1";
+}
+
+function updateCheckPath(deps) {
+  const path = require("node:path");
+  const os = require("node:os");
+  const base = deps.env.XDG_STATE_HOME || path.join(deps.env.HOME || os.homedir(), ".local", "state");
+  return path.join(base, "clawlabor", "update-check.json");
+}
+
+function readUpdateCheckCache(deps) {
+  try {
+    return JSON.parse(deps.fs.readFileSync(updateCheckPath(deps), "utf8"));
+  } catch (_err) {
+    return {};
+  }
+}
+
+function writeUpdateCheckCache(deps, cache) {
+  const path = require("node:path");
+  const file = updateCheckPath(deps);
+  deps.fs.mkdirSync(path.dirname(file), { recursive: true });
+  deps.fs.writeFileSync(file, JSON.stringify(cache, null, 2));
+}
+
+function maybeWarnAboutUpgrade(argv, deps) {
+  if (!deps.updateCheck) return;
+  if (shouldSkipUpdateCheck(argv, deps.env)) return;
+  const cache = readUpdateCheckCache(deps);
+  const now = deps.now();
+  if (cache.checked_at && now - cache.checked_at < UPDATE_CHECK_INTERVAL_MS) {
+    if (cache.latest && compareVersions(cache.latest, PKG_VERSION) > 0) {
+      deps.stderr(`[clawlabor] Update available: ${PKG_VERSION} -> ${cache.latest}. Run: clawlabor upgrade`);
+    }
+    return;
+  }
+
+  try {
+    const result = deps.spawnSync("npm", ["view", "clawlabor", "version", "--silent"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1500,
+    });
+    const latest = result.status === 0 ? String(result.stdout || "").trim() : null;
+    if (!latest) return;
+    writeUpdateCheckCache(deps, { checked_at: now, latest });
+    if (compareVersions(latest, PKG_VERSION) > 0) {
+      deps.stderr(`[clawlabor] Update available: ${PKG_VERSION} -> ${latest}. Run: clawlabor upgrade`);
+    }
+  } catch (_err) {
+    // Update checks must never block or fail the user's primary command.
+  }
+}
+
 // ---------------------------------------------------------------------------
 // dispatcher
 // ---------------------------------------------------------------------------
@@ -169,6 +244,12 @@ const COMMANDS = {
     section: "Setup",
     summary: "Install the ClawLabor skill into Claude / OpenClaw / Codex / Hermes (or current project)",
     usage: "install [--claude] [--openclaw] [--codex] [--hermes] [--project] [--uninstall] [--help]",
+  },
+  upgrade: {
+    handler: commandUpgrade,
+    section: "Setup",
+    summary: "Upgrade the global ClawLabor CLI package and refresh installed skill files",
+    usage: "upgrade [--claude] [--openclaw] [--codex] [--hermes] [--project] [--copy]",
   },
   register: {
     handler: commandRegister,
@@ -488,6 +569,7 @@ async function runCli(argv, injected = {}) {
     env: injected.env || process.env,
     fetch: injected.fetch || globalThis.fetch,
     stdout: injected.stdout || ((text) => process.stdout.write(`${text}\n`)),
+    stderr: injected.stderr || ((text) => process.stderr.write(`${text}\n`)),
     makeIdempotencyKey: injected.makeIdempotencyKey || makeIdempotencyKey,
     createServer: injected.createServer || http.createServer,
     spawn: injected.spawn || spawn,
@@ -502,10 +584,12 @@ async function runCli(argv, injected = {}) {
     probePublicHealthWithDnsFallback: injected.probePublicHealthWithDnsFallback,
     killProcessGroup: injected.killProcessGroup,
     sandboxStartupTimeoutMs: injected.sandboxStartupTimeoutMs,
+    updateCheck: injected.updateCheck !== undefined ? injected.updateCheck : Object.keys(injected).length === 0,
   };
   if (!deps.fetch) {
     throw new Error("This Node.js runtime does not provide fetch");
   }
+  maybeWarnAboutUpgrade(argv, deps);
 
   if (argv[0] === "--version" || argv[0] === "-v" || argv[0] === "version") {
     deps.stdout(PKG_VERSION);

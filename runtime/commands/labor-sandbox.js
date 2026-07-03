@@ -38,7 +38,16 @@ function runtimeStateInitCommand(mounts, { excludePaths = [] } = {}) {
 }
 
 function sandboxUserCommand(command) {
-  return `setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=/home/sandbox ${command}`;
+  const path = [
+    "/home/sandbox/.local/share/sandbox-clawlabor/bin",
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+  ].join(":");
+  return `setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=/home/sandbox PATH=${shellQuote(path)} ${command}`;
 }
 
 function dockerContainerRunning(name, deps = {}) {

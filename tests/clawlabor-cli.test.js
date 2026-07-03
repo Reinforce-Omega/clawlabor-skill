@@ -20,7 +20,11 @@ const {
   isExpired,
   readClaudeCodeKeychainCredentials,
   readClaudeOauthToken,
+  readRefreshTokenFromCredentials,
+  refreshClaudeOauthToken,
   resolveClaudeCodeOauthToken,
+  writeClaudeCodeKeychainCredentials,
+  writeCredentialsToPath,
 } = require("../runtime/claude_auth");
 const {
   cloudflaredArgs,
@@ -28,6 +32,7 @@ const {
 } = require("../runtime/commands/labor-tunnel");
 const {
   forceKillProcess,
+  sandboxUserCommand,
 } = require("../runtime/commands/labor-sandbox");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
@@ -158,6 +163,65 @@ test("match rejects non-positive --max-price before calling API", async () => {
     /--max-price must be greater than or equal to 1/,
   );
   assert.equal(calls.length, 0);
+});
+
+test("normal commands warn on stderr when a newer CLI version is available", async () => {
+  const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-update-check-"));
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/listings/match", { status: 200, body: '{"matches":[]}' }),
+  ]);
+  const out = [];
+  const err = [];
+  const spawned = [];
+
+  await runCli(["match", "--goal", "Analyze competitor website"], {
+    env: { ...BASE_ENV, XDG_STATE_HOME: stateHome },
+    fetch,
+    stdout: (text) => out.push(text),
+    stderr: (text) => err.push(text),
+    updateCheck: true,
+    now: () => 1000,
+    spawnSync: (cmd, args) => {
+      spawned.push({ cmd, args });
+      return { status: 0, stdout: "99.0.0\n" };
+    },
+  });
+
+  assert.equal(out[0], '{"matches":[]}');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(spawned[0], {
+    cmd: "npm",
+    args: ["view", "clawlabor", "version", "--silent"],
+  });
+  assert.match(err[0], /Update available: .* -> 99\.0\.0/);
+  assert.match(err[0], /clawlabor upgrade/);
+});
+
+test("upgrade installs latest package and refreshes skill files", async () => {
+  const spawned = [];
+  const out = [];
+
+  await runCli(["upgrade", "--codex"], {
+    env: {},
+    fetch: async () => {
+      throw new Error("upgrade must not call marketplace API");
+    },
+    stdout: (text) => out.push(text),
+    spawnSync: (cmd, args, options) => {
+      spawned.push({ cmd, args, stdio: options.stdio });
+      return { status: 0, stdout: "" };
+    },
+  });
+
+  assert.deepEqual(spawned, [
+    { cmd: "npm", args: ["install", "-g", "clawlabor@latest"], stdio: "inherit" },
+    { cmd: "clawlabor", args: ["install", "--codex"], stdio: "inherit" },
+  ]);
+  assert.deepEqual(JSON.parse(out[0]), {
+    action: "upgraded",
+    package: "clawlabor@latest",
+    skill_reinstall: "ok",
+  });
 });
 
 test("help prints usage without requiring credentials", async () => {
@@ -4160,6 +4224,10 @@ test("labor-agents reports concise local runtime inventory by default", async ()
     label: "Seller Team (team)",
     plan: "team",
   });
+  assert.deepEqual(parsed.host.codex, {
+    provider: "codex",
+    status: "auth_not_found",
+  });
   assert.deepEqual(parsed.agents.map((agent) => agent.runtime), ["claude", "codex", "opencode"]);
   const claude = parsed.agents[0];
   assert.equal(claude.status, "ready_to_serve");
@@ -4172,12 +4240,72 @@ test("labor-agents reports concise local runtime inventory by default", async ()
   // start_command converges publish+serve into one command (serve_command removed).
   assert.equal(claude.serve_command, undefined);
   assert.equal(claude.start_command, "clawlabor labor-start --runtime claude");
+  assert.deepEqual(claude.next_action, {
+    type: "start_labor",
+    ready: true,
+    command: "clawlabor labor-start --runtime claude",
+  });
   assert.equal(claude.path, undefined);
   assert.equal(claude.requirements, undefined);
   const codex = parsed.agents[1];
   assert.equal(codex.status, "publish_only");
   assert.equal(codex.can_publish, true);
   assert.equal(codex.can_serve, false);
+  assert.equal(codex.next_action.type, "finish_runtime_setup");
+  assert.equal(codex.next_action.ready, false);
+  assert.deepEqual(codex.next_action.blocked_by, ["codex_auth"]);
+  assert.match(codex.next_action.steps.join(" "), /codex login/);
+  assert.equal(codex.next_action.diagnostics_command, "clawlabor labor-agents --verbose");
+});
+
+function fakeJwt(payload) {
+  const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode(payload)}.`;
+}
+
+test("labor-agents reports Codex ChatGPT plan from local JWT claims", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  const codexAuth = JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: {
+      id_token: fakeJwt({
+        "https://api.openai.com/auth": {
+          chatgpt_account_id: "acct-123",
+          chatgpt_plan_type: "team",
+          chatgpt_subscription_active_start: "2026-06-30T11:25:28+00:00",
+          chatgpt_subscription_active_until: "2026-07-30T11:25:28+00:00",
+          chatgpt_subscription_last_checked: "2026-06-30T11:33:03+00:00",
+          organizations: [
+            { id: "org-1", title: "Reinforce-omega", is_default: true },
+          ],
+        },
+      }),
+    },
+  });
+  await runCli(["labor-agents"], {
+    ...laborAgentsDeps(fetch, out),
+    env: { ...BASE_ENV, HOME: "/tmp/home" },
+    fs: {
+      existsSync: (p) => ["/tmp/home/.codex/auth.json", "/tmp/home/.codex/config.toml"].includes(p),
+      readFileSync: (p) => {
+        assert.equal(p, "/tmp/home/.codex/auth.json");
+        return codexAuth;
+      },
+    },
+  });
+
+  const parsed = JSON.parse(out.join(""));
+  assert.deepEqual(parsed.host.codex, {
+    provider: "codex",
+    label: "ChatGPT Business",
+    plan: "business",
+    subscription_active_until: "2026-07-30T11:25:28+00:00",
+  });
+  const codex = parsed.agents.find((agent) => agent.runtime === "codex");
+  assert.equal(codex.status, "ready_to_serve");
+  assert.equal(codex.suggested_daily_rate_uat, 17);
+  assert.match(codex.publish_command, /Codex Labor \(business plan\)/);
 });
 
 test("labor-agents shows auth failure instead of null account fields", async () => {
@@ -4258,6 +4386,83 @@ test("labor-agents gives a complete publish command before a labor exists", asyn
   // agent can fire it off without lookups. Claude has no suggested token cap.
   assert.match(claude.start_command, /^clawlabor labor-start --runtime claude --daily-rate \d+$/);
   assert.equal(claude.start_command.includes("<"), false);
+  assert.equal(claude.next_action.type, "start_labor");
+  assert.equal(claude.next_action.command, claude.start_command);
+});
+
+test("labor-agents gives setup steps when Claude is installed but not ready to start", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      readClaudeOauthToken: () => null,
+      runClaudeAuthStatus: async () => ({
+        ok: true,
+        account: {
+          loggedIn: true,
+          authMethod: "claude.ai",
+          apiProvider: "firstParty",
+          email: "seller@example.com",
+          orgId: "org-123",
+          orgName: "Seller Team",
+          subscriptionType: "team",
+        },
+      }),
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents.find((agent) => agent.runtime === "claude");
+  assert.equal(claude.status, "publish_only");
+  assert.equal(claude.can_publish, true);
+  assert.equal(claude.can_serve, false);
+  assert.deepEqual(claude.needs, ["claude_code_oauth"]);
+  assert.equal(claude.next_action.type, "finish_runtime_setup");
+  assert.equal(claude.next_action.ready, false);
+  assert.deepEqual(claude.next_action.blocked_by, ["claude_code_oauth"]);
+  assert.match(claude.next_action.steps.join(" "), /claude setup-token/);
+  assert.match(claude.next_action.steps.join(" "), /clawlabor labor-start --runtime claude/);
+});
+
+test("labor-agents gives first-run setup steps when Claude, Docker, and cloudflared are missing", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      readClaudeOauthToken: () => null,
+      runClaudeAuthStatus: async () => ({ ok: false, account: { loggedIn: false } }),
+      spawnSync: (cmd, args) => {
+        const tool = cmd === "sh" ? args[3] : cmd;
+        const missing = new Set(["claude", "docker", "cloudflared"]);
+        const status = missing.has(tool) ? 1 : 0;
+        return {
+          status,
+          stdout: status === 0 ? `${tool} version ok` : "",
+          stderr: status === 0 ? "" : `${tool}: command not found`,
+        };
+      },
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  const claude = parsed.agents.find((agent) => agent.runtime === "claude");
+  assert.equal(claude.status, "not_installed");
+  assert.equal(claude.can_publish, false);
+  assert.equal(claude.can_serve, false);
+  assert.deepEqual(claude.needs, ["claude_cli", "claude_code_oauth", "docker", "cloudflared"]);
+  assert.equal(claude.next_action.type, "install_runtime");
+  assert.deepEqual(claude.next_action.blocked_by, ["claude_cli", "claude_code_oauth", "docker", "cloudflared"]);
+  const steps = claude.next_action.steps.join("\n");
+  assert.match(steps, /Install Claude Code CLI/);
+  assert.match(steps, /not Claude Desktop/);
+  assert.match(steps, /@anthropic-ai\/claude-code/);
+  assert.match(steps, /Install Docker Desktop/);
+  assert.match(steps, /Install cloudflared/);
+  assert.equal(claude.next_action.diagnostics_command, "clawlabor labor-agents --verbose");
 });
 
 test("labor-agents --verbose keeps diagnostic detail", async () => {
@@ -4300,7 +4505,7 @@ test("labor-agents --verbose keeps diagnostic detail", async () => {
   assert.equal(codex.present_on_path, true);
   assert.equal(codex.ready_to_publish, true);
   assert.equal(codex.ready_to_serve, false);
-  assert.equal(codex.serve_status, "candidate_not_wired_to_labor_serve");
+  assert.equal(codex.serve_status, "needs_codex_auth");
   const opencode = parsed.agents[2];
   assert.equal(opencode.ready_to_publish, true);
   assert.equal(opencode.ready_to_serve, false);
@@ -4470,8 +4675,8 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.match(spawned[0].args.join(" "), /chown sandbox:sandbox/);
   assert.match(spawned[0].args.join(" "), /find '\/home\/sandbox\/\.claude' -mindepth 1\s+-exec chown sandbox:sandbox/);
   assert.match(spawned[0].args.join(" "), /'\/home\/sandbox\/\.claude'/);
-  assert.match(spawned[0].args.join(" "), /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor install-agent 'claude'/);
-  assert.match(spawned[0].args.join(" "), /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor server/);
+  assert.match(spawned[0].args.join(" "), /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor install-agent 'claude'/);
+  assert.match(spawned[0].args.join(" "), /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor server/);
   assert.match(spawned[0].args.join(" "), /sandbox-clawlabor server --token='SBX'/);
   assert.ok(!spawned[0].args.includes("oauth-token-123"));
   assert.equal(spawned[1].cmd, "cloudflared");
@@ -5887,21 +6092,22 @@ test("labor-publish blocks a duplicate active listing for the same runtime", asy
   );
 });
 
-test("labor-publish rejects runtimes without serve support (codex)", async () => {
-  const { fetch } = recordingFetch([]);
-  await assert.rejects(
-    () => runCli(
-      ["labor-publish", "--runtime", "codex", "--name", "Codex bot", "--description", "rented codex",
-       "--daily-rate", "240"],
-      {
-        env: BASE_ENV,
-        fetch,
-        stdout: () => {},
-        runClaudeAuthStatus: async () => ({ ok: false }),
-      },
-    ),
-    /has no labor-serve support yet/,
+test("labor-publish --runtime codex creates a resource without host account", async () => {
+  const { fetch, calls } = recordingFetch([
+    matchRoute("GET", "/labor/list?limit=100", { status: 200, body: JSON.stringify({ items: [], next_cursor: null }) }),
+    matchRoute("GET", "/agents/me", { status: 200, body: JSON.stringify({ id: "seller-1", name: "Seller" }) }),
+    matchRoute("POST", "/labor", { status: 201, body: JSON.stringify({ id: "labor-codex", status: "draft" }) }),
+    matchRoute("PUT", "/labor/labor-codex", { status: 200, body: JSON.stringify({ id: "labor-codex", name: "Codex bot", status: "available" }) }),
+  ]);
+  await runCli(
+    ["labor-publish", "--runtime", "codex", "--name", "Codex bot", "--description", "rented codex", "--daily-rate", "240"],
+    { env: BASE_ENV, fetch, stdout: () => {} },
   );
+  const create = calls.find((c) => c.url.endsWith("/labor") && c.options.method === "POST");
+  const body = JSON.parse(create.options.body);
+  assert.equal(body.runtime, "codex");
+  assert.equal(body.daily_rate_uat, 240);
+  assert.equal("host_account_provider" in body, false);
 });
 
 test("labor-list defaults to current seller resources", async () => {
@@ -6202,6 +6408,218 @@ test("resolveClaudeCodeOauthToken never runs claude setup-token", async () => {
   assert.deepEqual(calls, [["auth", "status"]]);
 });
 
+test("resolveClaudeCodeOauthToken refreshes expired token using stored refresh token", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-refresh-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  const credentialsFile = path.join(credentialsDir, ".credentials.json");
+  fs.writeFileSync(credentialsFile, JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "expired-access-token",
+      refreshToken: "valid-refresh-token",
+      expiresAt: Date.now() - 60_000,
+    },
+  }));
+
+  const refreshCalls = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    readClaudeOauthToken: null,
+    refreshClaudeOauthToken: async (refreshToken) => {
+      refreshCalls.push(refreshToken);
+      return {
+        accessToken: "new-access-token",
+        refreshToken: "rotated-refresh-token",
+        expiresAt: Date.now() + 3600_000,
+      };
+    },
+    readClaudeCodeKeychainCredentials: () => null,
+    runClaudeAuthStatus: async () => { throw new Error("should not be reached"); },
+  });
+
+  assert.equal(result.token, "new-access-token");
+  assert.equal(result.source, "refreshed");
+  assert.deepEqual(refreshCalls, ["valid-refresh-token"]);
+
+  // Verify credentials file was updated with new tokens.
+  const updated = JSON.parse(fs.readFileSync(credentialsFile, "utf8"));
+  assert.equal(updated.claudeAiOauth.accessToken, "new-access-token");
+  assert.equal(updated.claudeAiOauth.refreshToken, "rotated-refresh-token");
+});
+
+test("resolveClaudeCodeOauthToken falls back to claude auth status when refresh fails", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-refresh-fail-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, ".credentials.json"), JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "expired-access-token",
+      refreshToken: "invalid-refresh-token",
+      expiresAt: Date.now() - 60_000,
+    },
+  }));
+
+  const authStatusCalls = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    readClaudeOauthToken: null,
+    refreshClaudeOauthToken: async () => null,
+    readClaudeCodeKeychainCredentials: () => null,
+    runClaudeAuthStatus: async () => {
+      authStatusCalls.push("called");
+      return { ok: true };
+    },
+  });
+
+  assert.equal(authStatusCalls.length, 1);
+  assert.equal(result.token, null);
+  assert.equal(result.authStatusOk, true);
+});
+
+test("resolveClaudeCodeOauthToken uses valid token from credentials without refresh", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-no-refresh-"));
+  const credentialsDir = path.join(home, ".claude");
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, ".credentials.json"), JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "fresh-access-token",
+      refreshToken: "unused-refresh-token",
+      expiresAt: Date.now() + 3600_000,
+    },
+  }));
+
+  const refreshCalls = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    refreshClaudeOauthToken: async () => { refreshCalls.push("should-not-be-called"); return null; },
+    readClaudeCodeKeychainCredentials: () => null,
+    runClaudeAuthStatus: async () => { throw new Error("should not be reached"); },
+  });
+
+  assert.equal(result.token, "fresh-access-token");
+  assert.equal(result.source, "credentials");
+  assert.equal(refreshCalls.length, 0);
+});
+
+test("resolveClaudeCodeOauthToken writes refreshed keychain credentials back to the keychain", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-keychain-writeback-"));
+  const keychainWrites = [];
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    readClaudeCodeKeychainCredentials: () => JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "expired-keychain-token",
+        refreshToken: "keychain-refresh-token",
+        expiresAt: Date.now() - 60_000,
+        scopes: ["user:inference", "user:profile"],
+        subscriptionType: "max",
+      },
+    }),
+    refreshClaudeOauthToken: async () => ({
+      accessToken: "new-access-token",
+      refreshToken: "rotated-refresh-token",
+      expiresAt: Date.now() + 3600_000,
+    }),
+    writeClaudeCodeKeychainCredentials: (_env, payload) => {
+      keychainWrites.push(payload);
+      return true;
+    },
+    runClaudeAuthStatus: async () => { throw new Error("should not be reached"); },
+  });
+
+  assert.equal(result.token, "new-access-token");
+  assert.equal(result.source, "refreshed_from_keychain");
+  assert.equal(keychainWrites.length, 1);
+  const written = JSON.parse(keychainWrites[0]);
+  assert.equal(written.claudeAiOauth.accessToken, "new-access-token");
+  assert.equal(written.claudeAiOauth.refreshToken, "rotated-refresh-token");
+  // Claude Code's own keychain payload fields must survive the write-back.
+  assert.deepEqual(written.claudeAiOauth.scopes, ["user:inference", "user:profile"]);
+  assert.equal(written.claudeAiOauth.subscriptionType, "max");
+
+  // The credentials file copy is still written alongside the keychain.
+  const fileCopy = JSON.parse(fs.readFileSync(path.join(home, ".claude", ".credentials.json"), "utf8"));
+  assert.equal(fileCopy.claudeAiOauth.accessToken, "new-access-token");
+});
+
+test("resolveClaudeCodeOauthToken keychain write-back failure is best-effort", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-keychain-besteffort-"));
+  const result = await resolveClaudeCodeOauthToken({
+    env: { HOME: home },
+    readClaudeCodeKeychainCredentials: () => JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "expired-keychain-token",
+        refreshToken: "keychain-refresh-token",
+        expiresAt: Date.now() - 60_000,
+      },
+    }),
+    refreshClaudeOauthToken: async () => ({
+      accessToken: "new-access-token",
+      refreshToken: "rotated-refresh-token",
+      expiresAt: Date.now() + 3600_000,
+    }),
+    writeClaudeCodeKeychainCredentials: () => false,
+    runClaudeAuthStatus: async () => { throw new Error("should not be reached"); },
+  });
+
+  assert.equal(result.token, "new-access-token");
+  assert.equal(result.source, "refreshed_from_keychain");
+});
+
+test("writeClaudeCodeKeychainCredentials runs security add-generic-password", () => {
+  if (process.platform !== "darwin") return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-security-stub-"));
+  const argsFile = path.join(dir, "args.txt");
+  const stub = path.join(dir, "security-stub");
+  fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\n`, { mode: 0o755 });
+
+  const ok = writeClaudeCodeKeychainCredentials(
+    { CLAWLABOR_SECURITY_BIN: stub, USER: "testuser" },
+    '{"claudeAiOauth":{"accessToken":"t"}}',
+  );
+
+  assert.equal(ok, true);
+  const args = fs.readFileSync(argsFile, "utf8").trimEnd().split("\n");
+  assert.deepEqual(args, [
+    "add-generic-password",
+    "-U",
+    "-s",
+    "Claude Code-credentials",
+    "-a",
+    "testuser",
+    "-w",
+    '{"claudeAiOauth":{"accessToken":"t"}}',
+  ]);
+});
+
+test("writeCredentialsToPath preserves extra claudeAiOauth fields", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-creds-merge-"));
+  const file = path.join(dir, ".credentials.json");
+  fs.writeFileSync(file, JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: 1,
+      scopes: ["user:inference"],
+      subscriptionType: "max",
+    },
+  }));
+
+  const ok = writeCredentialsToPath(file, {
+    accessToken: "new-access",
+    refreshToken: "new-refresh",
+    expiresAt: 2,
+  });
+
+  assert.equal(ok, true);
+  const updated = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(updated.claudeAiOauth.accessToken, "new-access");
+  assert.equal(updated.claudeAiOauth.refreshToken, "new-refresh");
+  assert.equal(updated.claudeAiOauth.expiresAt, 2);
+  assert.deepEqual(updated.claudeAiOauth.scopes, ["user:inference"]);
+  assert.equal(updated.claudeAiOauth.subscriptionType, "max");
+});
+
 test("labor-unpublish delists a resource (sets it inactive)", async () => {
   const { fetch, calls } = recordingFetch([
     matchRoute("PUT", "/labor/labor-7", {
@@ -6223,7 +6641,12 @@ test("labor-unpublish delists a resource (sets it inactive)", async () => {
 // --- opencode runtime: per-runtime sandbox credential seam (Task 1) ---
 const {
   formatLogTimestamp,
+  codexAuthPath,
+  codexConfigPath,
+  codexHomePath,
+  decodeJwtPayload,
   opencodeAuthPath,
+  resolveCodexChatGptAccount,
   resolveRuntimeSandboxCredentials,
   runtimeStateInitCommand,
   runtimeStateMounts,
@@ -6232,6 +6655,64 @@ const {
 test("opencodeAuthPath honors XDG_DATA_HOME then HOME", () => {
   assert.equal(opencodeAuthPath({ XDG_DATA_HOME: "/x" }), "/x/opencode/auth.json");
   assert.equal(opencodeAuthPath({ HOME: "/home/u" }), "/home/u/.local/share/opencode/auth.json");
+});
+
+test("codexAuthPath honors HOME", () => {
+  assert.equal(codexAuthPath({ HOME: "/home/u" }), "/home/u/.codex/auth.json");
+});
+
+test("codexConfigPath honors HOME", () => {
+  assert.equal(codexConfigPath({ HOME: "/home/u" }), "/home/u/.codex/config.toml");
+});
+
+test("codex paths prefer CODEX_HOME over HOME", () => {
+  assert.equal(codexHomePath({ CODEX_HOME: "/custom/codex", HOME: "/home/u" }), "/custom/codex");
+  assert.equal(codexAuthPath({ CODEX_HOME: "/custom/codex", HOME: "/home/u" }), "/custom/codex/auth.json");
+  assert.equal(codexConfigPath({ CODEX_HOME: "/custom/codex", HOME: "/home/u" }), "/custom/codex/config.toml");
+});
+
+test("decodeJwtPayload decodes base64url payloads", () => {
+  assert.deepEqual(decodeJwtPayload(fakeJwt({ sub: "user-1" })), { sub: "user-1" });
+});
+
+test("resolveCodexChatGptAccount returns api_key_auth for API login", () => {
+  const account = resolveCodexChatGptAccount({
+    env: { HOME: "/home/u" },
+    fs: {
+      existsSync: () => true,
+      readFileSync: () => JSON.stringify({ auth_mode: "api" }),
+    },
+  });
+  assert.deepEqual(account, {
+    provider: "codex",
+    logged_in: false,
+    status: "api_key_auth",
+    auth_mode: "api",
+  });
+});
+
+test("resolveCodexChatGptAccount reads ChatGPT plan from id_token claims", () => {
+  const token = fakeJwt({
+    "https://api.openai.com/auth": {
+      chatgpt_account_id: "acct-123",
+      chatgpt_plan_type: "pro",
+      organizations: [
+        { id: "org-1", title: "Codex Org", is_default: true },
+      ],
+    },
+  });
+  const account = resolveCodexChatGptAccount({
+    env: { HOME: "/home/u" },
+    fs: {
+      existsSync: () => true,
+      readFileSync: () => JSON.stringify({ auth_mode: "chatgpt", tokens: { id_token: token } }),
+    },
+  });
+  assert.equal(account.provider, "codex");
+  assert.equal(account.logged_in, true);
+  assert.equal(account.source, "local_jwt_claim");
+  assert.equal(account.plan, "pro");
+  assert.equal(account.label, "ChatGPT Pro");
 });
 
 test("runtimeStateMounts uses one hire-scoped volume source for every runtime", () => {
@@ -6257,6 +6738,14 @@ test("runtimeStateInitCommand fixes hire volume ownership before agent startup",
   assert.match(command, /find '\/home\/sandbox\/\.claude' -mindepth 1\s+-exec chown sandbox:sandbox/);
 });
 
+test("sandboxUserCommand exposes installed agent binaries on PATH", () => {
+  const command = sandboxUserCommand("codex --version");
+
+  assert.match(command, /^setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox /);
+  assert.match(command, /PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:/);
+  assert.match(command, / codex --version$/);
+});
+
 test("resolveRuntimeSandboxCredentials: claude returns oauth env, no mounts", async () => {
   const creds = await resolveRuntimeSandboxCredentials("claude", {
     env: {},
@@ -6280,10 +6769,37 @@ test("resolveRuntimeSandboxCredentials: opencode mounts auth.json read-only when
   }]);
 });
 
+test("resolveRuntimeSandboxCredentials: codex mounts auth.json read-only when present", async () => {
+  const creds = await resolveRuntimeSandboxCredentials("codex", {
+    env: { HOME: "/home/seller" },
+    fs: { existsSync: (p) => ["/home/seller/.codex/auth.json", "/home/seller/.codex/config.toml"].includes(p) },
+  });
+  assert.deepEqual(creds.env, {});
+  assert.deepEqual(creds.mounts, [
+    {
+      host: "/home/seller/.codex/auth.json",
+      container: "/home/sandbox/.codex/auth.json",
+      ro: true,
+    },
+    {
+      host: "/home/seller/.codex/config.toml",
+      container: "/home/sandbox/.codex/config.toml",
+      ro: true,
+    },
+  ]);
+});
+
 test("resolveRuntimeSandboxCredentials: opencode missing auth throws actionable error", async () => {
   await assert.rejects(
     resolveRuntimeSandboxCredentials("opencode", { env: { HOME: "/home/seller" }, fs: { existsSync: () => false } }),
     /opencode auth login/,
+  );
+});
+
+test("resolveRuntimeSandboxCredentials: codex missing auth throws actionable error", async () => {
+  await assert.rejects(
+    resolveRuntimeSandboxCredentials("codex", { env: { HOME: "/home/seller" }, fs: { existsSync: () => false } }),
+    /codex login/,
   );
 });
 
@@ -6326,8 +6842,8 @@ test("labor-serve --runtime opencode mounts auth.json ro and installs opencode",
   assert.match(joined, /chown sandbox:sandbox/);
   assert.match(joined, /find '\/home\/sandbox\/\.local\/share\/opencode' -mindepth 1 ! -path '\/home\/sandbox\/\.local\/share\/opencode\/auth\.json' -exec chown sandbox:sandbox/);
   assert.match(joined, /'\/home\/sandbox\/\.local\/share\/opencode'/);
-  assert.match(joined, /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor install-agent 'opencode'/);
-  assert.match(joined, /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox sandbox-clawlabor server/);
+  assert.match(joined, /setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor install-agent 'opencode'/);
+  assert.match(joined, /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor server/);
   assert.match(joined, /sandbox-clawlabor server --token='-SBX'/);
   assert.equal(dockerRun.args.includes("CLAUDE_CODE_OAUTH_TOKEN"), false);
 });
