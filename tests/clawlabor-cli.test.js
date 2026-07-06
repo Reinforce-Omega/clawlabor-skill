@@ -4545,6 +4545,39 @@ test("labor-agents --verbose explains expired Claude OAuth token recovery", asyn
   assert.match(oauthRequirement.detail, /CLAUDE_CODE_OAUTH_TOKEN/);
 });
 
+test("labor-agents shows the claude.ai subscription even when CLAUDE_CODE_OAUTH_TOKEN is exported", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      env: { ...BASE_ENV, CLAUDE_CODE_OAUTH_TOKEN: "sk-oauth-exported" },
+      // Identity must be queried with the token stripped, otherwise `claude auth
+      // status` returns inference-only output with no subscription detail.
+      runClaudeAuthStatus: async (env) => {
+        assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+        return {
+          ok: true,
+          account: {
+            loggedIn: true,
+            authMethod: "claude.ai",
+            apiProvider: "firstParty",
+            email: "seller@example.com",
+            orgId: "org-123",
+            orgName: "Seller Team",
+            subscriptionType: "team",
+          },
+        };
+      },
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.host.claude.label, "Seller Team (team)");
+  assert.equal(parsed.host.claude.plan, "team");
+});
+
 test("labor-agents points missing claude CLI users to Claude Code instead of Claude Desktop", async () => {
   const { fetch } = laborAgentsFetch();
   const out = [];
