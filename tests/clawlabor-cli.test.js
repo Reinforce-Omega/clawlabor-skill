@@ -4542,7 +4542,7 @@ test("labor-agents --verbose explains expired Claude OAuth token recovery", asyn
   assert.equal(oauthRequirement.status, "fail");
   assert.match(oauthRequirement.detail, /claude setup-token/);
   assert.match(oauthRequirement.detail, /clawlabor labor-start --runtime claude/);
-  assert.doesNotMatch(oauthRequirement.detail, /CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.match(oauthRequirement.detail, /CLAUDE_CODE_OAUTH_TOKEN/);
 });
 
 test("labor-agents points missing claude CLI users to Claude Code instead of Claude Desktop", async () => {

@@ -289,7 +289,7 @@ async function resolveRuntimeSandboxCredentials(runtime, deps) {
     const claudeOauth = await resolveClaudeCodeOauthToken(deps);
     if (!claudeOauth.token) {
       const authHint = claudeOauth.authStatusOk
-        ? "Claude Code is logged in, but the local claude.ai OAuth access token is missing or expired. Run `claude setup-token`, then retry `clawlabor labor-start --runtime claude`."
+        ? "Claude Code is logged in, but no usable claude.ai OAuth token was found locally (access token expired; no refresh token to renew it). Run `claude setup-token`, export the printed token as CLAUDE_CODE_OAUTH_TOKEN, then retry `clawlabor labor-start --runtime claude`."
         : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription.";
       throw new Error(`labor-serve requires a working local Claude Code claude.ai subscription login. ${authHint}`);
     }
@@ -681,7 +681,7 @@ async function claudeRuntimeAgent(deps) {
       detail: claudeOauth.token
         ? "Claude Code claude.ai OAuth token is available"
         : claudeOauth.authStatusOk
-          ? "Claude Code auth status passed, but the local claude.ai OAuth access token is missing or expired. Run `claude setup-token`, then retry `clawlabor labor-start --runtime claude`."
+          ? "Claude Code is logged in, but no usable claude.ai OAuth token was found locally (access token expired; no refresh token to renew it). Run `claude setup-token`, export the printed token as CLAUDE_CODE_OAUTH_TOKEN, then retry `clawlabor labor-start --runtime claude`."
           : "Run `claude auth status` and make sure it shows authMethod claude.ai with an active subscription.",
     },
     ...sharedServeRequirements,
