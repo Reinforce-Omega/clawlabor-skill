@@ -5264,6 +5264,81 @@ test("labor-serve restarts cloudflared immediately when the process exits, witho
   assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
 
+test("labor-serve restarts a live-but-stuck cloudflared after consecutive failed probes", async () => {
+  const stop = deferred();
+  const spawned = [];
+  let heartbeatCount = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => String(url).startsWith("https://")
+        ? { status: 503, body: "down" }
+        : { status: 200, body: '{"status":"ok"}' },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: () => {
+        heartbeatCount += 1;
+        if (heartbeatCount >= 5) stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        // cloudflared stays alive the whole time — it never exits on its own.
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.exitCode = null;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill(signal) {
+          this.killedWith = signal || "SIGTERM";
+          this.exitCode = 0;
+          this.emit("exit", 0, null);
+        };
+        spawned.push(child);
+        return child;
+      },
+      // Clock frozen: the propagation grace never expires, so only the
+      // consecutive-failure threshold can drive a restart.
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+      now: () => 0,
+    },
+  );
+
+  assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 2, "the stuck tunnel is restarted");
+  assert.match(out.join("\n"), /consecutive probes with cloudflared still running; restarting Cloudflare tunnel \(1\/3\)/);
+  assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
+});
+
 test("labor-serve pulls the pinned sandbox image when it is missing locally", async () => {
   const spawned = [];
   const spawnSyncCalls = [];

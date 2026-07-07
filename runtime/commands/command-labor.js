@@ -65,6 +65,11 @@ const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 // recovery (or a needed restart) is detected in seconds rather than up to a minute.
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const TUNNEL_OUTAGE_PROBE_INTERVAL_MS = 15_000;
+// A live cloudflared can hold a dead edge connection (e.g. after macOS wakes
+// from sleep) and never self-heal. After this many consecutive failed public
+// probes (~1 min at the outage cadence) restart it proactively instead of
+// waiting out the full propagation grace.
+const TUNNEL_STALE_PROBE_THRESHOLD = 4;
 const NANO_FACTOR = 1e9;
 const CLAUDE_CODE_INSTALL_HINT = "Install Claude Code CLI, not Claude Desktop. See https://docs.anthropic.com/en/docs/claude-code/quickstart or run `npm install -g @anthropic-ai/claude-code`, then run `claude auth login`.";
 
@@ -1375,6 +1380,10 @@ async function commandLaborServe(options, deps) {
     // True while the public tunnel is degraded (local healthy, public unreachable
     // or restarting) — drives the tightened heartbeat cadence.
     let tunnelReconnecting = false;
+    // Consecutive failed public probes while the sandbox is locally healthy;
+    // reaching TUNNEL_STALE_PROBE_THRESHOLD forces a restart of a live-but-stuck
+    // cloudflared (e.g. stale connection after machine sleep).
+    let consecutivePublicProbeFailures = 0;
 
     async function cleanupCurrentHire() {
       await cleanupRuntime({
@@ -1503,7 +1512,9 @@ async function commandLaborServe(options, deps) {
       tunnelRestartAttempts += 1;
       const cause = reason === "exited"
         ? "cloudflared process exited"
-        : `public tunnel unreachable for more than ${tunnelAvailabilityTimeoutSeconds()}s`;
+        : reason === "stale"
+          ? `public tunnel unreachable for ${TUNNEL_STALE_PROBE_THRESHOLD} consecutive probes with cloudflared still running`
+          : `public tunnel unreachable for more than ${tunnelAvailabilityTimeoutSeconds()}s`;
       stdout(
         `${cause}; restarting Cloudflare tunnel (${tunnelRestartAttempts}/${MAX_TUNNEL_RESTART_ATTEMPTS}).`,
       );
@@ -1526,10 +1537,14 @@ async function commandLaborServe(options, deps) {
         if (localOk) {
           tunnelReconnecting = true;
           tunnelAvailability.markUnavailable();
+          consecutivePublicProbeFailures += 1;
           // If cloudflared itself exited, don't burn the propagation grace —
           // that grace is for a live-but-not-yet-propagated tunnel. Restart now.
+          // Likewise, a live cloudflared that keeps failing probes is holding a
+          // stale edge connection (e.g. after machine sleep) — restart it too.
           const processExited = !!(tunnelState && tunnelState.exited);
-          if (hireRunning && !processExited && tunnelAvailability.withinGracePeriod()) {
+          const staleConnection = consecutivePublicProbeFailures >= TUNNEL_STALE_PROBE_THRESHOLD;
+          if (hireRunning && !processExited && !staleConnection && tunnelAvailability.withinGracePeriod()) {
             healthy = true;
             heartbeatBody = { healthy: true };
             if (!tunnelGraceNoticePrinted) {
@@ -1540,10 +1555,12 @@ async function commandLaborServe(options, deps) {
               );
             }
           } else if (hireRunning) {
-            if (await restartTunnelAfterTimeout(processExited ? "exited" : "timeout")) {
+            const reason = processExited ? "exited" : staleConnection ? "stale" : "timeout";
+            if (await restartTunnelAfterTimeout(reason)) {
               healthy = true;
               heartbeatBody = { healthy: true };
               tunnelAvailability.markUnavailable();
+              consecutivePublicProbeFailures = 0;
             } else {
               if (!tunnelTimeoutReported) {
                 tunnelTimeoutReported = true;
@@ -1562,6 +1579,7 @@ async function commandLaborServe(options, deps) {
           tunnelAvailability.reset();
           tunnelTimeoutReported = false;
           tunnelGraceNoticePrinted = false;
+          consecutivePublicProbeFailures = 0;
           const recovered = await selfHealSandbox();
           if (recovered) {
             healthy = await probeHealth(publicHealthUrl, { publicTunnel: true });
@@ -1585,6 +1603,7 @@ async function commandLaborServe(options, deps) {
         tunnelTimeoutReported = false;
         tunnelGraceNoticePrinted = false;
         tunnelRestartAttempts = 0;
+        consecutivePublicProbeFailures = 0;
         heartbeatBody = { healthy: true };
       }
 
