@@ -4,6 +4,10 @@ const https = require("node:https");
 const CLOUDFLARE_RESOLVERS = ["1.1.1.1", "1.0.0.1"];
 const TUNNEL_LOG_LINE_LIMIT = 12;
 const TUNNEL_AVAILABILITY_TIMEOUT_MS = 180_000;
+// After we actively restart cloudflared, a fresh tunnel comes up in seconds, so
+// we only need a short window to verify it recovered before the next restart —
+// not the full initial-propagation grace.
+const TUNNEL_RESTART_VERIFY_TIMEOUT_MS = 45_000;
 const DEFAULT_CLOUDFLARED_PROTOCOL = "http2";
 
 function tunnelAvailabilityTimeoutSeconds(timeoutMs = TUNNEL_AVAILABILITY_TIMEOUT_MS) {
@@ -98,23 +102,37 @@ function createTunnelAvailabilityState({
   tunnelState,
   tunnelLogs,
   timeoutMs = TUNNEL_AVAILABILITY_TIMEOUT_MS,
+  restartTimeoutMs = TUNNEL_RESTART_VERIFY_TIMEOUT_MS,
 }) {
   let unavailableSince = null;
+  // "initial" uses the long propagation grace; "restart" uses the short
+  // post-restart verification window (set via enterRestartMode()).
+  let phase = "initial";
+  const activeTimeoutMs = () => (phase === "restart" ? restartTimeoutMs : timeoutMs);
   return {
     markUnavailable() {
       if (unavailableSince === null) unavailableSince = now();
     },
     reset() {
       unavailableSince = null;
+      phase = "initial";
+    },
+    // Begin a fresh, short verification window right after an active restart.
+    enterRestartMode() {
+      phase = "restart";
+      unavailableSince = now();
     },
     elapsedMs() {
       return unavailableSince === null ? 0 : now() - unavailableSince;
     },
     withinGracePeriod() {
-      return unavailableSince !== null && this.elapsedMs() < timeoutMs;
+      return unavailableSince !== null && this.elapsedMs() < activeTimeoutMs();
     },
     remainingSeconds() {
-      return Math.max(0, Math.ceil((timeoutMs - this.elapsedMs()) / 1000));
+      return Math.max(0, Math.ceil((activeTimeoutMs() - this.elapsedMs()) / 1000));
+    },
+    graceTimeoutSeconds() {
+      return Math.ceil(activeTimeoutMs() / 1000);
     },
     failurePayload() {
       return {
@@ -238,6 +256,7 @@ function createSandboxHealthProbe({ deps, sandboxToken, timeoutMs }) {
 
 module.exports = {
   TUNNEL_AVAILABILITY_TIMEOUT_MS,
+  TUNNEL_RESTART_VERIFY_TIMEOUT_MS,
   TUNNEL_LOG_LINE_LIMIT,
   tunnelAvailabilityTimeoutSeconds,
   createTunnelAvailabilityState,
