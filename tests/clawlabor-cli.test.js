@@ -28,7 +28,10 @@ const {
 } = require("../runtime/claude_auth");
 const {
   cloudflaredArgs,
+  createTunnelAvailabilityState,
   startCloudflareTunnel,
+  TUNNEL_AVAILABILITY_TIMEOUT_MS,
+  TUNNEL_RESTART_VERIFY_TIMEOUT_MS,
 } = require("../runtime/commands/labor-tunnel");
 const {
   forceKillProcess,
@@ -5160,7 +5163,9 @@ test("labor-serve restarts cloudflared before reporting tunnel offline", async (
         return child;
       },
       sleep: async (ms) => {
-        if (ms === 60000) nowMs = 181_000;
+        // Advance past the grace on the first heartbeat-loop sleep. The interval
+        // tightens to the outage cadence (15s) once the tunnel is unreachable.
+        if (ms >= 15000) nowMs = 181_000;
       },
       waitForExit: () => stop.promise,
       probePublicHealthWithDnsFallback: async () => false,
@@ -5172,6 +5177,90 @@ test("labor-serve restarts cloudflared before reporting tunnel offline", async (
   assert.deepEqual(heartbeatBodies.slice(0, 2), [{ healthy: true }, { healthy: true }]);
   assert.equal(heartbeatBodies.at(-1).error?.reason, "seller_shutdown");
   assert.match(out.join("\n"), /restarting Cloudflare tunnel \(1\/3\)/);
+  assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
+});
+
+test("labor-serve restarts cloudflared immediately when the process exits, without waiting out the grace", async () => {
+  const stop = deferred();
+  const heartbeatBodies = [];
+  const spawned = [];
+  let cloudflaredCount = 0;
+  let heartbeatCount = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => String(url).startsWith("https://")
+        ? { status: 503, body: "down" }
+        : { status: 200, body: '{"status":"ok"}' },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: ({ options }) => {
+        heartbeatCount += 1;
+        heartbeatBodies.push(JSON.parse(options.body));
+        if (heartbeatCount >= 2) stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.exitCode = null;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill(signal) {
+          this.killedWith = signal || "SIGTERM";
+          this.exitCode = 0;
+          this.emit("exit", 0, null);
+        };
+        spawned.push(child);
+        if (cmd === "cloudflared") {
+          cloudflaredCount += 1;
+          // The first tunnel process dies on its own; exit fires after handlers attach.
+          if (cloudflaredCount === 1) {
+            Promise.resolve().then(() => child.emit("exit", 1, null));
+          }
+        }
+        return child;
+      },
+      // Clock never advances: any restart must be driven by the process exit,
+      // not by the propagation grace timing out.
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+      now: () => 0,
+    },
+  );
+
+  assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 2, "the exited tunnel is restarted");
+  assert.match(out.join("\n"), /cloudflared process exited; restarting Cloudflare tunnel \(1\/3\)/);
   assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
 
@@ -7407,4 +7496,49 @@ test("labor-cleanup aborts when active hire lookup fails so live hires are safe"
     /could not list active hires/,
   );
   assert.deepEqual(removed, [], "no volume should be removed when active-hire lookup fails");
+});
+
+// --- Tunnel availability: restart-verify window + grace phases ---
+
+function makeClock(startMs = 0) {
+  let t = startMs;
+  return { now: () => t, advance: (ms) => { t += ms; } };
+}
+
+test("tunnel availability uses the long grace initially and reports its timeout", () => {
+  const clock = makeClock();
+  const s = createTunnelAvailabilityState({ now: clock.now, timeoutMs: TUNNEL_AVAILABILITY_TIMEOUT_MS, restartTimeoutMs: TUNNEL_RESTART_VERIFY_TIMEOUT_MS });
+  s.markUnavailable();
+  assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_AVAILABILITY_TIMEOUT_MS / 1000));
+  assert.equal(s.withinGracePeriod(), true);
+  clock.advance(TUNNEL_AVAILABILITY_TIMEOUT_MS - 1000);
+  assert.equal(s.withinGracePeriod(), true, "still within the long grace just before timeout");
+  clock.advance(2000);
+  assert.equal(s.withinGracePeriod(), false, "grace expires after the long timeout");
+});
+
+test("enterRestartMode switches to the short verification window", () => {
+  const clock = makeClock();
+  const s = createTunnelAvailabilityState({ now: clock.now, timeoutMs: TUNNEL_AVAILABILITY_TIMEOUT_MS, restartTimeoutMs: TUNNEL_RESTART_VERIFY_TIMEOUT_MS });
+  s.markUnavailable();
+  clock.advance(TUNNEL_AVAILABILITY_TIMEOUT_MS + 1000); // long grace expired
+  assert.equal(s.withinGracePeriod(), false);
+
+  s.enterRestartMode(); // fresh short window starting now
+  assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_RESTART_VERIFY_TIMEOUT_MS / 1000));
+  assert.equal(s.withinGracePeriod(), true, "short window is open right after restart");
+  clock.advance(TUNNEL_RESTART_VERIFY_TIMEOUT_MS - 1000);
+  assert.equal(s.withinGracePeriod(), true, "still within short window just before it closes");
+  clock.advance(2000);
+  assert.equal(s.withinGracePeriod(), false, "short window closes after restart timeout, far sooner than the long grace");
+});
+
+test("reset returns availability to the initial long-grace phase", () => {
+  const clock = makeClock();
+  const s = createTunnelAvailabilityState({ now: clock.now, timeoutMs: TUNNEL_AVAILABILITY_TIMEOUT_MS, restartTimeoutMs: TUNNEL_RESTART_VERIFY_TIMEOUT_MS });
+  s.enterRestartMode();
+  assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_RESTART_VERIFY_TIMEOUT_MS / 1000));
+  s.reset();
+  s.markUnavailable();
+  assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_AVAILABILITY_TIMEOUT_MS / 1000), "reset restores the long grace");
 });

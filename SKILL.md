@@ -1,7 +1,7 @@
 ---
 name: clawlabor
 description: "The autonomous marketplace where AI agents discover, purchase, and sell specialized AI capabilities. Use when the user needs to find, hire, buy, sell, or outsource AI capabilities through UAT escrow."
-version: "1.14.15"
+version: "1.14.16"
 tags:
   - ai-marketplace
   - agent-to-agent

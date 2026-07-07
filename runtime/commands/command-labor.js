@@ -61,6 +61,10 @@ const SANDBOX_STARTUP_TIMEOUT_MS = 180_000;
 const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.4";
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
 const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
+// Heartbeat cadence: relaxed when healthy, tightened during a tunnel outage so
+// recovery (or a needed restart) is detected in seconds rather than up to a minute.
+const HEARTBEAT_INTERVAL_MS = 60_000;
+const TUNNEL_OUTAGE_PROBE_INTERVAL_MS = 15_000;
 const NANO_FACTOR = 1e9;
 const CLAUDE_CODE_INSTALL_HINT = "Install Claude Code CLI, not Claude Desktop. See https://docs.anthropic.com/en/docs/claude-code/quickstart or run `npm install -g @anthropic-ai/claude-code`, then run `claude auth login`.";
 
@@ -1368,6 +1372,9 @@ async function commandLaborServe(options, deps) {
     let tunnelAvailability = null;
     let tunnelRuntime = null;
     let tunnelRestartAttempts = 0;
+    // True while the public tunnel is degraded (local healthy, public unreachable
+    // or restarting) — drives the tightened heartbeat cadence.
+    let tunnelReconnecting = false;
 
     async function cleanupCurrentHire() {
       await cleanupRuntime({
@@ -1490,16 +1497,20 @@ async function commandLaborServe(options, deps) {
       stdout(formatTunnelUnavailableWarning({ publicHealthUrl, laborId, tunnelState, tunnelLogs }));
     }
 
-    async function restartTunnelAfterTimeout() {
+    async function restartTunnelAfterTimeout(reason = "timeout") {
       if (!tunnelRuntime || typeof tunnelRuntime.restart !== "function") return false;
       if (tunnelRestartAttempts >= MAX_TUNNEL_RESTART_ATTEMPTS) return false;
       tunnelRestartAttempts += 1;
+      const cause = reason === "exited"
+        ? "cloudflared process exited"
+        : `public tunnel unreachable for more than ${tunnelAvailabilityTimeoutSeconds()}s`;
       stdout(
-        `Public tunnel unreachable for more than ${tunnelAvailabilityTimeoutSeconds()}s; ` +
-          `restarting Cloudflare tunnel (${tunnelRestartAttempts}/${MAX_TUNNEL_RESTART_ATTEMPTS}).`,
+        `${cause}; restarting Cloudflare tunnel (${tunnelRestartAttempts}/${MAX_TUNNEL_RESTART_ATTEMPTS}).`,
       );
       tunnel = await tunnelRuntime.restart("public tunnel unreachable");
-      tunnelAvailability.reset();
+      // Verify the freshly restarted tunnel over a short window, not the full
+      // initial-propagation grace.
+      tunnelAvailability.enterRestartMode();
       tunnelGraceNoticePrinted = false;
       tunnelTimeoutReported = false;
       warnedTunnelDown = false;
@@ -1513,19 +1524,23 @@ async function commandLaborServe(options, deps) {
       if (!healthy) {
         const localOk = await probeHealth(localHealthUrl);
         if (localOk) {
+          tunnelReconnecting = true;
           tunnelAvailability.markUnavailable();
-          if (hireRunning && tunnelAvailability.withinGracePeriod()) {
+          // If cloudflared itself exited, don't burn the propagation grace —
+          // that grace is for a live-but-not-yet-propagated tunnel. Restart now.
+          const processExited = !!(tunnelState && tunnelState.exited);
+          if (hireRunning && !processExited && tunnelAvailability.withinGracePeriod()) {
             healthy = true;
             heartbeatBody = { healthy: true };
             if (!tunnelGraceNoticePrinted) {
               tunnelGraceNoticePrinted = true;
               stdout(
-                `Tunnel is not reachable yet; allowing up to ${tunnelAvailabilityTimeoutSeconds()}s ` +
+                `Tunnel is not reachable yet; allowing up to ${tunnelAvailability.graceTimeoutSeconds()}s ` +
                   `for Cloudflare propagation before reporting OFFLINE (${tunnelAvailability.remainingSeconds()}s remaining).`,
               );
             }
           } else if (hireRunning) {
-            if (await restartTunnelAfterTimeout()) {
+            if (await restartTunnelAfterTimeout(processExited ? "exited" : "timeout")) {
               healthy = true;
               heartbeatBody = { healthy: true };
               tunnelAvailability.markUnavailable();
@@ -1542,6 +1557,7 @@ async function commandLaborServe(options, deps) {
             }
           }
         } else {
+          tunnelReconnecting = true;
           warnedTunnelDown = false;
           tunnelAvailability.reset();
           tunnelTimeoutReported = false;
@@ -1550,7 +1566,9 @@ async function commandLaborServe(options, deps) {
           if (recovered) {
             healthy = await probeHealth(publicHealthUrl, { publicTunnel: true });
             heartbeatBody = { healthy };
-            if (!healthy) {
+            if (healthy) {
+              tunnelReconnecting = false;
+            } else {
               stdout(
                 `\n⚠️  Sandbox recovered locally but is still unreachable over the public tunnel ` +
                   `(${publicHealthUrl}); reporting current public health to the platform.\n`,
@@ -1561,6 +1579,7 @@ async function commandLaborServe(options, deps) {
           }
         }
       } else {
+        tunnelReconnecting = false;
         warnedTunnelDown = false;
         tunnelAvailability.reset();
         tunnelTimeoutReported = false;
@@ -1647,7 +1666,8 @@ async function commandLaborServe(options, deps) {
     await tick();
     while (hireRunning) {
       if (stopRequested) break;
-      const stopped = await interruptibleSleep(60000);
+      const intervalMs = tunnelReconnecting ? TUNNEL_OUTAGE_PROBE_INTERVAL_MS : HEARTBEAT_INTERVAL_MS;
+      const stopped = await interruptibleSleep(intervalMs);
       if (stopped) break;
       if (stopRequested) break;
       if (!hireRunning) break;
