@@ -65,6 +65,9 @@ const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 // recovery (or a needed restart) is detected in seconds rather than up to a minute.
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const TUNNEL_OUTAGE_PROBE_INTERVAL_MS = 15_000;
+// Seat-level liveness beat cadence (POST /labor/{id}/heartbeat). Kept well
+// under the platform's LABOR_HEARTBEAT_TIMEOUT_SECONDS (180s) staleness cutoff.
+const SEAT_HEARTBEAT_INTERVAL_MS = 60_000;
 // A live cloudflared can hold a dead edge connection (e.g. after macOS wakes
 // from sleep) and never self-heal. After this many consecutive failed public
 // probes (~1 min at the outage cadence) restart it proactively instead of
@@ -1236,6 +1239,25 @@ async function commandLaborServe(options, deps) {
     ]);
   }
 
+  // Best-effort seat-level liveness beat. Without it, labor_resources.
+  // last_heartbeat_at is only stamped once at POST /serve, so the platform
+  // cannot tell a live idle seat from one whose seller process died.
+  let lastSeatHeartbeatAt = -Infinity;
+  async function seatHeartbeat({ force = false } = {}) {
+    const nowMs = now();
+    if (!force && nowMs - lastSeatHeartbeatAt < SEAT_HEARTBEAT_INTERVAL_MS) return;
+    lastSeatHeartbeatAt = nowMs;
+    try {
+      await withTimeout(
+        requestJson(sellerDeps, "POST", `/labor/${laborId}/heartbeat`, { body: { healthy: true } }),
+        LABOR_CONTROL_TIMEOUT_MS,
+        "labor seat heartbeat",
+      );
+    } catch (_err) {
+      /* best effort */
+    }
+  }
+
   async function waitForActiveHire() {
     while (!stopRequested) {
       const hires = await Promise.race([
@@ -1248,6 +1270,7 @@ async function commandLaborServe(options, deps) {
       if (!hires) return null;
       const active = hires[0] || null;
       if (active) return active;
+      await seatHeartbeat();
       await interruptibleSleep(5000);
     }
     return null;
@@ -1619,6 +1642,7 @@ async function commandLaborServe(options, deps) {
     }
 
     async function tick() {
+      await seatHeartbeat();
       await heartbeatOnce();
       if (!hireRunning) return;
       if (!(await activeHireStillPresent(hireId))) {

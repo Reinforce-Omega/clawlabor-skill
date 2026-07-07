@@ -6444,6 +6444,54 @@ test("labor-serve waits for an active hire before provisioning a sandbox", async
   assert.ok(!calls.some((call) => call.url.endsWith("/labor/hire-1/accept")));
 });
 
+test("labor-serve sends seat-level heartbeats while idle and while serving", async () => {
+  let polls = 0;
+  let nowMs = 0;
+  const seatBeats = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/labor-9/heartbeat"),
+      respond: ({ options }) => {
+        seatBeats.push(JSON.parse(options.body));
+        return { status: 204, body: "" };
+      },
+    },
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        polls += 1;
+        if (polls <= 2) return { status: 200, body: '{"items":[]}' }; // idle first
+        if (polls === 3) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    { env: BASE_ENV, fetch, stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      // Advance the clock past the seat-beat interval on every sleep so each
+      // idle poll and each serving tick sends a fresh beat.
+      sleep: async () => { nowMs += 61_000; },
+      now: () => nowMs,
+      waitForExit: () => stop.promise },
+  );
+  assert.ok(seatBeats.length >= 2, `expected idle + serving seat beats, got ${seatBeats.length}`);
+  assert.ok(seatBeats.every((body) => body.healthy === true));
+});
+
 test("labor-serve Ctrl+C exits while active-hire poll is pending", async () => {
   const stop = deferred();
   let pollStarted = false;
