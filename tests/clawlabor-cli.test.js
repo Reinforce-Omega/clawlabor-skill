@@ -6048,6 +6048,7 @@ test("labor-publish applies the default gatekeeper when omitted", async () => {
   );
   const createBody = JSON.parse(calls[2].options.body);
   assert.match(createBody.gatekeeper_prompt, /Accept only safe, legal, well-scoped requests/);
+  assert.match(createBody.gatekeeper_prompt, /Save any files you produce under \/home\/sandbox\//);
 });
 
 test("labor-publish blocks a duplicate active listing for the same runtime", async () => {
