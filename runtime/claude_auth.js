@@ -269,7 +269,13 @@ async function resolveClaudeCodeOauthToken(deps = {}) {
 async function resolveClaudeCodeAccount(deps = {}) {
   const env = deps.env || process.env;
   const authStatus = deps.runClaudeAuthStatus || runClaudeAuthStatus;
-  const status = await authStatus(env);
+  // A present CLAUDE_CODE_OAUTH_TOKEN forces `claude auth status` into
+  // inference-only mode, which hides the email/org/subscription profile. That
+  // token is only the serving credential, not the host identity, so query with
+  // it stripped to surface the real claude.ai subscription login for display.
+  const identityEnv = { ...env };
+  delete identityEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  const status = await authStatus(identityEnv);
   const account = status && status.account ? status.account : null;
   if (!account || !account.loggedIn) {
     return {

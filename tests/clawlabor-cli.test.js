@@ -28,7 +28,10 @@ const {
 } = require("../runtime/claude_auth");
 const {
   cloudflaredArgs,
+  createTunnelAvailabilityState,
   startCloudflareTunnel,
+  TUNNEL_AVAILABILITY_TIMEOUT_MS,
+  TUNNEL_RESTART_VERIFY_TIMEOUT_MS,
 } = require("../runtime/commands/labor-tunnel");
 const {
   forceKillProcess,
@@ -4542,7 +4545,40 @@ test("labor-agents --verbose explains expired Claude OAuth token recovery", asyn
   assert.equal(oauthRequirement.status, "fail");
   assert.match(oauthRequirement.detail, /claude setup-token/);
   assert.match(oauthRequirement.detail, /clawlabor labor-start --runtime claude/);
-  assert.doesNotMatch(oauthRequirement.detail, /CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.match(oauthRequirement.detail, /CLAUDE_CODE_OAUTH_TOKEN/);
+});
+
+test("labor-agents shows the claude.ai subscription even when CLAUDE_CODE_OAUTH_TOKEN is exported", async () => {
+  const { fetch } = laborAgentsFetch();
+  const out = [];
+  await runCli(
+    ["labor-agents"],
+    {
+      ...laborAgentsDeps(fetch, out),
+      env: { ...BASE_ENV, CLAUDE_CODE_OAUTH_TOKEN: "sk-oauth-exported" },
+      // Identity must be queried with the token stripped, otherwise `claude auth
+      // status` returns inference-only output with no subscription detail.
+      runClaudeAuthStatus: async (env) => {
+        assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+        return {
+          ok: true,
+          account: {
+            loggedIn: true,
+            authMethod: "claude.ai",
+            apiProvider: "firstParty",
+            email: "seller@example.com",
+            orgId: "org-123",
+            orgName: "Seller Team",
+            subscriptionType: "team",
+          },
+        };
+      },
+    },
+  );
+
+  const parsed = JSON.parse(out.join(""));
+  assert.equal(parsed.host.claude.label, "Seller Team (team)");
+  assert.equal(parsed.host.claude.plan, "team");
 });
 
 test("labor-agents points missing claude CLI users to Claude Code instead of Claude Desktop", async () => {
@@ -5127,7 +5163,9 @@ test("labor-serve restarts cloudflared before reporting tunnel offline", async (
         return child;
       },
       sleep: async (ms) => {
-        if (ms === 60000) nowMs = 181_000;
+        // Advance past the grace on the first heartbeat-loop sleep. The interval
+        // tightens to the outage cadence (15s) once the tunnel is unreachable.
+        if (ms >= 15000) nowMs = 181_000;
       },
       waitForExit: () => stop.promise,
       probePublicHealthWithDnsFallback: async () => false,
@@ -5139,6 +5177,165 @@ test("labor-serve restarts cloudflared before reporting tunnel offline", async (
   assert.deepEqual(heartbeatBodies.slice(0, 2), [{ healthy: true }, { healthy: true }]);
   assert.equal(heartbeatBodies.at(-1).error?.reason, "seller_shutdown");
   assert.match(out.join("\n"), /restarting Cloudflare tunnel \(1\/3\)/);
+  assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
+});
+
+test("labor-serve restarts cloudflared immediately when the process exits, without waiting out the grace", async () => {
+  const stop = deferred();
+  const heartbeatBodies = [];
+  const spawned = [];
+  let cloudflaredCount = 0;
+  let heartbeatCount = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => String(url).startsWith("https://")
+        ? { status: 503, body: "down" }
+        : { status: 200, body: '{"status":"ok"}' },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: ({ options }) => {
+        heartbeatCount += 1;
+        heartbeatBodies.push(JSON.parse(options.body));
+        if (heartbeatCount >= 2) stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.exitCode = null;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill(signal) {
+          this.killedWith = signal || "SIGTERM";
+          this.exitCode = 0;
+          this.emit("exit", 0, null);
+        };
+        spawned.push(child);
+        if (cmd === "cloudflared") {
+          cloudflaredCount += 1;
+          // The first tunnel process dies on its own; exit fires after handlers attach.
+          if (cloudflaredCount === 1) {
+            Promise.resolve().then(() => child.emit("exit", 1, null));
+          }
+        }
+        return child;
+      },
+      // Clock never advances: any restart must be driven by the process exit,
+      // not by the propagation grace timing out.
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+      now: () => 0,
+    },
+  );
+
+  assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 2, "the exited tunnel is restarted");
+  assert.match(out.join("\n"), /cloudflared process exited; restarting Cloudflare tunnel \(1\/3\)/);
+  assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
+});
+
+test("labor-serve restarts a live-but-stuck cloudflared after consecutive failed probes", async () => {
+  const stop = deferred();
+  const spawned = [];
+  let heartbeatCount = 0;
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => ({ status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' }),
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.endsWith("/v1/health"),
+      respond: ({ url }) => String(url).startsWith("https://")
+        ? { status: 503, body: "down" }
+        : { status: 200, body: '{"status":"ok"}' },
+    },
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/hires/hire-1/heartbeat"),
+      respond: () => {
+        heartbeatCount += 1;
+        if (heartbeatCount >= 5) stop.resolve();
+        return { status: 204, body: "" };
+      },
+    },
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  const out = [];
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: BASE_ENV,
+      fetch,
+      stdout: (t) => out.push(t),
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawnSync: (cmd, args) => {
+        if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") return { status: 0 };
+        return spawnSync(cmd, args);
+      },
+      spawn: (cmd, args, opts) => {
+        // cloudflared stays alive the whole time — it never exits on its own.
+        const child = new EventEmitter();
+        child.cmd = cmd;
+        child.args = args;
+        child.opts = opts;
+        child.exitCode = null;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = function kill(signal) {
+          this.killedWith = signal || "SIGTERM";
+          this.exitCode = 0;
+          this.emit("exit", 0, null);
+        };
+        spawned.push(child);
+        return child;
+      },
+      // Clock frozen: the propagation grace never expires, so only the
+      // consecutive-failure threshold can drive a restart.
+      sleep: async () => {},
+      waitForExit: () => stop.promise,
+      probePublicHealthWithDnsFallback: async () => false,
+      now: () => 0,
+    },
+  );
+
+  assert.equal(spawned.filter((child) => child.cmd === "cloudflared").length, 2, "the stuck tunnel is restarted");
+  assert.match(out.join("\n"), /consecutive probes with cloudflared still running; restarting Cloudflare tunnel \(1\/3\)/);
   assert.doesNotMatch(out.join("\n"), /reporting OFFLINE to the platform/);
 });
 
@@ -6246,6 +6443,54 @@ test("labor-serve waits for an active hire before provisioning a sandbox", async
   );
   assert.equal(polls, 3);
   assert.ok(!calls.some((call) => call.url.endsWith("/labor/hire-1/accept")));
+});
+
+test("labor-serve sends seat-level heartbeats while idle and while serving", async () => {
+  let polls = 0;
+  let nowMs = 0;
+  const seatBeats = [];
+  const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
+  const { fetch } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 204, body: "" }),
+    {
+      match: ({ url, options }) =>
+        options.method === "POST" && url.endsWith("/labor/labor-9/heartbeat"),
+      respond: ({ options }) => {
+        seatBeats.push(JSON.parse(options.body));
+        return { status: 204, body: "" };
+      },
+    },
+    {
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        polls += 1;
+        if (polls <= 2) return { status: 200, body: '{"items":[]}' }; // idle first
+        if (polls === 3) return { status: 200, body: '{"items":[{"id":"hire-1","status":"active"}]}' };
+        return { status: 200, body: '{"items":[]}' };
+      },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ hire_id: "hire-1", tunnel_token: "TT", sandbox_token: "SBX", hostname: "hire-1.clawlabor.com" }),
+    }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    stopAfterHireTeardown,
+    matchRoute("DELETE", "/labor/labor-9/serve", { status: 204, body: "" }),
+  ]);
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    { env: BASE_ENV, fetch, stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      spawn: () => ({ kill() {} }),
+      // Advance the clock past the seat-beat interval on every sleep so each
+      // idle poll and each serving tick sends a fresh beat.
+      sleep: async () => { nowMs += 61_000; },
+      now: () => nowMs,
+      waitForExit: () => stop.promise },
+  );
+  assert.ok(seatBeats.length >= 2, `expected idle + serving seat beats, got ${seatBeats.length}`);
+  assert.ok(seatBeats.every((body) => body.healthy === true));
 });
 
 test("labor-serve Ctrl+C exits while active-hire poll is pending", async () => {
@@ -7375,4 +7620,49 @@ test("labor-cleanup aborts when active hire lookup fails so live hires are safe"
     /could not list active hires/,
   );
   assert.deepEqual(removed, [], "no volume should be removed when active-hire lookup fails");
+});
+
+// --- Tunnel availability: restart-verify window + grace phases ---
+
+function makeClock(startMs = 0) {
+  let t = startMs;
+  return { now: () => t, advance: (ms) => { t += ms; } };
+}
+
+test("tunnel availability uses the long grace initially and reports its timeout", () => {
+  const clock = makeClock();
+  const s = createTunnelAvailabilityState({ now: clock.now, timeoutMs: TUNNEL_AVAILABILITY_TIMEOUT_MS, restartTimeoutMs: TUNNEL_RESTART_VERIFY_TIMEOUT_MS });
+  s.markUnavailable();
+  assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_AVAILABILITY_TIMEOUT_MS / 1000));
+  assert.equal(s.withinGracePeriod(), true);
+  clock.advance(TUNNEL_AVAILABILITY_TIMEOUT_MS - 1000);
+  assert.equal(s.withinGracePeriod(), true, "still within the long grace just before timeout");
+  clock.advance(2000);
+  assert.equal(s.withinGracePeriod(), false, "grace expires after the long timeout");
+});
+
+test("enterRestartMode switches to the short verification window", () => {
+  const clock = makeClock();
+  const s = createTunnelAvailabilityState({ now: clock.now, timeoutMs: TUNNEL_AVAILABILITY_TIMEOUT_MS, restartTimeoutMs: TUNNEL_RESTART_VERIFY_TIMEOUT_MS });
+  s.markUnavailable();
+  clock.advance(TUNNEL_AVAILABILITY_TIMEOUT_MS + 1000); // long grace expired
+  assert.equal(s.withinGracePeriod(), false);
+
+  s.enterRestartMode(); // fresh short window starting now
+  assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_RESTART_VERIFY_TIMEOUT_MS / 1000));
+  assert.equal(s.withinGracePeriod(), true, "short window is open right after restart");
+  clock.advance(TUNNEL_RESTART_VERIFY_TIMEOUT_MS - 1000);
+  assert.equal(s.withinGracePeriod(), true, "still within short window just before it closes");
+  clock.advance(2000);
+  assert.equal(s.withinGracePeriod(), false, "short window closes after restart timeout, far sooner than the long grace");
+});
+
+test("reset returns availability to the initial long-grace phase", () => {
+  const clock = makeClock();
+  const s = createTunnelAvailabilityState({ now: clock.now, timeoutMs: TUNNEL_AVAILABILITY_TIMEOUT_MS, restartTimeoutMs: TUNNEL_RESTART_VERIFY_TIMEOUT_MS });
+  s.enterRestartMode();
+  assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_RESTART_VERIFY_TIMEOUT_MS / 1000));
+  s.reset();
+  s.markUnavailable();
+  assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_AVAILABILITY_TIMEOUT_MS / 1000), "reset restores the long grace");
 });
