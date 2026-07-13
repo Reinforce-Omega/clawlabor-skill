@@ -59,7 +59,7 @@ const DEFAULT_DAILY_TOKEN_CAP = 1_000_000; // 1M tokens/day
 const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const SANDBOX_STARTUP_TIMEOUT_MS = 180_000;
 const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.4";
-const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description.";
+const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description. Save any files you produce under /home/sandbox/.";
 const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 // Heartbeat cadence: relaxed when healthy, tightened during a tunnel outage so
 // recovery (or a needed restart) is detected in seconds rather than up to a minute.
