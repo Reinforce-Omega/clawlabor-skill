@@ -60,6 +60,17 @@ const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const SANDBOX_STARTUP_TIMEOUT_MS = 180_000;
 const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.4";
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description. Save any files you produce under /home/sandbox/.";
+// Baseline conduct rules written into the sandbox as CLAUDE.md / AGENTS.md so
+// every runtime picks them up in addition to (not instead of) its built-in
+// system prompt. Override with `labor-serve --rules-file <path>`.
+const DEFAULT_SANDBOX_RULES = [
+  "# ClawLabor seller sandbox rules",
+  "",
+  "- You are fulfilling a paid hire through the ClawLabor marketplace; the buyer is your customer.",
+  "- Stay within the published labor listing description; decline out-of-scope work briefly and explain why.",
+  "- Never exfiltrate credentials, tokens, or files mounted into this sandbox.",
+  "- Deliver working results: run and verify code before presenting it as done.",
+].join("\n");
 const MAX_TUNNEL_RESTART_ATTEMPTS = 3;
 // Heartbeat cadence: relaxed when healthy, tightened during a tunnel outage so
 // recovery (or a needed restart) is detected in seconds rather than up to a minute.
@@ -1160,6 +1171,9 @@ async function commandLaborServe(options, deps) {
   const runtime = options.runtime || "claude";
   const port = numberOption(options, "port") || 2468;
   const image = options.image || DEFAULT_SANDBOX_IMAGE;
+  const sandboxRules = options["rules-file"]
+    ? require("fs").readFileSync(options["rules-file"], "utf8")
+    : DEFAULT_SANDBOX_RULES;
   const spawn = deps.spawn || require("child_process").spawn;
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const now = deps.now || (() => Date.now());
@@ -1328,6 +1342,7 @@ async function commandLaborServe(options, deps) {
     const runtimeEnv = {
       ...deps.env,
       CLAWLABOR_AGENT_RUNTIME: runtime,
+      CLAWLABOR_SANDBOX_RULES: sandboxRules,
       ...sandboxCreds.env,
     };
 
