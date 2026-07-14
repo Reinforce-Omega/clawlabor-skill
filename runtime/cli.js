@@ -351,13 +351,13 @@ const COMMANDS = {
     handler: commandLaborStart,
     section: "Labor",
     summary: "Seller: put a supported local runtime on duty, publishing first when needed",
-    usage: "labor-start [--runtime claude] [--name \"...\"] [--description \"...\"] [--daily-rate <uat_per_day>] [--port 2468] [--image <docker_image>]",
+    usage: "labor-start [--runtime claude] [--name \"...\"] [--description \"...\"] [--daily-rate <uat_per_day>] [--port 2468] [--image <docker_image>] [--rules-file <path>]",
   },
   "labor-serve": {
     handler: commandLaborServe,
     section: "Labor",
     summary: "Seller: provision a platform tunnel, run the sandbox + cloudflared, auto-accept hires, and heartbeat",
-    usage: "labor-serve --labor <labor_resource_id> [--runtime claude] [--port 2468] [--image <docker_image>]",
+    usage: "labor-serve --labor <labor_resource_id> [--runtime claude] [--port 2468] [--image <docker_image>] [--rules-file <path>]",
   },
   "labor-cleanup": {
     handler: commandLaborCleanup,

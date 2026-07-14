@@ -35,7 +35,9 @@ const {
 } = require("../runtime/commands/labor-tunnel");
 const {
   forceKillProcess,
+  sandboxRulesInitCommand,
   sandboxUserCommand,
+  startSandboxContainer,
 } = require("../runtime/commands/labor-sandbox");
 
 const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
@@ -6982,6 +6984,49 @@ test("runtimeStateInitCommand fixes hire volume ownership before agent startup",
   assert.match(command, /mkdir -p '\/home\/sandbox\/\.local' '\/home\/sandbox\/\.cache' '\/home\/sandbox\/\.config'/);
   assert.match(command, /chown sandbox:sandbox .*'\/home\/sandbox\/\.claude'/);
   assert.match(command, /find '\/home\/sandbox\/\.claude' -mindepth 1\s+-exec chown sandbox:sandbox/);
+});
+
+test("sandboxRulesInitCommand writes CLAUDE.md and AGENTS.md from the rules env var", () => {
+  const command = sandboxRulesInitCommand();
+
+  // no-op when the env var is empty so the container still boots without rules
+  assert.match(command, /\[ -z "\$CLAWLABOR_SANDBOX_RULES" \] \|\|/);
+  assert.match(command, /printf '%s\\n' "\$CLAWLABOR_SANDBOX_RULES" > '\/home\/sandbox\/CLAUDE\.md'/);
+  assert.match(command, /printf '%s\\n' "\$CLAWLABOR_SANDBOX_RULES" > '\/home\/sandbox\/AGENTS\.md'/);
+  assert.match(command, /chown sandbox:sandbox '\/home\/sandbox\/CLAUDE\.md' '\/home\/sandbox\/AGENTS\.md'/);
+});
+
+test("startSandboxContainer forwards the rules env var and writes rules before agent install", () => {
+  const spawnCalls = [];
+  const spawn = (cmd, args, opts) => {
+    spawnCalls.push({ cmd, args, opts });
+    return { pid: 1 };
+  };
+  startSandboxContainer({
+    spawn,
+    stdout: () => {},
+    image: "img:test",
+    // deliberately not 2468: clearPortOccupant really shells out to docker,
+    // and an in-use dev port would get its container removed by this test
+    port: 59999,
+    runtime: "claude",
+    hireId: "hire-123",
+    containerName: "clawlabor-hire-hire-123",
+    sandboxToken: "tok",
+    sandboxCreds: { env: {}, mounts: [] },
+    runtimeEnv: { CLAWLABOR_SANDBOX_RULES: "- be nice" },
+  });
+
+  const dockerRun = spawnCalls.find((c) => c.cmd === "docker" && c.args[0] === "run");
+  assert.ok(dockerRun, "docker run was spawned");
+  const flat = dockerRun.args.join(" ");
+  assert.match(flat, /-e CLAWLABOR_SANDBOX_RULES/);
+  assert.equal(dockerRun.opts.env.CLAWLABOR_SANDBOX_RULES, "- be nice");
+  const script = dockerRun.args[dockerRun.args.length - 1];
+  const rulesIdx = script.indexOf("CLAWLABOR_SANDBOX_RULES");
+  const installIdx = script.indexOf("install-agent");
+  assert.ok(rulesIdx > -1 && installIdx > -1 && rulesIdx < installIdx,
+    "rules are written before the agent installs/starts");
 });
 
 test("sandboxUserCommand exposes installed agent binaries on PATH", () => {

@@ -37,6 +37,21 @@ function runtimeStateInitCommand(mounts, { excludePaths = [] } = {}) {
   return `mkdir -p ${quoted} && chown sandbox:sandbox ${quoted} && ${recursiveChowns}`;
 }
 
+// Writes the seller conduct rules into the agents' native instruction files so
+// they are APPENDED to each runtime's built-in system prompt instead of
+// replacing it: claude reads /home/sandbox/CLAUDE.md (project memory, cwd is
+// /home/sandbox), opencode and codex read /home/sandbox/AGENTS.md. The rules
+// text travels via the CLAWLABOR_SANDBOX_RULES env var to avoid shell-quoting
+// the content into the container command line.
+function sandboxRulesInitCommand() {
+  const files = ["/home/sandbox/CLAUDE.md", "/home/sandbox/AGENTS.md"];
+  const writes = files
+    .map((file) => `printf '%s\\n' "$CLAWLABOR_SANDBOX_RULES" > ${shellQuote(file)}`)
+    .join(" && ");
+  const quotedFiles = files.map(shellQuote).join(" ");
+  return `{ [ -z "$CLAWLABOR_SANDBOX_RULES" ] || { ${writes} && chown sandbox:sandbox ${quotedFiles}; }; }`;
+}
+
 function sandboxUserCommand(command) {
   const path = [
     "/home/sandbox/.local/share/sandbox-clawlabor/bin",
@@ -229,6 +244,7 @@ function startSandboxContainer({
       // agent install and the long-running server run as sandbox below.
       "-u", "root",
       "-e", "CLAWLABOR_AGENT_RUNTIME",
+      "-e", "CLAWLABOR_SANDBOX_RULES",
       ...credEnvFlags,
       ...stateMountFlags,
       ...credMountFlags,
@@ -237,6 +253,7 @@ function startSandboxContainer({
       "-lc",
       [
         runtimeStateInitCommand(stateMounts, { excludePaths: readOnlyCredPaths }),
+        sandboxRulesInitCommand(),
         sandboxUserCommand(`sandbox-clawlabor install-agent ${shellQuote(runtime)}`),
         runtimeStateInitCommand(stateMounts, { excludePaths: readOnlyCredPaths }),
         `exec ${sandboxUserCommand(`sandbox-clawlabor server --token=${shellQuote(sandboxToken)} --host 0.0.0.0 --port 2468`)}`,
@@ -289,6 +306,7 @@ module.exports = {
   shellQuote,
   runtimeStateMounts,
   runtimeStateInitCommand,
+  sandboxRulesInitCommand,
   sandboxUserCommand,
   dockerContainerRunning,
   dockerContainerState,
