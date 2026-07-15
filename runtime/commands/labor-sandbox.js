@@ -1,4 +1,11 @@
 const { spawnSync } = require("node:child_process");
+const { apiBase } = require("../http");
+
+// Container-internal directory the sandbox server writes its telemetry WAL +
+// server logs to. Bind-mounted (NOT a named volume) to the host so the
+// supervisor can tail it on macOS Docker Desktop, where named-volume files live
+// inside the Linux VM and are unreadable from the host. See design doc §8.1.
+const LOGS_TARGET = "/home/sandbox/.local/share/sandbox-clawlabor/logs";
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
@@ -6,6 +13,15 @@ function shellQuote(value) {
 
 function dockerName(value) {
   return String(value).replace(/[^a-zA-Z0-9_.-]/g, "-");
+}
+
+// Host-side directory bound into the container at LOGS_TARGET. Survives
+// container deletion so the supervisor can relay the crash WAL afterwards.
+function hostHireLogsDir(hireId, deps = {}) {
+  const path = require("path");
+  const os = require("os");
+  const home = (deps.env && deps.env.HOME) || os.homedir();
+  return path.join(home, ".clawlabor", "hires", dockerName(hireId), "logs");
 }
 
 function runtimeStateMounts(runtime, hireId) {
@@ -18,12 +34,13 @@ function runtimeStateMounts(runtime, hireId) {
   return targets.map((target) => ({ source, target, type: "volume" }));
 }
 
-function runtimeStateInitCommand(mounts, { excludePaths = [] } = {}) {
+function runtimeStateInitCommand(mounts, { excludePaths = [], extraPaths = [] } = {}) {
   const targets = [
     "/home/sandbox/.local",
     "/home/sandbox/.cache",
     "/home/sandbox/.config",
     ...mounts.map((m) => m.target),
+    ...extraPaths,
   ];
   if (targets.length === 0) return "true";
   const quoted = targets.map(shellQuote).join(" ");
@@ -225,7 +242,11 @@ function startSandboxContainer({
   sandboxToken,
   sandboxCreds,
   runtimeEnv,
+  env,
+  telemetryUrl,
+  hostLogsDir,
   logPrefix = "[6/7]",
+  deps = {},
 }) {
   clearPortOccupant({ port, containerName, stdout });
   stdout(`${logPrefix} Starting sandbox container (${image})...`);
@@ -236,6 +257,33 @@ function startSandboxContainer({
     "--mount", `type=${m.type},source=${m.source},target=${m.target}`,
   ]);
   const credMountFlags = sandboxCreds.mounts.flatMap((m) => ["-v", `${m.host}:${m.container}${m.ro ? ":ro" : ""}`]);
+
+  // Host bind-mount for the telemetry WAL + server logs. Must be a bind mount
+  // (not a named volume) so the host supervisor can tail it on macOS. See §8.1.
+  const fsImpl = deps.fs || require("fs");
+  const resolvedHostLogsDir = hostLogsDir || hostHireLogsDir(hireId, { env: env || (deps && deps.env) });
+  try {
+    fsImpl.mkdirSync(resolvedHostLogsDir, { recursive: true });
+  } catch (_err) {
+    // Telemetry must never block the container from starting.
+  }
+  const logsMountFlags = ["--mount", `type=bind,source=${resolvedHostLogsDir},target=${LOGS_TARGET}`];
+
+  // Telemetry env vars injected with concrete values (unlike the name-only
+  // CLAWLABOR_AGENT_RUNTIME passthrough). See contract "Env vars injected by
+  // skill into the container".
+  const resolvedTelemetryUrl = telemetryUrl ||
+    `${apiBase(env || (deps && deps.env))}/labor/hires/${hireId}/telemetry`;
+  const telemetryEnvFlags = [
+    "-e", `SANDBOX_TELEMETRY_URL=${resolvedTelemetryUrl}`,
+    "-e", `SANDBOX_TELEMETRY_TOKEN=${sandboxToken}`,
+    "-e", `SANDBOX_TELEMETRY_HIRE_ID=${hireId}`,
+    "-e", `SANDBOX_TELEMETRY_LEVEL=warn`,
+    "-e", `SANDBOX_CLAWLABOR_LOG_DIR=${LOGS_TARGET}`,
+    "-e", "SANDBOX_CLAWLABOR_LOG_STDOUT=1",
+    "-e", "RUST_BACKTRACE=1",
+  ];
+
   return spawn(
     "docker",
     [
@@ -245,17 +293,21 @@ function startSandboxContainer({
       "-u", "root",
       "-e", "CLAWLABOR_AGENT_RUNTIME",
       "-e", "CLAWLABOR_SANDBOX_RULES",
+      ...telemetryEnvFlags,
       ...credEnvFlags,
       ...stateMountFlags,
+      ...logsMountFlags,
       ...credMountFlags,
       "--entrypoint", "sh",
       image,
       "-lc",
       [
-        runtimeStateInitCommand(stateMounts, { excludePaths: readOnlyCredPaths }),
+        // Chown LOGS_TARGET alongside the -state volume so the sandbox user can
+        // write the WAL after the container drops from root to sandbox.
+        runtimeStateInitCommand(stateMounts, { excludePaths: readOnlyCredPaths, extraPaths: [LOGS_TARGET] }),
         sandboxRulesInitCommand(),
         sandboxUserCommand(`sandbox-clawlabor install-agent ${shellQuote(runtime)}`),
-        runtimeStateInitCommand(stateMounts, { excludePaths: readOnlyCredPaths }),
+        runtimeStateInitCommand(stateMounts, { excludePaths: readOnlyCredPaths, extraPaths: [LOGS_TARGET] }),
         `exec ${sandboxUserCommand(`sandbox-clawlabor server --token=${shellQuote(sandboxToken)} --host 0.0.0.0 --port 2468`)}`,
       ].join(" && "),
     ],
@@ -302,6 +354,8 @@ function hireIdFromContainerName(containerName) {
 }
 
 module.exports = {
+  LOGS_TARGET,
+  hostHireLogsDir,
   dockerName,
   shellQuote,
   runtimeStateMounts,

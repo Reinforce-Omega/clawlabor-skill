@@ -22,6 +22,7 @@ const {
   hireIdFromContainerName,
   hireIdFromVolumeName,
   hireStateVolumeName,
+  hostHireLogsDir,
   removeContainerByNameAsync,
   restartContainerByName,
   runtimeStateInitCommand,
@@ -34,6 +35,11 @@ const {
   terminateChild,
   terminateProcessGroup,
 } = require("./labor-sandbox");
+const {
+  createHostTelemetry,
+  listHireLogsDirs,
+  removeHireLogsDir,
+} = require("./labor-telemetry");
 const {
   TUNNEL_AVAILABILITY_TIMEOUT_MS,
   createSandboxHealthProbe,
@@ -1346,13 +1352,77 @@ async function commandLaborServe(options, deps) {
       ...sandboxCreds.env,
     };
 
-    ensureDockerImage(image, deps, stdout, { logPrefix: "[6/7]" });
-
     const probeHealth = createSandboxHealthProbe({
       deps: { ...deps, withTimeout },
       sandboxToken: sandbox_token,
       timeoutMs: LABOR_CONTROL_TIMEOUT_MS,
     });
+    const hostLogsDir = hostHireLogsDir(hireId, { env: deps.env });
+    const telemetryUrl = `${apiBase(sellerDeps.env)}/labor/hires/${hireId}/telemetry`;
+
+    // Host-side telemetry supervisor (design doc §8.2). Best-effort: every
+    // docker events/stats/relay call is guarded so it can never break the
+    // heartbeat loop. Relay uses the same seller agent auth as the heartbeat.
+    const hostTelemetry = createHostTelemetry({
+      containerName,
+      logsDir: hostLogsDir,
+      stdout,
+      deps,
+      relay: async ({ batch_id, records }) => {
+        try {
+          await withTimeout(
+            requestJson(
+              sellerDeps,
+              "POST",
+              `/labor/hires/${hireId}/telemetry/relay`,
+              { body: { batch_id, records } },
+            ),
+            LABOR_CONTROL_TIMEOUT_MS,
+            "telemetry relay",
+          );
+          return true;
+        } catch (_err) {
+          return false;
+        }
+      },
+    });
+    let telemetryStarted = false;
+    let telemetryTornDown = false;
+    async function telemetryRelaySafe() {
+      try {
+        await hostTelemetry.relayPass();
+      } catch (_err) {
+        /* telemetry must never break the supervisor */
+      }
+    }
+    async function teardownTelemetry() {
+      if (telemetryTornDown) return;
+      telemetryTornDown = true;
+      try {
+        hostTelemetry.stop();
+        await telemetryRelaySafe(); // final flush of remaining WAL + host envelopes
+      } catch (_err) {
+        /* best effort */
+      }
+    }
+    // Pull the sandbox image now that the telemetry controller exists, so an
+    // image pull failure can be captured as a host envelope before we abort.
+    try {
+      ensureDockerImage(image, deps, stdout, { logPrefix: "[6/7]" });
+    } catch (err) {
+      hostTelemetry.emit({
+        kind: "event",
+        severity: "error",
+        code: "image_pull_failed",
+        message: (err && err.message) || `docker image ${image} unavailable`,
+        attrs: { image },
+      });
+      // Best-effort flush so the platform sees the pull failure even though the
+      // hire is about to abort. Then re-throw to preserve existing behavior.
+      await telemetryRelaySafe();
+      throw err;
+    }
+
     const spawnSandboxContainer = () => startSandboxContainer({
       spawn,
       stdout,
@@ -1364,7 +1434,11 @@ async function commandLaborServe(options, deps) {
       sandboxToken: sandbox_token,
       sandboxCreds,
       runtimeEnv,
+      env: sellerDeps.env,
+      telemetryUrl,
+      hostLogsDir,
       logPrefix: "[6/7]",
+      deps,
     });
 
     async function ensureSandboxContainerRunning() {
@@ -1424,6 +1498,10 @@ async function commandLaborServe(options, deps) {
     let consecutivePublicProbeFailures = 0;
 
     async function cleanupCurrentHire() {
+      // Stop the docker-events child and flush a final relay before tearing
+      // down the container, so the crash WAL from the current incarnation is
+      // shipped. Best-effort; never blocks container teardown.
+      await teardownTelemetry();
       await cleanupRuntime({
         hireId,
         containerName,
@@ -1556,6 +1634,24 @@ async function commandLaborServe(options, deps) {
       stdout(
         `${cause}; restarting Cloudflare tunnel (${tunnelRestartAttempts}/${MAX_TUNNEL_RESTART_ATTEMPTS}).`,
       );
+      if (reason === "exited") {
+        // Host-vantage tunnel_exit envelope. Extract a Cloudflare error code
+        // (e.g. 1033) from the tunnel exit summary / logs when present.
+        try {
+          const summary = (tunnelState && tunnelState.exitSummary) || "";
+          const joined = `${summary}\n${(tunnelLogs || []).join("\n")}`;
+          const cfMatch = /\b(10\d{2})\b/.exec(joined);
+          hostTelemetry.emit({
+            kind: "event",
+            severity: "error",
+            code: "tunnel_exit",
+            message: summary || "cloudflared exited",
+            attrs: { cf_code: cfMatch ? Number(cfMatch[1]) : undefined },
+          });
+        } catch (_err) {
+          /* best effort */
+        }
+      }
       tunnel = await tunnelRuntime.restart("public tunnel unreachable");
       // Verify the freshly restarted tunnel over a short window, not the full
       // initial-propagation grace.
@@ -1659,6 +1755,9 @@ async function commandLaborServe(options, deps) {
     async function tick() {
       await seatHeartbeat();
       await heartbeatOnce();
+      // Host telemetry relay + stats sampling ride the heartbeat cadence.
+      // A failing relay must never stop heartbeats (already run above).
+      await telemetryRelaySafe();
       if (!hireRunning) return;
       if (!(await activeHireStillPresent(hireId))) {
         hireRunning = false;
@@ -1668,6 +1767,18 @@ async function commandLaborServe(options, deps) {
     if (!(await waitForInitialSandboxHealth())) {
       await reportInitialSandboxUnavailable();
       throw new Error(`Sandbox did not become locally healthy within ${tunnelAvailabilityTimeoutSeconds(sandboxStartupTimeoutMs)}s: ${localHealthUrl}`);
+    }
+
+    // Container is confirmed running: begin the host telemetry sources. This is
+    // the only vantage that can see OOM / hard-crash (the container can't report
+    // its own death). Guarded so absence of `docker events` degrades gracefully.
+    if (!telemetryStarted) {
+      telemetryStarted = true;
+      try {
+        hostTelemetry.start();
+      } catch (_err) {
+        /* best effort */
+      }
     }
 
     tunnelRuntime = startCloudflareTunnel({
@@ -1842,7 +1953,10 @@ async function commandLaborCleanup(_options, deps, flags) {
   const dryRun = !(flags && flags.has && flags.has("apply"));
   const volumes = dockerListHireStateVolumes(deps);
   const containers = dockerListHireContainers(deps);
-  if (volumes.length === 0 && containers.length === 0) {
+  // Host telemetry WAL dirs (~/.clawlabor/hires/<dockerName>/logs). Named by
+  // dockerName(hireId), same sanitization as containers/volumes.
+  const logsDirs = listHireLogsDirs(deps);
+  if (volumes.length === 0 && containers.length === 0 && logsDirs.length === 0) {
     return JSON.stringify(
       { action: "labor-cleanup", mode: dryRun ? "dry-run" : "apply", checked: 0, kept: [], removed: [], failed: [] },
       null,
@@ -1920,12 +2034,31 @@ async function commandLaborCleanup(_options, deps, flags) {
       failed.push({ type: "volume", volume, hire_id: hireId, reason: "docker volume rm failed (in use?)" });
     }
   }
+  // Orphan telemetry WAL dirs: named by dockerName(hireId). Compare against the
+  // active-hire set (dockerName-normalized) with the same safety guard as
+  // volumes — only reachable once activeHireIds is fully known.
+  const activeHireDockerNames = new Set(Array.from(activeHireIds).map((id) => dockerName(id)));
+  for (const logsDirName of logsDirs) {
+    if (activeHireDockerNames.has(logsDirName)) {
+      kept.push({ type: "logs", logs: logsDirName, reason: "active-hire" });
+      continue;
+    }
+    if (dryRun) {
+      removed.push({ type: "logs", logs: logsDirName, dry_run: true });
+      continue;
+    }
+    if (removeHireLogsDir(logsDirName, deps)) {
+      removed.push({ type: "logs", logs: logsDirName });
+    } else {
+      failed.push({ type: "logs", logs: logsDirName, reason: "rm failed" });
+    }
+  }
 
   return JSON.stringify(
     {
       action: "labor-cleanup",
       mode: dryRun ? "dry-run" : "apply",
-      checked: volumes.length + containers.length,
+      checked: volumes.length + containers.length + logsDirs.length,
       active_hires: Array.from(activeHireIds),
       kept,
       removed,
