@@ -45,10 +45,23 @@ const DEFAULT_API_BASE = "https://www.clawlabor.com/api";
 const BASE_ENV = {
   CLAWLABOR_API_KEY: "test-key",
   XDG_STATE_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-cli-state-")),
+  // Isolate HOME-derived paths (e.g. telemetry WAL dir ~/.clawlabor/hires) from
+  // the developer's real home so cleanup/serve tests are deterministic.
+  HOME: fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-cli-home-")),
 };
 
 function tempTestFile(name) {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-cli-test-")), name);
+}
+
+// Env with an isolated, empty HOME so home-derived paths (telemetry WAL dir
+// ~/.clawlabor/hires) start clean and are unaffected by other tests.
+function envWithIsolatedHome(extra = {}) {
+  return {
+    ...BASE_ENV,
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-cli-iso-home-")),
+    ...extra,
+  };
 }
 
 function recordingFetch(routes) {
@@ -4717,13 +4730,19 @@ test("labor-serve provisions a tunnel, spawns runtime + cloudflared, heartbeats,
   assert.match(spawned[0].args.join(" "), /exec setpriv --reuid=sandbox --regid=sandbox --init-groups env HOME=\/home\/sandbox PATH='\/home\/sandbox\/\.local\/share\/sandbox-clawlabor\/bin:[^']+' sandbox-clawlabor server/);
   assert.match(spawned[0].args.join(" "), /sandbox-clawlabor server --token='SBX'/);
   assert.ok(!spawned[0].args.includes("oauth-token-123"));
-  assert.equal(spawned[1].cmd, "cloudflared");
-  assert.ok(spawned[1].args.includes("TT")); // tunnel_token
-  assert.ok(spawned[1].args.includes("--no-autoupdate"));
-  assert.ok(spawned[1].args.includes("--protocol"));
-  assert.ok(spawned[1].args.includes("http2"));
-  assert.deepEqual(spawned[1].opts.stdio, ["ignore", "pipe", "pipe"]);
-  assert.equal(spawned[1].opts.detached, true);
+  // Phase 2: a `docker events` subscription is spawned after the container is
+  // healthy. Find children by cmd rather than fixed index.
+  const dockerEventsChild = spawned.find((s) => s.cmd === "docker" && s.args[0] === "events");
+  assert.ok(dockerEventsChild, "docker events subscription should be spawned");
+  assert.ok(dockerEventsChild.args.join(" ").includes("container=clawlabor-hire-hire-1"));
+  const cloudflaredChild = spawned.find((s) => s.cmd === "cloudflared");
+  assert.ok(cloudflaredChild, "cloudflared should be spawned");
+  assert.ok(cloudflaredChild.args.includes("TT")); // tunnel_token
+  assert.ok(cloudflaredChild.args.includes("--no-autoupdate"));
+  assert.ok(cloudflaredChild.args.includes("--protocol"));
+  assert.ok(cloudflaredChild.args.includes("http2"));
+  assert.deepEqual(cloudflaredChild.opts.stdio, ["ignore", "pipe", "pipe"]);
+  assert.equal(cloudflaredChild.opts.detached, true);
   assert.equal(spawned[0].args.includes("--rm"), false);
   assert.ok(spawned.some((s) => s.cmd === "docker" && s.args.join(" ") === "rm -f clawlabor-hire-hire-1"));
   assert.ok(spawnSyncCalls.some((c) => c.cmd === "docker" && c.args.join(" ") === "image inspect ryanxdocker/sandbox-clawlabor:0.4.4"));
@@ -7504,7 +7523,7 @@ test("labor-cleanup defaults to dry-run and lists stale volumes that would be re
 
   const out = [];
   await runCli(["labor-cleanup"], {
-    env: BASE_ENV,
+    env: envWithIsolatedHome(),
     fetch,
     stdout: (t) => out.push(t),
     spawnSync: (cmd, args) => {
@@ -7550,7 +7569,7 @@ test("labor-cleanup --apply removes stale volumes via docker volume rm", async (
   const removed = [];
   const out = [];
   await runCli(["labor-cleanup", "--apply"], {
-    env: BASE_ENV,
+    env: envWithIsolatedHome(),
     fetch,
     stdout: (t) => out.push(t),
     spawnSync: (cmd, args) => {
@@ -7593,7 +7612,7 @@ test("labor-cleanup --apply removes stale preserved hire containers", async () =
   const removed = [];
   const out = [];
   await runCli(["labor-cleanup", "--apply"], {
-    env: BASE_ENV,
+    env: envWithIsolatedHome(),
     fetch,
     stdout: (t) => out.push(t),
     spawnSync: (cmd, args) => {
@@ -7710,4 +7729,324 @@ test("reset returns availability to the initial long-grace phase", () => {
   s.reset();
   s.markUnavailable();
   assert.equal(s.graceTimeoutSeconds(), Math.ceil(TUNNEL_AVAILABILITY_TIMEOUT_MS / 1000), "reset restores the long grace");
+});
+
+// ---------------------------------------------------------------------------
+// Telemetry: Phase 1 (env/mount injection) + Phase 2 (docker events, WAL relay)
+// ---------------------------------------------------------------------------
+const {
+  startSandboxContainer,
+  LOGS_TARGET,
+} = require("../runtime/commands/labor-sandbox");
+const {
+  parseDockerEventLine,
+  dockerEventToEnvelope,
+  readSegmentFrom,
+  listSegments,
+  batchRecords,
+  parseMemUsage,
+  createHostTelemetry,
+} = require("../runtime/commands/labor-telemetry");
+
+function fakeSandboxCreds() {
+  return { env: { CLAUDE_CODE_OAUTH_TOKEN: "x" }, mounts: [] };
+}
+
+test("Phase 1: startSandboxContainer injects telemetry -e flags and the logs bind mount", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-tel-home-"));
+  let captured = null;
+  const spawn = (cmd, args, opts) => { captured = { cmd, args, opts }; return { kill() {} }; };
+  const hostLogsDir = path.join(home, ".clawlabor", "hires", "clawlabor-hire-hire-1", "logs");
+  startSandboxContainer({
+    spawn,
+    stdout: () => {},
+    image: "img:1",
+    port: 2468,
+    runtime: "claude",
+    hireId: "hire-1",
+    containerName: "clawlabor-hire-hire-1",
+    sandboxToken: "SBX",
+    sandboxCreds: fakeSandboxCreds(),
+    runtimeEnv: {},
+    env: { CLAWLABOR_API_BASE: "http://localhost:8000/api" },
+    telemetryUrl: "http://localhost:8000/api/labor/hires/hire-1/telemetry",
+    hostLogsDir,
+    deps: { spawnSync: () => ({ status: 1 }) },
+  });
+  assert.ok(captured, "spawn should be called");
+  const joined = captured.args.join(" ");
+  // telemetry env flags with concrete values
+  assert.ok(captured.args.includes("SANDBOX_TELEMETRY_URL=http://localhost:8000/api/labor/hires/hire-1/telemetry"));
+  assert.ok(captured.args.includes("SANDBOX_TELEMETRY_TOKEN=SBX"));
+  assert.ok(captured.args.includes("SANDBOX_TELEMETRY_HIRE_ID=hire-1"));
+  assert.ok(captured.args.includes("SANDBOX_TELEMETRY_LEVEL=warn"));
+  assert.ok(captured.args.includes(`SANDBOX_CLAWLABOR_LOG_DIR=${LOGS_TARGET}`));
+  assert.ok(captured.args.includes("SANDBOX_CLAWLABOR_LOG_STDOUT=1"));
+  assert.ok(captured.args.includes("RUST_BACKTRACE=1"));
+  // logs bind mount (NOT a named volume)
+  assert.ok(captured.args.includes(`type=bind,source=${hostLogsDir},target=${LOGS_TARGET}`),
+    `expected bind mount for logs, got: ${joined}`);
+  // logs dir chowned to sandbox in init phase
+  assert.ok(joined.includes(`'${LOGS_TARGET}'`), "LOGS_TARGET should appear in chown init");
+  // host logs dir created on disk
+  assert.ok(fs.existsSync(hostLogsDir), "host logs dir should be created");
+});
+
+test("Phase 1: telemetryUrl defaults from apiBase (single /api, no double)", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-tel-home2-"));
+  let captured = null;
+  startSandboxContainer({
+    spawn: (cmd, args, opts) => { captured = { cmd, args, opts }; return { kill() {} }; },
+    stdout: () => {},
+    image: "img:1", port: 2468, runtime: "claude", hireId: "hire-9",
+    containerName: "clawlabor-hire-hire-9",
+    sandboxToken: "SBX", sandboxCreds: fakeSandboxCreds(), runtimeEnv: {},
+    env: { CLAWLABOR_API_BASE: "https://www.clawlabor.com/api", HOME: home },
+    hostLogsDir: path.join(home, "logs"),
+    deps: { spawnSync: () => ({ status: 1 }) },
+  });
+  assert.ok(captured.args.includes(
+    "SANDBOX_TELEMETRY_URL=https://www.clawlabor.com/api/labor/hires/hire-9/telemetry"));
+  assert.ok(!captured.args.join(" ").includes("/api/api/"));
+});
+
+test("Phase 2: docker events lines map to the right envelope codes", () => {
+  // oom action -> oom_killed
+  const oom = dockerEventToEnvelope(
+    parseDockerEventLine('{"Action":"oom","Actor":{"Attributes":{}}}'),
+    { containerName: "c", incarnation: "inc" },
+    { spawnSync: () => ({ status: 1 }) });
+  assert.equal(oom.code, "oom_killed");
+  assert.equal(oom.vantage, "host");
+  assert.equal(oom.kind, "crash");
+  assert.equal(oom.attrs.exit_code, 137);
+
+  // die with exit 137 (via inspect) -> oom_killed
+  const dieOom = dockerEventToEnvelope(
+    parseDockerEventLine('{"Action":"die","Actor":{"Attributes":{"exitCode":"137"}}}'),
+    { containerName: "c", incarnation: "inc" },
+    { spawnSync: () => ({ status: 0, stdout: '{"ExitCode":137,"OOMKilled":true,"Error":""}' }) });
+  assert.equal(dieOom.code, "oom_killed");
+  assert.equal(dieOom.attrs.exit_code, 137);
+
+  // die with non-137 exit -> container_exit with attrs.exit_code/error
+  const die = dockerEventToEnvelope(
+    parseDockerEventLine('{"Action":"die","Actor":{"Attributes":{"exitCode":"1"}}}'),
+    { containerName: "c", incarnation: "inc" },
+    { spawnSync: () => ({ status: 0, stdout: '{"ExitCode":1,"OOMKilled":false,"Error":"boom"}' }) });
+  assert.equal(die.code, "container_exit");
+  assert.equal(die.vantage, "host");
+  assert.equal(die.attrs.exit_code, 1);
+  assert.equal(die.attrs.error, "boom");
+
+  // health_status: healthy -> ignored
+  const healthy = dockerEventToEnvelope(
+    parseDockerEventLine('{"Action":"health_status: healthy","Actor":{"Attributes":{}}}'),
+    { containerName: "c", incarnation: "inc" }, {});
+  assert.equal(healthy, null);
+});
+
+test("Phase 2: parseMemUsage parses docker stats MemUsage", () => {
+  assert.deepEqual(parseMemUsage("1.5GiB / 2GiB"),
+    { used: 1.5 * 1024 ** 3, limit: 2 * 1024 ** 3 });
+  assert.equal(parseMemUsage("garbage"), null);
+});
+
+test("Phase 2: WAL tail parses complete lines and skips an incomplete trailing line", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-wal-"));
+  const seg = path.join(dir, "events-inc-000001.ndjson");
+  // two complete lines + an incomplete trailing line (no newline)
+  const r1 = JSON.stringify({ id: "a", message: "one" });
+  const r2 = JSON.stringify({ id: "b", message: "two" });
+  const incomplete = '{"id":"c","message":"thr';
+  fs.writeFileSync(seg, `${r1}\n${r2}\n${incomplete}`);
+  const { records, newOffset } = readSegmentFrom(seg, 0);
+  assert.equal(records.length, 2);
+  assert.equal(records[0].id, "a");
+  assert.equal(records[1].id, "b");
+  // offset points at the start of the incomplete line
+  assert.equal(newOffset, Buffer.byteLength(`${r1}\n${r2}\n`));
+  // completing the line makes it consumable from the stored offset
+  fs.appendFileSync(seg, 'ee"}\n');
+  const next = readSegmentFrom(seg, newOffset);
+  assert.equal(next.records.length, 1);
+  assert.equal(next.records[0].id, "c");
+});
+
+test("Phase 2: listSegments sorts by incarnation then numeric seq", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-seg-"));
+  fs.writeFileSync(path.join(dir, "events-inc-000010.ndjson"), "");
+  fs.writeFileSync(path.join(dir, "events-inc-000002.ndjson"), "");
+  fs.writeFileSync(path.join(dir, "not-a-segment.txt"), "");
+  const segs = listSegments(dir);
+  assert.deepEqual(segs.map((s) => s.seq), [2, 10]);
+});
+
+test("Phase 2: batchRecords caps at 1000 records", () => {
+  const recs = Array.from({ length: 2500 }, (_, i) => ({ id: String(i), message: "x" }));
+  const batches = batchRecords(recs);
+  assert.ok(batches.every((b) => b.length <= 1000));
+  assert.equal(batches.reduce((n, b) => n + b.length, 0), 2500);
+});
+
+test("Phase 2: relayPass posts to /telemetry/relay, deletes closed segment after 204", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-relay-"));
+  const closed = path.join(dir, "events-inc-000001.ndjson");
+  const active = path.join(dir, "events-inc-000002.ndjson");
+  fs.writeFileSync(closed, `${JSON.stringify({ id: "r1", message: "closed-line" })}\n`);
+  fs.writeFileSync(active, `${JSON.stringify({ id: "r2", message: "active-line" })}\n`);
+
+  const relayed = [];
+  const tel = createHostTelemetry({
+    containerName: "c",
+    logsDir: dir,
+    stdout: () => {},
+    deps: { spawnSync: () => ({ status: 1 }) }, // docker stats unavailable -> no-op
+    relay: async ({ batch_id, records }) => { relayed.push({ batch_id, records }); return true; },
+  });
+  const result = await tel.relayPass();
+
+  // both records relayed
+  const allIds = relayed.flatMap((b) => b.records.map((r) => r.id));
+  assert.ok(allIds.includes("r1"));
+  assert.ok(allIds.includes("r2"));
+  // valid batch body: batch_id present (uuid), records array
+  assert.ok(relayed[0].batch_id && typeof relayed[0].batch_id === "string");
+  assert.ok(Array.isArray(relayed[0].records));
+  // CLOSED segment deleted; ACTIVE segment kept
+  assert.ok(!fs.existsSync(closed), "closed segment should be deleted after 204");
+  assert.ok(fs.existsSync(active), "active segment must never be deleted");
+  assert.ok(result.deletedSegments >= 1);
+  // active segment offset advanced (sidecar persisted)
+  assert.ok(fs.existsSync(`${active}.offset`), "active offset sidecar should persist");
+});
+
+test("Phase 2: relayPass keeps closed segment when relay fails", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-relayfail-"));
+  const closed = path.join(dir, "events-inc-000001.ndjson");
+  const active = path.join(dir, "events-inc-000002.ndjson");
+  fs.writeFileSync(closed, `${JSON.stringify({ id: "r1" })}\n`);
+  fs.writeFileSync(active, `${JSON.stringify({ id: "r2" })}\n`);
+  const tel = createHostTelemetry({
+    containerName: "c", logsDir: dir, stdout: () => {},
+    deps: { spawnSync: () => ({ status: 1 }) },
+    relay: async () => false, // relay fails
+  });
+  const result = await tel.relayPass();
+  assert.ok(result.failed);
+  assert.ok(fs.existsSync(closed), "closed segment kept on relay failure");
+  assert.ok(!fs.existsSync(`${active}.offset`), "offset not advanced on failure");
+});
+
+test("Phase 2: emitted host envelopes (tunnel_exit) are relayed and route is correct", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-emit-"));
+  const relayed = [];
+  const tel = createHostTelemetry({
+    containerName: "c", logsDir: dir, stdout: () => {},
+    deps: { spawnSync: () => ({ status: 1 }) },
+    relay: async (body) => { relayed.push(body); return true; },
+  });
+  tel.emit({ kind: "event", severity: "error", code: "tunnel_exit", message: "cloudflared exited", attrs: { cf_code: 1033 } });
+  await tel.relayPass();
+  const rec = relayed.flatMap((b) => b.records).find((r) => r.code === "tunnel_exit");
+  assert.ok(rec, "tunnel_exit envelope relayed");
+  assert.equal(rec.vantage, "host");
+  assert.equal(rec.attrs.cf_code, 1033);
+  // record body must NOT include hire_id (comes from URL path)
+  assert.ok(!("hire_id" in rec));
+});
+
+test("Phase 2: labor-serve relay posts to /labor/hires/<id>/telemetry/relay", async () => {
+  // End-to-end-ish: run labor-serve with a WAL segment on disk and assert the
+  // relay route + batch body are correct.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawlabor-serve-home-"));
+  // Host WAL dir is ~/.clawlabor/hires/<dockerName(hireId)>/logs. dockerName("hire-1") === "hire-1".
+  const logsDir = path.join(home, ".clawlabor", "hires", "hire-1", "logs");
+  fs.mkdirSync(logsDir, { recursive: true });
+  // one CLOSED + one ACTIVE segment
+  fs.writeFileSync(path.join(logsDir, "events-inc-000001.ndjson"),
+    `${JSON.stringify({ id: "wal-1", vantage: "container", kind: "log", severity: "error", message: "boom" })}\n`);
+  fs.writeFileSync(path.join(logsDir, "events-inc-000002.ndjson"),
+    `${JSON.stringify({ id: "wal-2", vantage: "container", kind: "log", severity: "info", message: "hi" })}\n`);
+
+  const relayCalls = [];
+  const stop = deferred();
+  let hirePolls = 0;
+  const { fetch, calls } = recordingFetch([
+    matchRoute("POST", "/labor/labor-9/serve", { status: 200, body: "{}" }),
+    matchRoute("POST", "/labor/hires/hire-1/serve", {
+      status: 200,
+      body: JSON.stringify({ tunnel_token: "TT", sandbox_token: "SBX", hostname: "h.example.com" }),
+    }),
+    {
+      match: ({ url, options }) => options.method === "POST" && /\/labor\/hires\/hire-1\/telemetry\/relay$/.test(url),
+      respond: ({ options }) => { relayCalls.push(JSON.parse(options.body)); return { status: 204, body: "" }; },
+    },
+    matchRoute("POST", "/labor/hires/hire-1/heartbeat", { status: 204, body: "" }),
+    matchRoute("POST", "/labor/labor-9/heartbeat", { status: 204, body: "" }),
+    matchRoute("GET", "/v1/health", { status: 200, body: '{"status":"ok"}' }),
+    {
+      // First poll: hire active. Later polls: gone, so the hire ends naturally,
+      // triggering teardown -> final telemetry relay flush.
+      match: ({ url, options }) => (options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires"),
+      respond: () => {
+        hirePolls += 1;
+        return {
+          status: 200,
+          body: hirePolls === 1
+            ? '{"items":[{"id":"hire-1","status":"active"}]}'
+            : '{"items":[]}',
+        };
+      },
+    },
+    {
+      match: ({ url, options }) => options.method === "DELETE" && /\/labor\/hires\/hire-1\/serve$/.test(url),
+      respond: () => { stop.resolve(); return { status: 204, body: "" }; },
+    },
+    {
+      match: ({ url, options }) => options.method === "DELETE" && /\/labor\/labor-9\/serve$/.test(url),
+      respond: { status: 204, body: "" },
+    },
+  ]);
+
+  const spawned = [];
+  await runCli(["labor-serve", "--labor", "labor-9"], {
+    env: { ...BASE_ENV, HOME: home, CLAWLABOR_API_BASE: "https://www.clawlabor.com/api" },
+    fetch,
+    stdout: () => {},
+    now: () => Date.now(),
+    sleep: async () => {},
+    waitForExit: () => stop.promise,
+    readClaudeOauthToken: () => "oauth-token-123",
+    spawnSync: (cmd, args) => {
+      if (cmd === "docker" && args[0] === "inspect" && args[1] === "-f") {
+        return { status: 0, stdout: "running", stderr: "" };
+      }
+      if (cmd === "docker" && args[0] === "image" && args[1] === "inspect") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    },
+    spawn: (cmd, args, opts) => {
+      const child = new EventEmitter();
+      child.cmd = cmd; child.args = args; child.opts = opts;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = function kill() {};
+      spawned.push(child);
+      return child;
+    },
+  }).catch(() => {});
+
+  // relay endpoint was called with a valid batch body containing the WAL records
+  assert.ok(relayCalls.length > 0, "relay endpoint should be called");
+  const anyBatch = relayCalls.find((b) => b.records.some((r) => r.id === "wal-1" || r.id === "wal-2"));
+  assert.ok(anyBatch, "WAL records should be relayed");
+  assert.ok(anyBatch.batch_id, "batch body has batch_id");
+  assert.ok(Array.isArray(anyBatch.records));
+  // relay uses the correct route
+  assert.ok(calls.some((c) => /\/labor\/hires\/hire-1\/telemetry\/relay$/.test(c.url) && c.options.method === "POST"));
+  // closed segment deleted after successful relay; active kept
+  assert.ok(!fs.existsSync(path.join(logsDir, "events-inc-000001.ndjson")), "closed WAL segment deleted");
+  assert.ok(fs.existsSync(path.join(logsDir, "events-inc-000002.ndjson")), "active WAL segment kept");
 });
