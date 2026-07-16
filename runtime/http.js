@@ -152,12 +152,13 @@ function classifyApiError(status, parsed, body) {
   return "api_error";
 }
 
-async function request(deps, method, route, { body, headers } = {}) {
+async function request(deps, method, route, { body, headers, signal } = {}) {
   const url = `${apiBase(deps.env)}${route}`;
   const response = await deps.fetch(url, {
     method,
     headers: { ...authHeaders(deps.env), ...(headers || {}) },
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
   });
   const text = await response.text();
   if (!response.ok) {

@@ -584,6 +584,7 @@ async function runCli(argv, injected = {}) {
     probePublicHealthWithDnsFallback: injected.probePublicHealthWithDnsFallback,
     killProcessGroup: injected.killProcessGroup,
     sandboxStartupTimeoutMs: injected.sandboxStartupTimeoutMs,
+    laborControlTimeoutMs: injected.laborControlTimeoutMs,
     updateCheck: injected.updateCheck !== undefined ? injected.updateCheck : Object.keys(injected).length === 0,
   };
   if (!deps.fetch) {
