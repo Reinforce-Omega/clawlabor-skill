@@ -64,7 +64,7 @@ const PLAN_MONTHLY_COST_UAT = {
 const DEFAULT_DAILY_TOKEN_CAP = 1_000_000; // 1M tokens/day
 const LABOR_CONTROL_TIMEOUT_MS = 10_000;
 const SANDBOX_STARTUP_TIMEOUT_MS = 180_000;
-const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.4";
+const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.5";
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description. Save any files you produce under /home/sandbox/.";
 // Baseline conduct rules written into the sandbox as CLAUDE.md / AGENTS.md so
 // every runtime picks them up in addition to (not instead of) its built-in
