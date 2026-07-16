@@ -5460,6 +5460,58 @@ test("labor-serve keeps the startup seller API key for long-running requests", a
   assert.deepEqual([...new Set(seenAuth)], ["Bearer test-key"]);
 });
 
+test("labor-serve recovers from active-hire poll timeouts with capped backoff", async () => {
+  const stop = deferred();
+  const delays = [];
+  const pollSignals = [];
+  let polls = 0;
+  let cappedDelays = 0;
+  const response = (status, body = "") => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => body,
+  });
+  const fetch = async (url, options) => {
+    if (options.method === "POST" && url.endsWith("/labor/labor-9/serve")) {
+      return response(204);
+    }
+    if ((options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires")) {
+      polls += 1;
+      pollSignals.push(options.signal);
+      return new Promise((_, reject) => {
+        options.signal?.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+      });
+    }
+    if (options.method === "DELETE" && url.endsWith("/labor/labor-9/serve")) {
+      return response(204);
+    }
+    throw new Error(`Unexpected request ${options.method || "GET"} ${url}`);
+  };
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: envWithIsolatedHome(),
+      fetch,
+      stdout: () => {},
+      readClaudeOauthToken: () => "oauth-token-123",
+      laborControlTimeoutMs: 1,
+      sleep: async (ms) => {
+        delays.push(ms);
+        if (ms === 300_000) {
+          cappedDelays += 1;
+          if (cappedDelays === 2) stop.resolve();
+        }
+      },
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.equal(polls, 7);
+  assert.deepEqual(delays, [10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000]);
+  assert.ok(pollSignals.every((signal) => signal && signal.aborted));
+});
+
 test("labor-serve heartbeat is not blocked by a slow active-hire poll", async () => {
   const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
   let hirePolls = 0;
@@ -7734,10 +7786,7 @@ test("reset returns availability to the initial long-grace phase", () => {
 // ---------------------------------------------------------------------------
 // Telemetry: Phase 1 (env/mount injection) + Phase 2 (docker events, WAL relay)
 // ---------------------------------------------------------------------------
-const {
-  startSandboxContainer,
-  LOGS_TARGET,
-} = require("../runtime/commands/labor-sandbox");
+const { LOGS_TARGET } = require("../runtime/commands/labor-sandbox");
 const {
   parseDockerEventLine,
   dockerEventToEnvelope,

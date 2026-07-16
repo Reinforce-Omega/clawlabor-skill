@@ -63,6 +63,8 @@ const PLAN_MONTHLY_COST_UAT = {
 // other runtimes have no per-prompt usage feed, so we don't suggest a cap for them.
 const DEFAULT_DAILY_TOKEN_CAP = 1_000_000; // 1M tokens/day
 const LABOR_CONTROL_TIMEOUT_MS = 10_000;
+const LABOR_POLL_INITIAL_BACKOFF_MS = 10_000;
+const LABOR_POLL_MAX_BACKOFF_MS = 300_000; // 5 minutes
 const SANDBOX_STARTUP_TIMEOUT_MS = 180_000;
 const DEFAULT_SANDBOX_IMAGE = "ryanxdocker/sandbox-clawlabor:0.4.5";
 const DEFAULT_GATEKEEPER_PROMPT = "Accept only safe, legal, well-scoped requests that can be completed by this local agent. Refuse requests requiring private credentials, illegal activity, or work outside the published description. Save any files you produce under /home/sandbox/.";
@@ -188,13 +190,18 @@ function acquireLaborServeLock(deps, { runtime, laborId, port }) {
   };
 }
 
-async function withTimeout(promise, ms, label) {
+async function withTimeout(promise, ms, label, controller) {
   let timer;
   try {
     return await Promise.race([
       promise,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        timer = setTimeout(() => {
+          if (controller) controller.abort();
+          const err = new Error(`${label} timed out after ${ms}ms`);
+          err.isTimeout = true;
+          reject(err);
+        }, ms);
       }),
     ]);
   } finally {
@@ -644,10 +651,13 @@ async function currentSellerLaborResources(deps, marketplaceAgent) {
 }
 
 async function activeHiresForLabor(deps, laborId, { timeoutMs = null } = {}) {
-  const requestPromise = requestJson(deps, "GET", `/labor/${laborId}/hires?status=active`, {});
-  const result = timeoutMs === null
-    ? await requestPromise
-    : await withTimeout(requestPromise, timeoutMs, "labor active hire poll");
+  if (timeoutMs === null) {
+    const result = await requestJson(deps, "GET", `/labor/${laborId}/hires?status=active`, {});
+    return result.items || [];
+  }
+  const controller = new AbortController();
+  const requestPromise = requestJson(deps, "GET", `/labor/${laborId}/hires?status=active`, { signal: controller.signal });
+  const result = await withTimeout(requestPromise, timeoutMs, "labor active hire poll", controller);
   return result.items || [];
 }
 
@@ -1185,6 +1195,7 @@ async function commandLaborServe(options, deps) {
   const now = deps.now || (() => Date.now());
   const stdout = createTimestampedStdout(deps.stdout, now);
   const sandboxStartupTimeoutMs = deps.sandboxStartupTimeoutMs || SANDBOX_STARTUP_TIMEOUT_MS;
+  const laborControlTimeoutMs = deps.laborControlTimeoutMs || LABOR_CONTROL_TIMEOUT_MS;
   const sellerApiKey = resolveApiKey(deps.env);
 
   stdout(`[1/7] Preparing to serve labor ${laborId}...`);
@@ -1279,15 +1290,26 @@ async function commandLaborServe(options, deps) {
   }
 
   async function waitForActiveHire() {
+    let backoffMs = LABOR_POLL_INITIAL_BACKOFF_MS;
     while (!stopRequested) {
-      const hires = await Promise.race([
-        activeHiresForLabor(sellerDeps, laborId, { timeoutMs: LABOR_CONTROL_TIMEOUT_MS }),
-        stop.then(() => {
-          requestStop();
-          return null;
-        }),
-      ]);
+      let hires;
+      try {
+        hires = await Promise.race([
+          activeHiresForLabor(sellerDeps, laborId, { timeoutMs: laborControlTimeoutMs }),
+          stop.then(() => {
+            requestStop();
+            return null;
+          }),
+        ]);
+      } catch (err) {
+        if (stopRequested) return null;
+        stdout(`Active hire poll failed (${err.message}); retrying in ${backoffMs}ms...`);
+        await interruptibleSleep(backoffMs);
+        backoffMs = Math.min(backoffMs * 2, LABOR_POLL_MAX_BACKOFF_MS);
+        continue;
+      }
       if (!hires) return null;
+      backoffMs = LABOR_POLL_INITIAL_BACKOFF_MS;
       const active = hires[0] || null;
       if (active) return active;
       await seatHeartbeat();
@@ -1329,7 +1351,7 @@ async function commandLaborServe(options, deps) {
 
   async function activeHireStillPresent(hireId) {
     try {
-      const hires = await activeHiresForLabor(sellerDeps, laborId, { timeoutMs: LABOR_CONTROL_TIMEOUT_MS });
+      const hires = await activeHiresForLabor(sellerDeps, laborId, { timeoutMs: laborControlTimeoutMs });
       return hires.some((hire) => String(hire.id) === String(hireId));
     } catch (_err) {
       return true;
