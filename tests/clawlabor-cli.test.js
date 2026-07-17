@@ -5512,6 +5512,57 @@ test("labor-serve recovers from active-hire poll timeouts with capped backoff", 
   assert.ok(pollSignals.every((signal) => signal && signal.aborted));
 });
 
+test("labor-serve logs recovery once the active-hire poll succeeds after failures", async () => {
+  const stop = deferred();
+  const lines = [];
+  let polls = 0;
+  const response = (status, body = "") => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => body,
+  });
+  const fetch = async (url, options) => {
+    if (options.method === "POST" && url.endsWith("/labor/labor-9/serve")) {
+      return response(204);
+    }
+    if ((options.method || "GET") === "GET" && url.includes("/labor/labor-9/hires")) {
+      polls += 1;
+      if (polls <= 2) throw new Error("fetch failed");
+      return response(200, '{"items":[]}');
+    }
+    if (options.method === "POST" && url.endsWith("/labor/labor-9/heartbeat")) {
+      return response(204);
+    }
+    if (options.method === "DELETE" && url.endsWith("/labor/labor-9/serve")) {
+      return response(204);
+    }
+    throw new Error(`Unexpected request ${options.method || "GET"} ${url}`);
+  };
+
+  await runCli(
+    ["labor-serve", "--labor", "labor-9"],
+    {
+      env: envWithIsolatedHome(),
+      fetch,
+      stdout: (line) => {
+        lines.push(String(line));
+      },
+      readClaudeOauthToken: () => "oauth-token-123",
+      sleep: async (ms) => {
+        if (ms === 5000) stop.resolve();
+      },
+      waitForExit: () => stop.promise,
+    },
+  );
+
+  assert.equal(polls, 3);
+  assert.equal(lines.filter((line) => line.includes("Active hire poll failed")).length, 2);
+  assert.ok(
+    lines.some((line) => /Active hire poll recovered after 2 failed attempts \(~\d+s\); polling normally\./.test(line)),
+    `expected recovery log line, got:\n${lines.join("\n")}`,
+  );
+});
+
 test("labor-serve heartbeat is not blocked by a slow active-hire poll", async () => {
   const { stop, route: stopAfterHireTeardown } = laborServeStopAfterHireTeardown();
   let hirePolls = 0;
