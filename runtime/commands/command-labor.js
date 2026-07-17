@@ -1291,6 +1291,8 @@ async function commandLaborServe(options, deps) {
 
   async function waitForActiveHire() {
     let backoffMs = LABOR_POLL_INITIAL_BACKOFF_MS;
+    let failedPolls = 0;
+    let firstFailureAtMs = null;
     while (!stopRequested) {
       let hires;
       try {
@@ -1303,12 +1305,20 @@ async function commandLaborServe(options, deps) {
         ]);
       } catch (err) {
         if (stopRequested) return null;
+        failedPolls += 1;
+        if (firstFailureAtMs === null) firstFailureAtMs = now();
         stdout(`Active hire poll failed (${err.message}); retrying in ${backoffMs}ms...`);
         await interruptibleSleep(backoffMs);
         backoffMs = Math.min(backoffMs * 2, LABOR_POLL_MAX_BACKOFF_MS);
         continue;
       }
       if (!hires) return null;
+      if (failedPolls > 0) {
+        const downSeconds = Math.max(1, Math.round((now() - firstFailureAtMs) / 1000));
+        stdout(`Active hire poll recovered after ${failedPolls} failed attempt${failedPolls === 1 ? "" : "s"} (~${downSeconds}s); polling normally.`);
+        failedPolls = 0;
+        firstFailureAtMs = null;
+      }
       backoffMs = LABOR_POLL_INITIAL_BACKOFF_MS;
       const active = hires[0] || null;
       if (active) return active;
